@@ -1,0 +1,18 @@
+# Gradle 构建输出。
+build/
+.gradle/
+
+# 换台机器、换个用户就错，属于机器状态不是源码。Android Studio 会自动重建。
+local.properties
+
+# Android Studio / IntelliJ 的索引和窗口布局，同样是机器状态
+.idea/
+*.iml
+captures/
+
+# NDK 中间产物（阶段五接 JNI 之后会生成）
+.externalNativeBuild/
+.cxx/
+
+# 系统垃圾
+.DS_Store
