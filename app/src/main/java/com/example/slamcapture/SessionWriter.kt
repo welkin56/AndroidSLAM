@@ -84,32 +84,88 @@ class SessionWriter(val sessionDir: File) {
     var startedAtNs: Long = 0
         private set
 
+    /**
+     * 这一段是不是「强制开始」的——对焦没收敛、或者 IMU 还没出数，用户按了红按钮。
+     * 由编排层在 [start] 之前设好，写进 meta.json，**事后审查时一眼能认出可疑数据**。
+     */
+    @Volatile
+    var forced = false
+
+    /** 第一帧落盘的时刻。0 = 一帧都没落。writer 线程独占写。 */
+    @Volatile
+    var firstFrameTsNs = 0L
+        private set
+
+    /**
+     * 第一条 IMU 落盘的时刻。0 = 一条都没落。writer 线程独占写。
+     *
+     * 这是「**这一段到底写进去没有**」的权威事实——和 ImuCollector.ready 那个事前
+     * 判断是两回事。事前判断永远可能过时（传感器刚好哑了、写盘刚好失败），
+     * 所以两个都要：一个用来当场决定要不要放行，一个用来事后核对。
+     *
+     * 和 [firstFrameTsNs] 一比，就是这一段两个流的实际覆盖关系。
+     * 按设计 IMU 应该**小于**相机、且差约 300 ms。
+     */
+    @Volatile
+    var firstImuTsNs = 0L
+        private set
+
+    /** 建文件失败的原因，正常为 null。编排层看它决定要不要继续。 */
+    @Volatile
+    var ioError: String? = null
+        private set
+
+    /** writer 线程还在不在。**`stop()` 的 join 超时之后，不能再去删目录。** */
+    val threadAlive: Boolean get() = thread?.isAlive == true
+
+    /**
+     * 建文件并启动 writer 线程。
+     *
+     * **IO 异常在这里收掉，不抛给调用方。** 磁盘满、外部存储没挂载都会走到这儿，
+     * 而调用方是主线程——让它接这个异常只会崩掉 App。失败时 [ioError] 非 null。
+     */
     fun start() {
-        camDir.mkdirs()
-        imuDir.mkdirs()
+        try {
+            camDir.mkdirs()
+            imuDir.mkdirs()
 
-        camCsv = BufferedWriter(OutputStreamWriter(FileOutputStream(File(sessionDir, "cam0/data.csv"))))
-        imuCsv = BufferedWriter(OutputStreamWriter(FileOutputStream(File(imuDir, "data.csv"))))
+            camCsv = BufferedWriter(OutputStreamWriter(FileOutputStream(File(sessionDir, "cam0/data.csv"))))
+            imuCsv = BufferedWriter(OutputStreamWriter(FileOutputStream(File(imuDir, "data.csv"))))
 
-        // EuRoC 格式的注释行。ORB-SLAM3 会跳过以 '#' 开头的行。
-        camCsv.write("#timestamp [ns],filename\n")
-        imuCsv.write(
-            "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1]," +
-            "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\n"
-        )
+            // EuRoC 格式的注释行。ORB-SLAM3 会跳过以 '#' 开头的行。
+            camCsv.write("#timestamp [ns],filename\n")
+            imuCsv.write(
+                "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1]," +
+                "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\n"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "建 session 文件失败（磁盘满或外部存储不可写）", e)
+            ioError = e.message ?: e.javaClass.simpleName
+            closeFiles()
+            return
+        }
 
         startedAtNs = System.nanoTime()
         running = true
         thread = Thread({ loop() }, "session-writer").also { it.start() }
     }
 
-    /** 采集线程调用。队列满了就丢帧并计数——绝不阻塞采集。 */
+    /**
+     * 采集线程调用。队列满了就丢帧并计数——绝不阻塞采集。
+     *
+     * `running` 为 false 时送来的，是拆除途中的在途帧。[MainActivity] 读 `writer`
+     * 和 `phase` 的顺序（先 writer 后 phase）与本类拆除时的写序（先 phase 后 writer）
+     * **正好相反**，所以相机线程可能读到非 null 的 writer 加一个陈旧的 RECORDING。
+     * 这个窗口只有毫秒级，后果也就是丢一帧——但老代码在这条路上是**静默丢弃且不计数**，
+     * 于是 `frames_written + frames_dropped` 不等于相机实际出的帧数，统计口径骗人。
+     */
     fun offerFrame(item: FrameItem) {
-        if (!frameQueue.offer(item)) framesDropped.incrementAndGet()
+        if (!running || !frameQueue.offer(item)) framesDropped.incrementAndGet()
     }
 
+    /** 同上，[offerImu] 侧的那道检查。 */
     fun offerImu(item: ImuItem) {
-        if (!imuQueue.offer(item)) imuDropped.incrementAndGet()
+        if (!running || !imuQueue.offer(item)) imuDropped.incrementAndGet()
     }
 
     private fun loop() {
@@ -166,6 +222,7 @@ class SessionWriter(val sessionDir: File) {
 
             camCsv.write("${f.tsNs},$name\n")
             val written = framesWritten.incrementAndGet()
+            if (firstFrameTsNs == 0L) firstFrameTsNs = f.tsNs
             if (written % 30 == 0L) camCsv.flush()  // 每秒刷一次，崩溃时少丢数据
         } catch (e: Exception) {
             framesFailed.incrementAndGet()
@@ -177,15 +234,24 @@ class SessionWriter(val sessionDir: File) {
         try {
             imuCsv.write("${i.tsNs},${i.wx},${i.wy},${i.wz},${i.ax},${i.ay},${i.az}\n")
             val written = imuWritten.incrementAndGet()
+            if (firstImuTsNs == 0L) firstImuTsNs = i.tsNs
             if (written % 200 == 0L) imuCsv.flush()
         } catch (e: Exception) {
             Log.e(TAG, "写 IMU 失败", e)
         }
     }
 
+    /**
+     * 关掉两个 CSV。**对"可能根本没打开成功"是安全的**——[start] 失败时
+     * 会在中途抛出来，那时只有一部分文件被打开。
+     */
+    private fun closeFiles() {
+        try { if (::camCsv.isInitialized) { camCsv.flush(); camCsv.close() } } catch (_: Exception) {}
+        try { if (::imuCsv.isInitialized) { imuCsv.flush(); imuCsv.close() } } catch (_: Exception) {}
+    }
+
     private fun closeQuietly() {
-        try { camCsv.flush(); camCsv.close() } catch (_: Exception) {}
-        try { imuCsv.flush(); imuCsv.close() } catch (_: Exception) {}
+        closeFiles()
 
         // 写一份元数据，阶段三/四用得上
         try {
@@ -194,6 +260,9 @@ class SessionWriter(val sessionDir: File) {
                 """
                 {
                   "duration_s": $elapsedS,
+                  "forced": $forced,
+                  "first_frame_ts_ns": $firstFrameTsNs,
+                  "first_imu_ts_ns": $firstImuTsNs,
                   "frames_written": ${framesWritten.get()},
                   "frames_dropped": ${framesDropped.get()},
                   "imu_written": ${imuWritten.get()},

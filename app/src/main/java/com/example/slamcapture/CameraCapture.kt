@@ -14,13 +14,32 @@ import android.media.ImageReader
 import android.os.Handler
 import android.util.Log
 import android.util.Range
-import android.util.Size
 import android.view.Surface
-import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * 相机。**只负责「开相机」和「把帧交出去」两件事。**
+ *
+ * 它不知道 writer、不知道 IMU、不判断"什么时候该开始落盘"——那些是编排层
+ * （[MainActivity]）的事。2026-09-18 那次只把 `imuReady` 的写入从 `start()`/`stop()`
+ * 里拿掉，字段和判断还留在这儿，结果「什么时候开始落盘」要读四个地方才能拼出来。
+ * 这次连根搬走。
+ *
+ * 每个帧的出口只有 [onFrame] 一个。预览挂在它上面；将来 SLAM 那一版也挂这儿，
+ * 这个文件不用再动。
+ *
+ * ------------------------------------------------------------------
+ * **一条必须守住的不变式：本类没有"自由预览"态。**
+ *
+ * 相机只有「开」和「关」两种状态，[ready] 和 [focusLockArmed] 只在 [start] / [stop]
+ * （以及出错时那两处 [releaseResources]）里复位，别处一律不碰。以前有个 `endSettle()`
+ * 想在相机开着的情况下把锁定解开、回到连续对焦，那会造出第三种状态——每个回调都得
+ * 重新回答"我现在属于哪一代"。现在没有它了：**要重新对焦就重新 [beginSettle]，
+ * 要重新开始就 [stop] 再 [start]**。将来谁想加"不关相机就回 IDLE"的快捷路径，
+ * 先看见这条。
+ * ------------------------------------------------------------------
+ */
 class CameraCapture(
     private val context: Context,
-    private val writer: SessionWriter,
     private val handler: Handler
 ) {
     companion object {
@@ -47,52 +66,99 @@ class CameraCapture(
     private var fpsRange: Range<Int>? = null
     private var surface: Surface? = null
 
-    // 两个超时兜底的句柄。stop() 里必须撤掉——否则会话关了之后它们还会响，
-    // 把一个已经停掉的相机重新标成"就绪"。原来只有一个对焦超时时就漏了这茬。
-    private var focusTimeout: Runnable? = null
-    private var imuTimeout: Runnable? = null
+    /**
+     * 每帧的出口。跑在**相机线程**上，实现里不能有阻塞操作。
+     *
+     * 注意它**不受"能不能落盘"约束**——对焦还没收敛、IMU 还没出数时也照给。
+     * 预览要能看见"现在还是糊的"，那正是采集时该看的东西；能不能落盘是编排层
+     * 的判断，跟这个出口无关。
+     */
+    @Volatile
+    var onFrame: ((gray: ByteArray, tsNs: Long) -> Unit)? = null
+
+    /**
+     * **相机输出是否已经稳定到可以信任。**
+     *
+     * 今天这个判据等价于「对焦已收敛」：要么镜组真的锁上了，要么读不到有效对焦
+     * 距离、决定保持连续对焦（连续对焦的图是清晰的，只是焦距会随拍摄距离呼吸）。
+     *
+     * 名字刻意**不叫** `focusLocked`——这是对外的判据，将来若锁白平衡/曝光，它们
+     * 同样属于"相机输出稳没稳"，并进这个属性就行，不用再改一次名。内部真正只管
+     * 对焦的东西（[requestSettle]、[focusLockArmed]）保持 `focus` 前缀。
+     *
+     * 只在相机线程上写；外面读它是为了决定能不能开始落盘。
+     */
+    @Volatile
+    var ready = false
+        private set
+
+    /**
+     * 出错的说明，给状态栏用。正常时为 null。
+     *
+     * **没有它，出错的表现就是一块黑屏加一个永远红的按钮，没有任何解释**——
+     * 那正是最该避免的「查不出来的状态」。
+     */
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    /**
+     * 相机这一代的编号。**奇数 = 正在跑，偶数 = 已停。**
+     *
+     * 以前这里是个 `started` 布尔量，它挡不住这个序列：
+     * `开始准备 →(5ms) 取消准备 →(3ms) 开始准备`。第一次 `openCamera` 的 `onOpened`
+     * 迟到，读到的 `started` 是**第二次刚置的 true**，于是把过期设备写进 [device]；
+     * 紧接着第二次 open 拿到 `ERROR_CAMERA_IN_USE`，`onError` 里那行无条件的
+     * `device = null` 把唯一活着的设备抹掉。结果：预览照常出图，但对焦永远收敛不了，
+     * [device] 恒为 null，相机被永久占死，只能重启进程。
+     *
+     * 所以每个回调都捕获自己出生时的那一代 [epoch]，跑起来先比一次，**不相等就只
+     * `close()` 自己那份资源然后退出，绝不写字段**。用奇偶编码运行状态（而不是
+     * 另开一个布尔）是有意的：「这一代还算不算数」和「相机在不在跑」从根上就是同一个
+     * 问题，分成两个字段迟早会互相矛盾。
+     *
+     * 只在相机线程上读写——所有回调都排在同一个 handler 上。
+     */
+    private var epoch = 0L
+
+    /**
+     * 这一轮「收敛」有没有被要求锁定对焦。
+     *
+     * [beginSettle] 置 true，[releaseResources] 置 false。**没有"自由预览"态**，
+     * 所以它在相机开着的整段时间里一直是 true。
+     */
+    private var focusLockArmed = false
 
     /** 这颗镜头支不支持自动对焦（定焦摄像头为 false）。 */
     private var supportsAf = false
 
-    /** 对焦是否已经锁定完毕。锁定后焦距固定，可以开始信任标定了。 */
-    @Volatile var focusLocked = false
-        private set
+    // ---------------- 开合 ----------------
 
     /**
-     * 是否已经开始真正落盘。两个条件**同时**满足才开。
+     * 打开相机并开始出帧。
      *
-     * 1. 对焦完成（[focusReady]）——不然开头几帧是糊的。糊帧不是"没用"，
-     *    是**有害**：ORB-SLAM3 的初始地图就是拿最前面这几帧建的，喂糊帧
-     *    进去要么初始化失败，要么建出一个烂地图，后面全歪。
-     *
-     * 2. IMU 已经出数（[imuReady]）——ORB-SLAM3 假定 IMU 比相机先开始。
-     *    本机 IMU 挂在传感器协处理器后面，注册后要 3 秒多才出数；如果相机
-     *    抢先开始录，两个流的时间关系就反了，见 [ImuCollector.onFirstSample]。
-     *
-     * 两个条件**谁后到谁触发**，都不阻塞。
+     * **整段排在相机线程上**，和 [stop] 共用一条队列，所以快速的前后台切换
+     * （onStop → onStart）不会出现"刚开的相机被上一轮的拆除动作关掉"。
      */
-    @Volatile private var focusReady = false
-    @Volatile private var imuReady = false
-    private val capturing = AtomicBoolean(false)
-
-    /** 等对焦的超时上限。超过它就不再等，带着当前画面开始采集。 */
-    private val focusWaitMs = 2500L
-
-    //等 IMU 首样本的超时上限。
-    private val imuWaitMs = 8000L
-
     @SuppressLint("MissingPermission")
-    fun start() {
-        val cameraId = pickCameraId() ?: run {
+    fun start() = handler.post {
+        if (epoch % 2L != 0L) return@post      // 已经在跑
+        epoch++
+        val myEpoch = epoch
+
+        lastError = null
+        val cameraId = pickCameraId()
+        if (cameraId == null) {
             Log.e(TAG, "找不到可用的后置相机")
-            return
+            lastError = "找不到可用的后置相机"
+            epoch++                            // 回到偶数 = 已停
+            return@post
         }
+
         Log.i(TAG, "使用相机 id=$cameraId")
         fpsRange = pickFpsRange(cameraId)
-        focusLocked = false
-        focusReady = false
-        capturing.set(false)
+        ready = false
+        focusLockArmed = false
 
         supportsAf = manager.getCameraCharacteristics(cameraId)
             .get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
@@ -100,47 +166,238 @@ class CameraCapture(
         Log.i(TAG, "支持自动对焦 = $supportsAf")
 
         val r = ImageReader.newInstance(W, H, ImageFormat.YUV_420_888, 4)
-        r.setOnImageAvailableListener({ rd ->
-            // acquireLatestImage 会自动丢掉落后的帧——这正是我们要的：
-            // 宁可丢帧，也不要处理过期数据
-            val image = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                // 对焦完成、IMU 出数，两件事都齐了之前，照常取走并 close，
-                // 但**不送编码**。
-                //
-                // 为什么不是干脆不 acquire：不消费的话 4 个 buffer 很快填满，
-                // 整条相机管线会停住，AE/AWB 也跟着停止收敛——等你要开始
-                // 采集时画面反而更糟。必须保持管线畅通，只是在门口过滤掉。
-                //
-                // 为什么要过滤：糊帧不是"没用"，是**有害**；IMU 没出数就开录，
-                // 还会让两个流的时间关系反过来。两者都见 capturing 的注释。
-                if (!capturing.get()) return@setOnImageAvailableListener
-
-                val gray = extractGray(image)
-                writer.offerFrame(SessionWriter.FrameItem(image.timestamp, gray, W, H))
-            } catch (e: Exception) {
-                Log.e(TAG, "处理帧失败", e)
-            } finally {
-                image.close()   // 必须 close，否则 ImageReader 很快就耗尽缓冲
-            }
-        }, handler)
+        r.setOnImageAvailableListener({ rd -> onImageReady(rd, myEpoch) }, handler)
         reader = r
         surface = r.surface
 
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(d: CameraDevice) {
-                device = d
-                createSession(d, r.surface)
+        try {
+            manager.openCamera(cameraId, deviceCallback(myEpoch), handler)
+        } catch (e: Exception) {
+            // 没权限时 openCamera 抛的是**运行期** SecurityException，而且是在
+            // 相机线程的 runnable 里抛——不接就是进程直接死。
+            // （方法上的 @SuppressLint 只是关掉静态检查，拦不住它。）
+            Log.e(TAG, "openCamera 失败", e)
+            lastError = "打不开相机：${e.javaClass.simpleName}"
+            releaseResources()
+            epoch++                            // 回到偶数 = 已停，下次 start() 还能重来
+        }
+    }
+
+    /**
+     * 关掉相机。同样排在相机线程上，所以一定跑在 [start] 之后。
+     *
+     * 引用一律清成 null：留着已关闭的 CameraDevice 的话，紧接着开相机就是
+     * `IllegalStateException`。
+     */
+    fun stop() = handler.post {
+        if (epoch % 2L == 0L) return@post       // 已经停了
+        releaseResources()
+        epoch++                                 // 偶数 = 已停
+    }
+
+    /** 关掉并清空所有资源。**只在相机线程上调用。** */
+    private fun releaseResources() {
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        try { session?.close() } catch (_: Exception) {}
+        try { device?.close() } catch (_: Exception) {}
+        // 先摘掉监听再关 reader：关掉之后任何一条在途回调都会让 acquireLatestImage
+        // 抛 IllegalStateException，逃出 Handler 就是进程直接死。
+        try {
+            reader?.setOnImageAvailableListener(null as ImageReader.OnImageAvailableListener?, null)
+        } catch (_: Exception) {}
+        try { reader?.close() } catch (_: Exception) {}
+        session = null; device = null; reader = null; surface = null
+        ready = false
+        focusLockArmed = false
+    }
+
+    /**
+     * 取一帧交给 [onFrame]。**跑在相机线程上。**
+     *
+     * [myEpoch] 是这个监听器出生时的代号：reader 关掉之后还会飞来一些回调，
+     * 用代号一眼就能认出它们属于上一代。
+     */
+    private fun onImageReady(rd: ImageReader, myEpoch: Long) {
+        if (myEpoch != epoch) return
+
+        // acquireLatestImage 会自动丢掉落后的帧——这正是我们要的：
+        // 宁可丢帧，也不要处理过期数据。
+        val image = try {
+            rd.acquireLatestImage()
+        } catch (e: Exception) {
+            // reader 已经关了，但回调还在路上。这是正常竞态，不是错误。
+            return
+        } ?: return
+
+        try {
+            // 没人要这一帧就白白取走 close 掉。
+            val cb = onFrame ?: return
+            cb(extractGray(image), image.timestamp)
+        } catch (e: Exception) {
+            Log.e(TAG, "处理帧失败", e)
+        } finally {
+            image.close()   // 必须 close，否则 ImageReader 很快就耗尽缓冲
+        }
+    }
+
+    private fun deviceCallback(myEpoch: Long) = object : CameraDevice.StateCallback() {
+        override fun onOpened(d: CameraDevice) {
+            if (myEpoch != epoch) {
+                // 这一代已经结束了。这个 device 没人要了，**必须在这里关掉**：
+                // 关了 reader 之后配置会话会失败，但"配置失败"不等于"设备被释放"。
+                Log.w(TAG, "onOpened 迟到（这一代相机已结束），直接关掉")
+                try { d.close() } catch (_: Exception) {}
+                return
             }
-            override fun onDisconnected(d: CameraDevice) {
-                Log.w(TAG, "相机断开")
-                d.close(); device = null
+            val surf = reader?.surface
+            if (surf == null) {
+                try { d.close() } catch (_: Exception) {}
+                return
             }
-            override fun onError(d: CameraDevice, error: Int) {
-                Log.e(TAG, "相机打开失败 error=$error")
-                d.close(); device = null
+            device = d
+            createSession(d, surf, myEpoch)
+        }
+
+        override fun onDisconnected(d: CameraDevice) {
+            if (myEpoch != epoch) {
+                try { d.close() } catch (_: Exception) {}
+                return
+            }
+            Log.w(TAG, "相机断开")
+            lastError = "相机被断开（可能被别的 App 抢走了）"
+            try { d.close() } catch (_: Exception) {}
+            // 设备没了，这一代作废：清干净并回到"已停"，否则之后每次 start()
+            // 都会以为相机还开着，静默什么都不做。
+            releaseResources()
+            epoch++
+        }
+
+        override fun onError(d: CameraDevice, error: Int) {
+            if (myEpoch != epoch) {
+                try { d.close() } catch (_: Exception) {}
+                return
+            }
+            Log.e(TAG, "相机打开失败 error=$error")
+            lastError = "相机打开失败 error=$error"
+            try { d.close() } catch (_: Exception) {}
+            releaseResources()
+            epoch++
+        }
+    }
+
+    private fun createSession(d: CameraDevice, target: Surface, myEpoch: Long) {
+        d.createCaptureSession(listOf(target), object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) {
+                if (myEpoch != epoch) {
+                    try { s.close() } catch (_: Exception) {}
+                    return
+                }
+                session = s
+                // 先跑连续对焦版，把焦点找准。锁定由 [focusCallback] 在
+                // AF_STATE 收敛之后完成。
+                requestSettle(myEpoch)
+                Log.i(TAG, "相机已启动 ${W}x${H} fps范围=$fpsRange 支持AF=$supportsAf")
+            }
+
+            override fun onConfigureFailed(s: CameraCaptureSession) {
+                Log.e(TAG, "会话配置失败——可能这台设备不支持 ${W}x${H} 的 YUV 输出")
+                lastError = "会话配置失败（${W}x${H} YUV 不支持？）"
             }
         }, handler)
+    }
+
+    // ---------------- 收敛（对焦） ----------------
+
+    /**
+     * 进「已准备」时调用：**开始收敛**——重新跑连续对焦，对上之后由 [focusCallback]
+     * 把镜组钉死。
+     *
+     * 排在相机线程上，和 [focusCallback] 天然串行。这也顺带解决了"读到已关闭的
+     * CameraDevice"：`device` 只在相机线程上被清。
+     */
+    fun beginSettle() = handler.post {
+        // 相机没开着（start 失败、或还没跑完就出了错）就没什么可收敛的。
+        // 这一行挡掉的是"给一个已死的相机把 ready 置成 true"——那会让绿色按钮说谎。
+        if (epoch % 2L == 0L) return@post
+
+        // 这两行必须在 return 之前：会话可能还没建好（onConfigured 尚未回调），
+        // 那种情况下请求由 onConfigured 发出去，它注册的 [focusCallback] 会读到
+        // 这里刚设好的 focusLockArmed。
+        //
+        // 定焦镜头没什么可收敛的（AF_STATE 恒为 INACTIVE，focusCallback 永远不置位），
+        // 直接算就绪——否则「开始录制」永远不会变绿，用户只能一直强制开始。
+        ready = !supportsAf
+        focusLockArmed = true
+        requestSettle(epoch)
+    }
+
+    /** 发一次「连续对焦 + 盯着 AF_STATE」的请求。会话没建好就什么都不做。 */
+    private fun requestSettle(myEpoch: Long) {
+        val d = device ?: return
+        val s = session ?: return
+        val surf = surface ?: return
+        try {
+            s.setRepeatingRequest(
+                buildRequest(d, surf, focusDistance = null), focusCallback(myEpoch), handler
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "发连续对焦请求失败", e)
+        }
+    }
+
+    /**
+     * 盯着 `CONTROL_AF_STATE`，一旦对焦完成就换成锁定版请求。
+     *
+     * 如果一直等不到（光线太暗、画面无纹理），就保持连续对焦继续跑——
+     * 连续对焦的图是清晰的，只是焦距会随距离微调，比"锁在一个错误的
+     * 位置、整幅图都是糊的"要好得多。
+     *
+     * 每次请求新造一个，好把出生时的 [epoch] 一起捕获进来：上一代的会话关掉之后
+     * 仍可能有回调在路上，由一个陈旧的回调把 [ready] 置 true 就是绿色按钮说谎。
+     */
+    private fun focusCallback(myEpoch: Long) = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            s: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            if (myEpoch != epoch) return
+            // 还没被要求收敛，或者已经收敛完了。两个条件都写在前面：
+            // ready 兼任幂等闩锁，避免反复切请求。
+            if (!focusLockArmed || ready) return
+            val st = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
+            val focused = st == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                          st == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+            if (!focused) return
+
+            val d = device ?: return
+            val surf = surface ?: return
+
+            // 把对焦达成那一刻的镜组位置读出来，之后用它把镜组钉在原地。
+            val dist = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+
+            if (dist == null || dist <= 0f) {
+                // 读不到有效距离（0 表示未知，或者镜组在无穷远）。
+                //
+                // 这时**千万不能**切 AF_MODE_OFF——那正是会让镜组停车、
+                // 把画面搞糊的那一步。宁可保持连续对焦：图一直是清晰的，
+                // 代价只是焦距会随拍摄距离轻微呼吸。
+                ready = true
+                Log.w(TAG, "AF_STATE=$st，但读不到有效对焦距离($dist)，保持连续对焦")
+                return
+            }
+
+            try {
+                s.setRepeatingRequest(buildRequest(d, surf, dist), null, handler)
+                ready = true
+                Log.i(TAG, "对焦完成 AF_STATE=$st，镜组锁定于 %.3f 屈光度 (= %.2f m)"
+                    .format(dist, 1f / dist))
+            } catch (e: Exception) {
+                // 锁不上也别卡住：连续对焦的画面是清晰的，只是焦距不固定。
+                ready = true
+                Log.e(TAG, "锁定对焦失败，继续用连续对焦（画面仍清晰，但焦距不固定）", e)
+            }
+        }
     }
 
     /**
@@ -233,144 +490,6 @@ class CameraCapture(
             // 固定帧率
             fpsRange?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
         }.build()
-    }
-
-    /**
-     * 盯着 `CONTROL_AF_STATE`，一旦对焦完成就换成锁定版请求。
-     *
-     * 如果一直等不到（光线太暗、画面无纹理），就保持连续对焦继续跑——
-     * 连续对焦的图是清晰的，只是焦距会随距离微调，比"锁在一个错误的
-     * 位置、整幅图都是糊的"要好得多。
-     */
-    private val focusCallback = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(
-            s: CameraCaptureSession,
-            request: CaptureRequest,
-            result: TotalCaptureResult
-        ) {
-            if (focusLocked) return
-            val st = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
-            val focused = st == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                          st == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
-            if (!focused) return
-
-            val d = device ?: return
-            val surf = surface ?: return
-
-            // 把对焦达成那一刻的镜组位置读出来，之后用它把镜组钉在原地。
-            val dist = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
-
-            if (dist == null || dist <= 0f) {
-                // 读不到有效距离（0 表示未知，或者镜组在无穷远）。
-                //
-                // 这时**千万不能**切 AF_MODE_OFF——那正是会让镜组停车、
-                // 把画面搞糊的那一步。宁可保持连续对焦：图一直是清晰的，
-                // 代价只是焦距会随拍摄距离轻微呼吸。
-                focusLocked = true
-                Log.w(TAG, "AF_STATE=$st，但读不到有效对焦距离($dist)，保持连续对焦")
-                markFocusReady("连续对焦（没有可锁的对焦距离）")
-                return
-            }
-
-            try {
-                s.setRepeatingRequest(buildRequest(d, surf, dist), null, handler)
-                focusLocked = true
-                Log.i(TAG, "对焦完成 AF_STATE=$st，镜组锁定于 %.3f 屈光度 (= %.2f m)"
-                    .format(dist, 1f / dist))
-                markFocusReady("对焦已锁定")
-            } catch (e: Exception) {
-                Log.e(TAG, "锁定对焦失败，继续用连续对焦（画面仍清晰，但焦距不固定）", e)
-                markFocusReady("锁定失败，带连续对焦开始")
-            }
-        }
-    }
-
-    /**
-     * 两个条件都齐了就开闸。幂等——两条路（对焦 / IMU）谁后到谁触发，
-     * 各自的超时兜底也会触发，一共四个调用点。
-     */
-    private fun maybeBegin(trigger: String) {
-        if (!focusReady || !imuReady) return
-        if (!capturing.compareAndSet(false, true)) return
-        Log.i(TAG, "开始落盘（由「$trigger」触发；对焦与 IMU 均已就绪）")
-    }
-
-    /** 对焦就绪：要么真的锁定了，要么等超时了。只标记，不阻塞。 */
-    private fun markFocusReady(reason: String) {
-        if (focusReady) return
-        focusReady = true
-        Log.i(TAG, "对焦就绪（$reason）")
-        maybeBegin(reason)
-    }
-
-    /**
-     * IMU 就绪。由 [ImuCollector.onFirstSample] 在第一个样本落盘后回调，
-     * 跑在 IMU 的 handler 线程上——这里只碰 volatile 标志和 AtomicBoolean，
-     * 不能有阻塞操作。
-     */
-    fun markImuReady() = markImuReady("IMU 首样本")
-
-    private fun markImuReady(reason: String) {
-        if (imuReady) return
-        imuReady = true
-        Log.i(TAG, "IMU 就绪（$reason）")
-        maybeBegin(reason)
-    }
-
-    private fun createSession(d: CameraDevice, target: Surface) {
-        d.createCaptureSession(listOf(target), object : CameraCaptureSession.StateCallback() {
-            override fun onConfigured(s: CameraCaptureSession) {
-                session = s
-                try {
-                    // 先跑连续对焦版。对焦完成后 focusCallback 会自己换成锁定版。
-                    s.setRepeatingRequest(
-                        buildRequest(d, target, focusDistance = null), focusCallback, handler
-                    )
-                    Log.i(TAG, "相机已启动 ${W}x${H} fps范围=$fpsRange 支持AF=$supportsAf，"
-                        + "等对焦与 IMU 都就绪后开始落盘")
-
-                    // 兜底 1：万一 AF 一直不报 FOCUSED（光线太暗、画面无纹理、
-                    // 或者干脆是定焦镜头），不能无限等下去。超时就开始采集——
-                    // 连续对焦的画面是清晰的，只是焦距不固定，比空等强。
-                    focusTimeout = Runnable {
-                        if (!focusLocked) markFocusReady("等对焦超时 ${focusWaitMs}ms")
-                    }.also { handler.postDelayed(it, focusWaitMs) }
-
-                    // 兜底 2：IMU 迟迟不出数。本机正常约 3.3 s（传感器挂在
-                    // 协处理器后面），给足 8 s。超时也开——但录出来的数据
-                    // ORB-SLAM3 会因为 IMU 晚于相机而报错退出，所以这条 ERROR
-                    // 是排查时的关键线索。
-                    imuTimeout = Runnable {
-                        if (!imuReady) {
-                            Log.e(TAG, "等 IMU 首样本超时 ${imuWaitMs}ms——"
-                                + "本次录制两个流的时间关系可能不满足 ORB-SLAM3 的前提")
-                            markImuReady("等 IMU 超时")
-                        }
-                    }.also { handler.postDelayed(it, imuWaitMs) }
-                } catch (e: Exception) {
-                    Log.e(TAG, "setRepeatingRequest 失败", e)
-                }
-            }
-            override fun onConfigureFailed(s: CameraCaptureSession) {
-                Log.e(TAG, "会话配置失败——可能这台设备不支持 ${W}x${H} 的 YUV 输出")
-            }
-        }, handler)
-    }
-
-    fun stop() {
-        focusTimeout?.let { handler.removeCallbacks(it) }
-        imuTimeout?.let { handler.removeCallbacks(it) }
-        focusTimeout = null
-        imuTimeout = null
-
-        try { session?.stopRepeating() } catch (_: Exception) {}
-        try { session?.close() } catch (_: Exception) {}
-        try { device?.close() } catch (_: Exception) {}
-        try { reader?.close() } catch (_: Exception) {}
-        session = null; device = null; reader = null; surface = null
-        focusLocked = false
-        focusReady = false
-        capturing.set(false)
     }
 
     // ---------------- 设备探测 ----------------

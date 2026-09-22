@@ -2,23 +2,58 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="16dp">
+    android:orientation="vertical">
 
-    <Button
-        android:id="@+id/btnToggle"
+    <!-- 黑底既是 letterbox 的黑边，也是"没有画面时露出来的东西"。
+         预览永远从**已经在跑的那路 ImageReader 的 Y 平面**取帧，不额外挂 camera
+         surface——多一路输出会让相机重新协商 stream 配置，可能换 sensor mode 或裁切，
+         fx 就变了，整个标定作废。 -->
+    <com.example.slamcapture.PreviewView
+        android:id="@+id/preview"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="开始采集" />
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#000000" />
 
     <TextView
         android:id="@+id/tvStatus"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:layout_marginTop="16dp"
+        android:layout_height="wrap_content"
+        android:padding="8dp"
         android:fontFamily="monospace"
         android:textSize="12sp"
-        android:text="就绪" />
+        android:text="点「开始准备」打开相机和 IMU。" />
+
+    <!-- 两个按钮放最下面，好按；左边"退一层"，右边"进一步"。 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="8dp">
+
+        <!-- textColor 必须显式给：主题（Theme.AppCompat.NoActionBar 的按钮）默认是
+             白字，而 render() 在中性态会把 backgroundTintList 置 null 让底变成白色——
+             白底白字就看不见了。中性态用深字，着色态（绿/红）由 render() 切回白字。 -->
+        <Button
+            android:id="@+id/btnA"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="4dp"
+            android:text="开始准备"
+            android:textColor="#DE000000" />
+
+        <Button
+            android:id="@+id/btnB"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="4dp"
+            android:enabled="false"
+            android:text="开始录制"
+            android:textColor="#DE000000" />
+    </LinearLayout>
 
 </LinearLayout>
