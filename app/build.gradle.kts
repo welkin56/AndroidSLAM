@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.example.slamcapture"
     compileSdk = 34
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.example.slamcapture"
@@ -13,6 +14,10 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            abiFilters += "arm64-v8a"    // 只打 64 位 ARM：APK 减半，也避免 ABI 混装
+        }
     }
 
     buildTypes {
@@ -28,6 +33,12 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")   // native 工程的入口
+        }
     }
 }
 
