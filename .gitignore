@@ -17,5 +17,10 @@ captures/
 # 由 CMakeLists 里的 export_compile_commands 目标导出，是生成物不是源码
 app/src/main/cpp/compile_commands.json
 
+# 安卓版 Boost：它是**构建产物**不是源码 —— 绑死 NDK 版本和编译选项，150 MB，
+# 而 13 个头文件里的 serialize() 只用到 libboost_serialization 这一个。
+# 拿不到的：Boost 没有官方安卓发布物，跑 tools/setup-boost-android.sh 自己编。
+app/src/main/cpp/thirdparty/boost-android/
+
 # 系统垃圾
 .DS_Store
