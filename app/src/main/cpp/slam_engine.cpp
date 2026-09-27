@@ -27,11 +27,19 @@ namespace {
 struct Engine {
     std::atomic<State> state{State::kIdle};
     std::atomic<ORB_SLAM3::System*> sys{nullptr};
+    /** 开始构造的时刻（steady_clock 的毫秒，只在本进程内有意义）。给 elapsedMs 用。 */
+    std::atomic<long long> startedAtMs{0};
 
     // 只在启动线程之前赋值，之后只读 —— 所以不用锁。
     std::string vocab;
     std::string settings;
 };
+
+long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 // 故意泄漏，见文件头第 2 条。
 Engine& engine() {
@@ -92,11 +100,18 @@ void init(const std::string& vocabPath, const std::string& settingsPath,
 
     e.vocab = vocabPath;
     e.settings = settingsPath;
+    e.startedAtMs.store(nowMs());
 
     // 起来就 detach：它活到进程结束，没人 join 它。
     std::thread(&construct, std::ref(e)).detach();
 }
 
 State state() { return engine().state.load(); }
+
+long long elapsedMs() {
+    Engine& e = engine();
+    if (e.state.load() != State::kLoading) return 0;
+    return nowMs() - e.startedAtMs.load();
+}
 
 }  // namespace slam

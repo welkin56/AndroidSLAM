@@ -48,4 +48,13 @@ object SlamBridge {
     external fun nativeState(): Int
 
     external fun nativeIsReady(): Boolean
+
+    /**
+     * 词袋已经加载了多久（毫秒）。不在加载中时返回 0。
+     *
+     * **不要用 Kotlin 自己掐表** —— 构造是进程级的事实，而 Activity 重建时（比如从入口页
+     * 再进来一次）Kotlin 那边的计时会归零，`System` 却还在造，界面就成了「刚点下然后
+     * 一直转圈」。谁干的活谁报时间。
+     */
+    external fun nativeElapsedMs(): Long
 }

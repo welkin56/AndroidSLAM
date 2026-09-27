@@ -95,3 +95,14 @@ Java_com_example_slamcapture_SlamBridge_nativeIsReady(JNIEnv* /*env*/, jobject /
         return JNI_FALSE;
     }
 }
+
+// 已经加载了多久（毫秒）。不在加载中时返回 0。
+// 由 C++ 报而不是 Kotlin 掐表：构造是进程级的事实，Activity 重建时 Kotlin 那边的计时会归零。
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeElapsedMs(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jlong>(slam::elapsedMs());
+    } catch (...) {
+        return 0;
+    }
+}

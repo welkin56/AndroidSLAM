@@ -24,4 +24,11 @@ void init(const std::string& vocabPath, const std::string& settingsPath,
 
 State state();
 
+// 「已经加载了多久」，毫秒；不在加载中时返回 0。
+//
+// 为什么要由 C++ 报而不是 Kotlin 自己掐表：**构造是进程级的事实，掐表是 Activity 级的状态**。
+// Activity 重建（比如从入口页再进来一次）时 Kotlin 那边的计时会归零，而 System 还在造 ——
+// 界面就会显示成「刚点下」然后一直转圈。谁干的活谁报时间。
+long long elapsedMs();
+
 }  // namespace slam

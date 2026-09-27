@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  入口页：选定「地图从哪来」，然后进主界面。
+
+  「＋ 新建地图」和下面的列表是**两类动作**（一个是"从零开始"，一个是"挑一张已有的"），
+  所以分开摆，不混成一个列表。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:text="选一张地图"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/btnNewMap"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="＋ 新建地图"
+        android:textColor="#DE000000" />
+
+    <!-- 列表空的时候露出来的东西。M8 之前恒为这一态：保存还没做，磁盘上不会有 .osa。 -->
+    <TextView
+        android:id="@+id/tvEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:gravity="center"
+        android:text="还没有保存的图\n\n（保存功能是 M8 的事）"
+        android:textColor="#99000000"
+        android:visibility="gone" />
+
+    <ListView
+        android:id="@+id/mapList"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="8dp" />
+
+    <!-- 录制模式和上面的「选地图」是**两条不同的轴** —— 它不碰地图，直接进采集页。
+         所以隔开摆，不混进那个列表。 -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="12dp"
+        android:background="#22000000" />
+
+    <Button
+        android:id="@+id/btnRecordMode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="录制模式"
+        android:textColor="#DE000000" />
+
+</LinearLayout>
