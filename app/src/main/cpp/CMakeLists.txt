@@ -128,8 +128,15 @@ add_library(orb_slam3 SHARED
 # 但 target 级能限到最窄：不会漏给 g2o、DBoW2、slam_jni。
 target_include_directories(orb_slam3 PRIVATE ${CPP_DIR})
 
-target_link_libraries(orb_slam3
-    DBoW2 g2o
+target_link_libraries(orb_slam3 PUBLIC DBoW2 g2o)
+# OpenCV / Boost / z 用 PRIVATE：orb_slam3 对外只该暴露 ORB-SLAM3 自己的东西。
+# ⚠️ 但实测这**没有**让 libslam_jni.so 变干净 —— OpenCV 的 .a 照样出现在它的链接行上。
+# 漏点在 vendored 的 DBoW2/CMakeLists.txt：`target_link_libraries(DBoW2 ${OpenCV_LIBS})`
+# 用的是默认签名（= PUBLIC），从那条路传下去了，在 orb_slam3 这一层挡不住。
+# 结果：libslam_jni.so 的 .text 253 KB，里面 170 个 cv:: 符号（imshow / namedWindow 那类）。
+# 两份是同一份静态库编出来的，逐字节相同，所以**只是体积问题、不是正确性问题**。
+# 要清掉得改 DBoW2 那一行，见改动记录的遗留。
+target_link_libraries(orb_slam3 PRIVATE
     ${OpenCV_LIBS}
     ${BOOST_SERIALIZATION_LIB}
     z log)
@@ -140,8 +147,9 @@ target_link_libraries(orb_slam3
 add_library(slam_jni SHARED
     jni_bridge.cpp        # JNI 符号层：翻译 + 转发
     log_redirect.cpp      # 基础设施：把 fd 1/2 接进 logcat
+    slam_engine.cpp       # 构造并持有 ORB_SLAM3::System
     )
-target_link_libraries(slam_jni orb_slam3 log)
+target_link_libraries(slam_jni PRIVATE orb_slam3 log)
 
 # 把 compile_commands.json 导出到本文件旁边（固定路径）。
 # 智能感知要读它，但 AGP 生成在 app/.cxx/<类型>/<哈希>/<abi>/ 下——

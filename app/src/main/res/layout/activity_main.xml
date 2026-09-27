@@ -24,6 +24,20 @@
         android:textSize="12sp"
         android:text="点「开始准备」打开相机和 IMU。" />
 
+    <!-- SLAM 单独一行：它和下面那两个**不属于同一组语义**——下面那两个是采集端
+         「落盘」这一个开关，而 SLAM 是另一条线（APP_DESIGN §6 的四个正交开关）。
+         ⚠️ 这一行是 M4 的临时位置，等主界面按 APP_DESIGN 重排时会挪到「启动/停止 SLAM」
+         该在的地方。 -->
+    <Button
+        android:id="@+id/btnSlam"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:layout_marginEnd="8dp"
+        android:layout_marginBottom="4dp"
+        android:text="启动 SLAM"
+        android:textColor="#DE000000" />
+
     <!-- 两个按钮放最下面，好按；左边"退一层"，右边"进一步"。 -->
     <LinearLayout
         android:layout_width="match_parent"

@@ -23,4 +23,29 @@ object SlamBridge {
      * 重定向装在 `JNI_OnLoad` 里，见 jni_bridge.cpp。
      */
     external fun nativeLogSelfTest()
+
+    // —— M4：构造 ORB_SLAM3::System ——
+
+    /**
+     * **只生效一次**，重复调用会被忽略（构造一次要十几到几十秒，不能重来）。
+     *
+     * 同步只做「存路径 + 置加载中」，真正的构造在 C++ 那边的线程上跑，所以这个调用
+     * **立刻返回**——否则「启动」按钮会被卡死十几到几十秒。
+     *
+     * 两条路径都必须指向**真实存在的文件**：`System` 会把它们交给 `cv::FileStorage`
+     * 和 `loadFromTextFile`，路径不对时 ORB-SLAM3 用 `exit(-1)` 报错，
+     * 表现是 App 干净地消失、logcat 里什么也没有。
+     *
+     * @param loadFromFile 载入哪张旧图。**M4 还不支持**，传 null。
+     */
+    external fun nativeInit(vocabPath: String, settingsPath: String, loadFromFile: String?)
+
+    /**
+     * 构造状态：0=没开始 1=加载中 2=就绪 3=失败。
+     *
+     * 用四态而不是布尔：「失败」必须能显示出来，否则界面就是「点了一下，一直转圈」。
+     */
+    external fun nativeState(): Int
+
+    external fun nativeIsReady(): Boolean
 }

@@ -4,11 +4,30 @@
 // 时 Kotlin 侧抛 UnsatisfiedLinkError —— 排错第一板斧就是逐段核这个名。
 #include <jni.h>
 
+#include <android/log.h>
+
 #include <cstdio>
 #include <iostream>
 #include <string>
 
 #include "log_redirect.h"
+#include "slam_engine.h"
+
+namespace {
+
+// jstring → std::string。路径都是 ASCII，GetStringUTFChars 拿到的够用。
+// ⚠️ 放匿名 namespace 里：这一层编出来的辅助符号不能漏进 .so 的导出表（见 M2 的改动记录）。
+std::string toStdString(JNIEnv* env, jstring s) {
+    if (s == nullptr) return {};
+    const char* p = env->GetStringUTFChars(s, nullptr);
+    if (p == nullptr) return {};   // OOM
+    std::string out(p);
+    env->ReleaseStringUTFChars(s, p);
+    return out;
+}
+
+}  // namespace
+
 
 // .so 一加载就装日志重定向。ORB-SLAM3 的 cout/cerr 默认进 /dev/null，不接出来它
 // 就是个哑巴，而它的失败方式（exit(-1)）在 logcat 里连栈都没有。
@@ -39,4 +58,40 @@ Java_com_example_slamcapture_SlamBridge_nativeLogSelfTest(JNIEnv* /*env*/, jobje
     // 收尾语先打；下面那行故意不带换行，要晚约 0.2 s 才出现，晚一点是对的。
     std::cerr << "[M2] 自检结束（下面那行不带换行，晚约 0.2 s 出现才是对的）" << std::endl;
     std::cout << "[M2] 这一行故意不带换行" << std::flush;
+}
+
+// —— M4：构造 ORB_SLAM3::System ——
+//
+// 三个函数体都包 try/catch：C++ 异常穿过 JNI 边界 = 进程直接死，Java 侧连栈都没有。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeInit(JNIEnv* env, jobject /*thiz*/,
+                                                   jstring vocabPath, jstring settingsPath,
+                                                   jstring loadFromFile) {
+    try {
+        slam::init(toStdString(env, vocabPath), toStdString(env, settingsPath),
+                   toStdString(env, loadFromFile));
+    } catch (...) {
+        // 这里吞掉不好，但「异常过界」更坏。状态查询那边会显示成「没开始」。
+        __android_log_write(ANDROID_LOG_ERROR, "slam", "[M4] nativeInit 抛异常");
+    }
+}
+
+// 0=没开始 1=加载中 2=就绪 3=失败。用四态而不是布尔：「失败」必须能显示出来，
+// 否则界面就是「点了一下，一直转圈」。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::state());
+    } catch (...) {
+        return static_cast<jint>(slam::State::kFailed);
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeIsReady(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::state() == slam::State::kReady ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
 }

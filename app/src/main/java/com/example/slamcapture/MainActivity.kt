@@ -17,6 +17,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.Executors
 
 /**
@@ -61,6 +62,21 @@ class MainActivity : AppCompatActivity() {
         /** 状态栏刷新间隔。 */
         const val TICK_MS = 250L
 
+        /**
+         * 词袋文件名。**145 MB，不进 APK** —— 用 `tools/push-vocab.sh` 推到外部文件目录，
+         * 和 session 同一个根（理由同采集端：`adb push/pull` 都不需要 root）。
+         */
+        const val VOCAB_NAME = "ORBvoc.txt"
+
+        /** 相机配置。权威副本在 `assets/`（STAGE5 §2.2），启动时落到私有目录再给 C++。 */
+        private const val SETTINGS_NAME = "phone.yaml"
+
+        // SlamBridge.nativeState() 的取值，和 C++ 侧 slam::State 一一对应。
+        private const val SLAM_IDLE = 0
+        private const val SLAM_LOADING = 1
+        private const val SLAM_READY = 2
+        private const val SLAM_FAILED = 3
+
         private const val REQ_CAMERA = 1
         private val RED = Color.parseColor("#C62828")
         private val GREEN = Color.parseColor("#2E7D32")
@@ -76,6 +92,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var btnA: Button
     private lateinit var btnB: Button
+    private lateinit var btnSlam: Button
     private lateinit var tvStatus: TextView
     private lateinit var preview: PreviewView
 
@@ -127,6 +144,14 @@ class MainActivity : AppCompatActivity() {
 
     private var dialog: AlertDialog? = null
 
+    // ---------------- SLAM（M4：只到「能构造 System」为止）----------------
+
+    /** 按过「启动 SLAM」的时刻，0 = 没按过。只用来算「已用多久」。 */
+    private var slamStartedAtNs = 0L
+
+    /** 缓存的构造状态。**只在主线程写**（[onButtonSlam] 和 [ticker]）。 */
+    private var slamState = SLAM_IDLE
+
     // ---------------- 帧出口 ----------------
 
     /**
@@ -160,6 +185,7 @@ class MainActivity : AppCompatActivity() {
 
         btnA = findViewById(R.id.btnA)
         btnB = findViewById(R.id.btnB)
+        btnSlam = findViewById(R.id.btnSlam)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
 
@@ -173,6 +199,14 @@ class MainActivity : AppCompatActivity() {
 
         btnA.setOnClickListener { onButtonA() }
         btnB.setOnClickListener { onButtonB() }
+        btnSlam.setOnClickListener { onButtonSlam() }
+
+        // 摸一下 SlamBridge，让 .so 在启动时就加载：JNI_OnLoad 里装着日志重定向，
+        // 而 liborb_slam3.so 是它的依赖，静态初始化也在这一刻跑。
+        // 用 nativeHello 不用 nativeLogSelfTest——前者只回一个字符串，不灌七行噪音。
+        // 这同时是 STAGE5 §7 排查阶梯的第一级：「桥还通不通」。
+        Log.i(TAG, "native 探针：" + SlamBridge.nativeHello())
+
         render()
     }
 
@@ -219,6 +253,72 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------------- SLAM ----------------
+
+    /**
+     * 按「启动 SLAM」。**只生效一次**——`System` 构造一次要十几到几十秒，不能重来。
+     *
+     * [SlamBridge.nativeInit] 立刻返回，真正的构造在 C++ 那边的线程上跑，所以这里
+     * 不会卡住界面。我们只负责：把路径准备好，**并且在调它之前把最常见的死法挡在门外**。
+     */
+    private fun onButtonSlam() {
+        if (slamStartedAtNs != 0L) return
+        // 相机权限不是 SLAM 的前提（M4 不喂帧），但词袋和 yaml 是。
+        val vocab = resolveVocabPath() ?: return
+        val settings = resolveSettingsPath() ?: return
+
+        slamStartedAtNs = SystemClock.elapsedRealtimeNanos()
+        slamState = SLAM_LOADING
+        SlamBridge.nativeInit(vocab, settings, null)
+        render()
+        uiQueueTicker()
+    }
+
+    /**
+     * 词袋路径。145 MB，没进 APK，靠 `tools/push-vocab.sh` 推到外部文件目录。
+     *
+     * 返回 null = 已经往状态栏写了可读的提示，调用方直接返回、**不要调 nativeInit**。
+     */
+    private fun resolveVocabPath(): String? {
+        val f = File(getExternalFilesDir(null) ?: filesDir, VOCAB_NAME)
+        return f.takeIf { it.isFile && it.length() > 0 && it.canRead() }?.absolutePath
+            ?: refuse("词袋", f) {
+                "跑一次 tools/push-vocab.sh 把它推上来（145 MB，不进 APK）。"
+            }
+    }
+
+    /**
+     * yaml 路径。`assets/phone.yaml` 是权威副本（STAGE5 §2.2），但 C++ 那边要的是
+     * **真实文件路径**（`cv::FileStorage` 不吃 AssetManager），所以先落到私有目录。
+     */
+    private fun resolveSettingsPath(): String? {
+        val dst = File(filesDir, SETTINGS_NAME)
+        try {
+            assets.open(SETTINGS_NAME).use { input ->
+                dst.outputStream().use { output -> input.copyTo(output) }
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "释放 $SETTINGS_NAME 失败", e)
+            tvStatus.text = "打不开 assets/$SETTINGS_NAME：$e"
+            return null
+        }
+        return dst.takeIf { it.length() > 0 && it.canRead() }?.absolutePath
+            ?: refuse("配置", dst) { "assets/$SETTINGS_NAME 是空的，检查打包。" }
+    }
+
+    /**
+     * **第一道防线**（STAGE5 §3.2）。路径不对时 ORB-SLAM3 用 `exit(-1)` 报错，
+     * 表现是「App 整个退回桌面、logcat 干干净净」——能在这里挡住的就别让它跑进去。
+     *
+     * 挡不住的也得知道它挡不住：yaml **存在但缺一个必填键**照样会 exit(-1)，
+     * 那种只能靠 M2 接进 logcat 的 `cerr`。两道的分工见改动记录。
+     */
+    private fun refuse(what: String, f: File, hint: () -> String): String? {
+        Log.e(TAG, "找不到$what：${f.absolutePath}")
+        tvStatus.text = "找不到$what：\n${f.absolutePath}\n\n${hint()}"
+        return null
+    }
+
     // ---------------- 准备 ----------------
 
     /**
@@ -252,8 +352,7 @@ class MainActivity : AppCompatActivity() {
         cam.beginSettle()
 
         render()
-        uiHandler.removeCallbacks(ticker)
-        uiHandler.post(ticker)
+        uiQueueTicker()
     }
 
     // ---------------- 录制 ----------------
@@ -378,7 +477,9 @@ class MainActivity : AppCompatActivity() {
 
         dialog?.dismiss()
         dialog = null
-        uiHandler.removeCallbacks(ticker)
+        // 不是 removeCallbacks —— SLAM 可能还在加载，而它的进度靠这个 ticker 刷。
+        // 重新排一遍，让 ticker 自己决定该不该继续。
+        uiQueueTicker()
 
         imu?.stop()
         imuThread?.quitSafely()
@@ -394,12 +495,27 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 状态栏 ----------------
 
+    /**
+     * 每 [TICK_MS] 刷一次。**什么时候继续跑由它自己判断**：采集端不在 IDLE，
+     * 或者 SLAM 还在加载。
+     *
+     * ⚠️ 「SLAM 还在加载」这一条是必需的：那一段发生在 [Phase.IDLE] 期间，
+     * 而这里原先遇到 IDLE 就直接 return —— 那样「词袋加载中…」永远不刷新。
+     */
     private val ticker = object : Runnable {
         override fun run() {
-            if (phase == Phase.IDLE) return
+            if (slamStartedAtNs != 0L) slamState = SlamBridge.nativeState()
+            val slamBusy = slamStartedAtNs != 0L && slamState == SLAM_LOADING
+            if (phase == Phase.IDLE && !slamBusy) return
             render()
             uiHandler.postDelayed(this, TICK_MS)
         }
+    }
+
+    /** 重新起一遍 ticker。重复调用无害——它每轮自己决定还继不继续。 */
+    private fun uiQueueTicker() {
+        uiHandler.removeCallbacks(ticker)
+        uiHandler.post(ticker)
     }
 
     /** 刷按钮和状态栏。**按钮的颜色和文字都是从 [phase] 推出来的**，不另存一份。 */
@@ -408,6 +524,11 @@ class MainActivity : AppCompatActivity() {
         val w = writer
         val camOk = cam.ready
         val imuOk = imu?.ready == true
+
+        // ---- SLAM（M4 只有「启动」，没有停止/重定位）----
+        // 失败之后也不放开：C++ 那边的 init 只生效一次（CAS on kIdle），再按也没用。
+        btnSlam.isEnabled = slamStartedAtNs == 0L
+        btnSlam.text = if (slamStartedAtNs == 0L) "启动 SLAM" else "SLAM 已启动"
 
         // ---- 按钮 ----
         // 文字色和背景**成对**设置：中性态（tint=null，白底）配深字，
@@ -474,7 +595,21 @@ class MainActivity : AppCompatActivity() {
             lastSessionDir?.let { append("\n上一次：${it.absolutePath}") }
             cam.lastError?.let { append("\n相机：$it") }
         }
-        tvStatus.text = "$head\n\n$body"
+
+        // SLAM 那一行单独放最上面：它是另一条线（APP_DESIGN §6 的四个正交开关之一）。
+        // 「加载中」带已用秒数 —— 文档里一直写的是猜的「十几到几十秒」，实测数字靠它读。
+        val slamHead = when {
+            slamStartedAtNs == 0L -> "SLAM：未启动"
+            slamState == SLAM_LOADING -> {
+                val sec = (SystemClock.elapsedRealtimeNanos() - slamStartedAtNs) / 1_000_000_000
+                "SLAM：词袋加载中…（已 ${sec}s，十几到几十秒属正常）"
+            }
+            slamState == SLAM_READY -> "SLAM：就绪"
+            slamState == SLAM_FAILED -> "SLAM：构造失败 —— 看 logcat（tag slam）"
+            else -> "SLAM：状态未知（$slamState）"
+        }
+
+        tvStatus.text = "$slamHead\n\n$head\n\n$body"
     }
 
     // ---------------- 权限 ----------------
