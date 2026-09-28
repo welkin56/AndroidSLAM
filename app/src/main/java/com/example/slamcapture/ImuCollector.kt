@@ -98,6 +98,19 @@ class ImuCollector(private val context: Context) {
     @Volatile
     private var writer: SessionWriter? = null
 
+    /**
+     * 每个**搓好对**的样本的出口：一个时间戳 + 角速度 + 加速度。
+     *
+     * 和 [writer] **各管各的**，可以同时有，也可以只有一边 —— 一个是落盘，一个是喂给 SLAM。
+     * **跑在 IMU 的 handler 线程上**，实现里不能阻塞。
+     *
+     * 为什么是一整个样本而不是「陀螺、加速度各一路」：ORB-SLAM3 的 `IMU::Point`
+     * 就是这个形状，而配对逻辑本来就在下面那个陀螺回调里。详见 `SlamBridge.nativePushImu`。
+     */
+    @Volatile
+    var onSample: ((tsNs: Long, wx: Float, wy: Float, wz: Float,
+                    ax: Float, ay: Float, az: Float) -> Unit)? = null
+
     /** [start] 的那一刻，用来量冷启动耗时。 */
     @Volatile
     private var registeredAtNs = 0L
@@ -137,21 +150,27 @@ class ImuCollector(private val context: Context) {
     private val gyroListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
             if (event.values.size < 3) return
-            val w = writer ?: return      // 没在记录：传感器照跑，不落盘
-            val n = newestAccel ?: return // 还没收到过加速度，等下一拍
+            val n = newestAccel ?: return            // 还没收到过加速度，等下一拍
+            val w = writer
+            val cb = onSample
+            if (w == null && cb == null) return      // 既不落盘也没人要：传感器照跑
             val p = prevAccel
 
             val t = event.timestamp
             val s = if (p != null && abs(t - p.ts) < abs(t - n.ts)) p else n
 
-            w.recordPairGap(abs(t - s.ts))
-            w.offerImu(
-                SessionWriter.ImuItem(
-                    t,
-                    event.values[0], event.values[1], event.values[2],
-                    s.x, s.y, s.z
+            // 两个出口都在**同一个地方** —— 这样它们拿到的都是搓好对的完整样本。
+            cb?.invoke(t, event.values[0], event.values[1], event.values[2], s.x, s.y, s.z)
+            if (w != null) {
+                w.recordPairGap(abs(t - s.ts))
+                w.offerImu(
+                    SessionWriter.ImuItem(
+                        t,
+                        event.values[0], event.values[1], event.values[2],
+                        s.x, s.y, s.z
+                    )
                 )
-            )
+            }
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }

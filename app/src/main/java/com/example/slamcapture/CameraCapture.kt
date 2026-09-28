@@ -103,6 +103,25 @@ class CameraCapture(
         private set
 
     /**
+     * 把 Camera2 的错误码翻成人话 —— 光一句 `error=1` 谁也看不懂。
+     *
+     * `ERROR_CAMERA_IN_USE` 那条是最常见的：**上一个页面刚放开相机、系统还没真正释放**。
+     * 从 SLAM 页按 Back 再立刻进录制页就会撞上它（两个页面各持一份 [CameraCapture]，
+     * 关是异步的）。**症状是黑屏，出路是再按一次「开始准备」。**
+     */
+    // ⚠️ 这几个常量挂在 `CameraDevice.StateCallback` 上，**不是** `CameraDevice` ——
+    // Kotlin 不许通过外部类访问嵌套类的静态成员，写错了编不过（已用 javap 核过）。
+    private fun cameraErrorText(error: Int): String = when (error) {
+        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE ->
+            "相机被占用 —— 上一个页面可能还没放开，再试一次"
+        CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "相机数量已达上限"
+        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "相机被系统策略禁用"
+        CameraDevice.StateCallback.ERROR_CAMERA_DEVICE -> "相机设备出错"
+        CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "相机服务出错"
+        else -> "相机打开失败 error=$error"
+    }
+
+    /**
      * 相机这一代的编号。**奇数 = 正在跑，偶数 = 已停。**
      *
      * 以前这里是个 `started` 布尔量，它挡不住这个序列：
@@ -278,7 +297,7 @@ class CameraCapture(
                 return
             }
             Log.e(TAG, "相机打开失败 error=$error")
-            lastError = "相机打开失败 error=$error"
+            lastError = cameraErrorText(error)
             try { d.close() } catch (_: Exception) {}
             releaseResources()
             epoch++

@@ -57,4 +57,40 @@ object SlamBridge {
      * 一直转圈」。谁干的活谁报时间。
      */
     external fun nativeElapsedMs(): Long
+
+    // —— M5：喂帧、喂 IMU、位姿 ——
+
+    /**
+     * 每帧一次。**跑在相机线程上，里面绝不能阻塞**（铁律 1）—— 实现里只是拷进队列。
+     *
+     * **不做零拷贝**（STAGE5 §5）：`ByteArray` 有三个持有者（落盘 / 预览 / SLAM），
+     * 复用一个 buffer 会让它们读到被覆盖的帧。
+     */
+    external fun nativePushImage(tsNs: Long, gray: ByteArray, w: Int, h: Int)
+
+    /**
+     * 每来一个完整样本调一次：**一个时间戳 + 角速度 + 加速度**。
+     *
+     * ⚠️ 这不是 §6 写的那种「陀螺/加速度分两次调、由 C++ 配对」。改的理由：
+     * `IMU::Point` 要的就是完整样本，而配对逻辑 [`ImuCollector`] 本来就有（还带配对偏差统计）。
+     * 顺带关掉一个**静默**的坑 —— 那个结构体的参数顺序是「加速度在前」，
+     * 和我们的 `ImuItem` 正好相反，分开传很容易写反，而**写反不报错、只是跟踪整个乱掉**。
+     */
+    external fun nativePushImu(tsNs: Long, wx: Float, wy: Float, wz: Float,
+                               ax: Float, ay: Float, az: Float)
+
+    /** 开始吃帧。**不销毁 `System`** —— 所以「停止」之后再「启动」是立刻可用的。 */
+    external fun nativeStart()
+
+    /** 停止吃帧，并**清空积压的队列**（否则下次启动会吃到停止前的旧帧）。`System` 保留。 */
+    external fun nativeStop()
+
+    /** 4x4 **列主序**。返回 false = 还没有位姿。**传进来的数组必须 ≥ 16 个元素。** */
+    external fun nativeGetPose(out: FloatArray): Boolean
+
+    /** ORB-SLAM3 的 `eTrackingState`：-1 还没准备好 / 0 一帧没进来 / 1 惯性初始化中 / 2 OK / 3 刚丢 / 4 完全丢。 */
+    external fun nativeGetTrackingState(): Int
+
+    /** 把这一趟的位姿历史写成文件（TUM 格式，和 PC 的 `CameraTrajectory.txt` 同款）。 */
+    external fun nativeDumpTrajectory(path: String)
 }

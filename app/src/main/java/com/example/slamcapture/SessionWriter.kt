@@ -91,6 +91,16 @@ class SessionWriter(val sessionDir: File) {
     @Volatile
     var forced = false
 
+    /**
+     * 这一段是不是**在 SLAM 跑着的时候录的**（抽屉里那个开关）。
+     *
+     * ⚠️ 必须标出来：两种来源录出来的文件**格式完全一样**，事后光看目录分不出。
+     * 而它们的用途不同 —— 带 SLAM 的那段是给「同段数据手机跑 vs PC 跑」做对照用的，
+     * 帧率被落盘拖低过；录制模式录的才是干净的采集数据。
+     */
+    @Volatile
+    var withSlam = false
+
     /** 第一帧落盘的时刻。0 = 一帧都没落。writer 线程独占写。 */
     @Volatile
     var firstFrameTsNs = 0L
@@ -261,6 +271,7 @@ class SessionWriter(val sessionDir: File) {
                 {
                   "duration_s": $elapsedS,
                   "forced": $forced,
+                  "with_slam": $withSlam,
                   "first_frame_ts_ns": $firstFrameTsNs,
                   "first_imu_ts_ns": $firstImuTsNs,
                   "frames_written": ${framesWritten.get()},

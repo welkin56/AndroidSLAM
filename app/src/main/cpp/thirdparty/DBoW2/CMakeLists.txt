@@ -40,6 +40,18 @@ endif()
 set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
-add_library(DBoW2 SHARED ${SRCS_DBOW2} ${SRCS_DUTILS})
+# 改自上游：SHARED → STATIC。
+#
+# 上游把它做成独立的 .so，而它 `target_link_libraries(DBoW2 ${OpenCV_LIBS})` 用的是
+# **静态** OpenCV —— 于是 **libDBoW2.so 里静态链了一份完整的 cv::**，
+# 而 liborb_slam3.so 里**也有一份**。同一个进程里两份 `cv::` 符号。
+#
+# 后果是真机上的 SIGSEGV：`Frame::ExtractORB` → `ORBextractor` → `cv::GaussianBlur`
+# → **`cv::parallel_for_` 被动态链接器解析到了 libDBoW2.so 那一份** ——
+# 那是 OpenCV 里带**全局线程池**的东西，两个副本的状态互相踩。
+# 完整调用链见 docs/changes/2026-09-28-m5-slam-on-phone.md。
+#
+# 静态链进来之后，整个进程只剩一份 OpenCV 的符号，问题消失。
+add_library(DBoW2 STATIC ${SRCS_DBOW2} ${SRCS_DUTILS})
 target_link_libraries(DBoW2 ${OpenCV_LIBS})
 

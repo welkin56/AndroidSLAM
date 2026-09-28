@@ -106,3 +106,93 @@ Java_com_example_slamcapture_SlamBridge_nativeElapsedMs(JNIEnv* /*env*/, jobject
         return 0;
     }
 }
+
+// —— M5：喂帧、喂 IMU、位姿 ——
+//
+// ⚠️ `nativePushImage` 和 `nativePushImu` **跑在相机线程 / 传感器线程上**，
+// 里面绝不能有阻塞操作（铁律 1）。两个都只是把数据拷进队列就返回。
+//
+// **先不做零拷贝**（STAGE5 §5）：`ByteArray` 现在有三个持有者（落盘 / 预览 / SLAM），
+// 复用 buffer 会让它们读到被覆盖的帧。JNI_ABORT = 只读，不回写。
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativePushImage(JNIEnv* env, jobject /*thiz*/,
+                                                        jlong tsNs, jbyteArray gray,
+                                                        jint w, jint h) {
+    try {
+        jbyte* p = env->GetByteArrayElements(gray, nullptr);
+        if (p == nullptr) return;   // OOM
+        slam::pushImage(static_cast<long long>(tsNs),
+                        reinterpret_cast<const unsigned char*>(p), w, h);
+        env->ReleaseByteArrayElements(gray, p, JNI_ABORT);
+    } catch (...) {
+        __android_log_write(ANDROID_LOG_ERROR, "slam", "[M5] nativePushImage 抛异常");
+    }
+}
+
+// ⚠️ **一个完整样本**（一个时间戳 + 角速度 + 加速度），不是分两次调。
+// 配对由 Kotlin 侧的 `ImuCollector` 做（它本来就在做，还带配对偏差的统计）。
+// 见 slam_engine.h 里那段说明 —— 顺带关掉了「加速度和角速度写反」那个静默的坑。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativePushImu(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                      jlong tsNs, jfloat wx, jfloat wy, jfloat wz,
+                                                      jfloat ax, jfloat ay, jfloat az) {
+    try {
+        slam::pushImu(static_cast<long long>(tsNs), wx, wy, wz, ax, ay, az);
+    } catch (...) {
+        __android_log_write(ANDROID_LOG_ERROR, "slam", "[M5] nativePushImu 抛异常");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeStart(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::start();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeStop(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::stop();
+    } catch (...) {
+    }
+}
+
+// 4x4 列主序，用出参（§6 约定 3）。返回 false = 还没有位姿。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetPose(JNIEnv* env, jobject /*thiz*/,
+                                                      jfloatArray out) {
+    try {
+        // ⚠️ 必须查长度：Kotlin 那边传短了的话，写 16 个 float 会踩坏堆。
+        if (env->GetArrayLength(out) < 16) return JNI_FALSE;
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return JNI_FALSE;
+        const bool ok = slam::pose(p);
+        // ok 时回写（mode 0），不 ok 时 JNI_ABORT 不白拷一趟。
+        env->ReleaseFloatArrayElements(out, p, ok ? 0 : JNI_ABORT);
+        return ok ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetTrackingState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::trackingState());
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
+                                                             jstring path) {
+    try {
+        slam::dumpTrajectory(toStdString(env, path));
+    } catch (...) {
+        __android_log_write(ANDROID_LOG_ERROR, "slam", "[M5] nativeDumpTrajectory 抛异常");
+    }
+}

@@ -106,12 +106,24 @@
             android:textSize="18sp"
             android:textStyle="bold" />
 
+        <!-- 能点的那个：SLAM 跑着的时候多挂一个落盘消费者。
+             录出来的 session 标了 with_slam，和「录制模式」录的分得开。 -->
         <Button
-            android:id="@+id/btnSaveTrack"
+            android:id="@+id/btnRecord"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:enabled="false"
-            android:text="保存轨迹（M8）"
+            android:text="开始录制"
+            android:textColor="#DE000000" />
+
+        <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->
+        <Button
+            android:id="@+id/btnSaveMap"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:enabled="false"
+            android:text="保存地图（M8）"
             android:textColor="#DE000000" />
     </LinearLayout>
 

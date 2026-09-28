@@ -91,8 +91,15 @@ set_target_properties(DBoW2 g2o PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY ${_slam_out})
 
 # ---- ORB-SLAM3 本体（Viewer / MapDrawer 已是空壳）----
+#
+# ⚠️ `orb_track.cpp` 是**我们自己写的**，却编在这个 target 里。为什么：
+# 它要构造 `cv::Mat`，而 `slam_jni` 那个 target **刻意不链 OpenCV** ——
+# 进程里已经有一份静态 OpenCV 了（在 orb_slam3 里），再来一份会让 `cv::` 的全局状态
+# 变成两套。真机上为此崩过一次（两份 `cv::parallel_for_`，它带 OpenCV 的全局线程池），
+# 见 docs/changes/2026-09-28-m5-slam-on-phone.md。**这一层包装就是为了让那条边界成立。**
 add_library(orb_slam3 SHARED
     ${CPP_DIR}/md5.cpp                # 顶掉上游的 -lcrypto
+    ${CPP_DIR}/orb_track.cpp          # 我们写的；为什么编在这儿见上面那段
     ${ORB_ROOT}/src/System.cc
     ${ORB_ROOT}/src/Tracking.cc
     ${ORB_ROOT}/src/LocalMapping.cc
@@ -128,15 +135,18 @@ add_library(orb_slam3 SHARED
 # 但 target 级能限到最窄：不会漏给 g2o、DBoW2、slam_jni。
 target_include_directories(orb_slam3 PRIVATE ${CPP_DIR})
 
-target_link_libraries(orb_slam3 PUBLIC DBoW2 g2o)
-# OpenCV / Boost / z 用 PRIVATE：orb_slam3 对外只该暴露 ORB-SLAM3 自己的东西。
-# ⚠️ 但实测这**没有**让 libslam_jni.so 变干净 —— OpenCV 的 .a 照样出现在它的链接行上。
-# 漏点在 vendored 的 DBoW2/CMakeLists.txt：`target_link_libraries(DBoW2 ${OpenCV_LIBS})`
-# 用的是默认签名（= PUBLIC），从那条路传下去了，在 orb_slam3 这一层挡不住。
-# 结果：libslam_jni.so 的 .text 253 KB，里面 170 个 cv:: 符号（imshow / namedWindow 那类）。
-# 两份是同一份静态库编出来的，逐字节相同，所以**只是体积问题、不是正确性问题**。
-# 要清掉得改 DBoW2 那一行，见改动记录的遗留。
+# ⚠️⚠️ **全部 PRIVATE，尤其是 DBoW2。**
+#
+# 这条踩过一次，而且**真机崩了**：DBoW2 现在是**静态库**（见它的 CMakeLists），
+# 而它 `target_link_libraries(DBoW2 ${OpenCV_LIBS})` 用默认签名（= PUBLIC）链着**静态** OpenCV。
+# 用 PUBLIC 链 DBoW2 会把 OpenCV 一路传到 slam_jni —— 于是**同一个进程里出现两份 `cv::`**，
+# 其中 `cv::parallel_for_` 带着 **OpenCV 的全局线程池**：`GaussianBlur` 从这库调进去、
+# 执行到那库那份实现，状态互相踩 → `SIGSEGV`。
+#
+# 教训：**「两份逐字节相同的静态库副本」不是体积问题，是正确性问题。**
+# DBoW2 静态链进来之后它的代码已经在 liborb_slam3.so 里，slam_jni 不需要再链它。
 target_link_libraries(orb_slam3 PRIVATE
+    DBoW2 g2o
     ${OpenCV_LIBS}
     ${BOOST_SERIALIZATION_LIB}
     z log)
@@ -149,6 +159,12 @@ add_library(slam_jni SHARED
     log_redirect.cpp      # 基础设施：把 fd 1/2 接进 logcat
     slam_engine.cpp       # 构造并持有 ORB_SLAM3::System
     )
+# ⚠️ **只给头文件路径，绝不链它。**
+# `ImuTypes.h` / `System.h` 自己就 include OpenCV，所以编的时候要能找到那些头。
+# 但**头文件不产生符号引用** —— 链了才会，而链了进程里就会有两份 `cv::`。
+# 这是那条边界的另一半：能在 `slam_jni` 里出现的是**声明**，不是实现。
+target_include_directories(slam_jni PRIVATE ${OpenCV_INCLUDE_DIRS})
+
 target_link_libraries(slam_jni PRIVATE orb_slam3 log)
 
 # 把 compile_commands.json 导出到本文件旁边（固定路径）。
