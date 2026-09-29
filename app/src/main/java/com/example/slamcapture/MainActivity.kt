@@ -121,10 +121,15 @@ class MainActivity : AppCompatActivity() {
     private var recording = false
 
     /**
-     * 这一趟（「启动 SLAM」→「结束」）的目录：`files/maps/<时间戳>/`。
-     * 轨迹和会话都落在它下面 —— **同目录 = 同一坐标系**，这样轨迹能直接投到 2D 地图上。
+     * 这次**会话**的目录：`files/maps/<时间戳>/`。
+     *
+     * ⚠️ **一次「新建地图」= 一个目录**，第一次按「启动 SLAM」时建，之后一直复用 ——
+     * 否则「结束再启动」会把同一次新建地图裂成好几个文件夹（2026-09-29 用户报的）。
      */
-    private var runDir: File? = null
+    private var sessionDir: File? = null
+
+    /** 这一次「启动 SLAM → 结束」的子目录 `<会话>/run-N/`。**它才是坐标系单元**。 */
+    private var curRunDir: File? = null
 
     /** 上一次保留的目录，只给状态栏显示。 */
     private var lastRunDir: File? = null
@@ -277,8 +282,12 @@ class MainActivity : AppCompatActivity() {
         SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
 
-        // 一趟一个目录。**先建目录再问开关** —— 这样自动录和手动拨开走的是同一条路。
-        runDir = newRunDir()
+        // 会话目录**只建一次**；本次「启动→结束」在它下面开一个 run-N/。
+        val session = sessionDir ?: newSessionDir().also {
+            sessionDir = it
+            writeSessionMeta(it)
+        }
+        curRunDir = nextRunDir(session)
         if (swRecord.isChecked) startRecording()
 
         Log.i(TAG, "SLAM 开始吃帧")
@@ -302,10 +311,10 @@ class MainActivity : AppCompatActivity() {
 
         stopRecording()           // 正在录的话文件一律保留（录到一半也是真数据）
 
-        // 轨迹和会话都落在这一趟的目录里。**主动结束**才弹窗问留不留；
-        // 切后台 / 退出直接留着（数据是真的，回来按「启动」是新的一趟）。
-        val dir = runDir
-        runDir = null
+        // 轨迹落在这一趟的 run-N/ 里。**主动结束**才弹窗问留不留；
+        // 切后台 / 退出直接留着（数据是真的，回来按「启动」是新的 run）。
+        val dir = curRunDir
+        curRunDir = null
         if (dir != null) {
             exportTrajectory(dir)
             if (reason == "用户结束") askKeepRun(dir) else keepRun(dir)
@@ -358,7 +367,7 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 落盘开关（抽屉里）----------------
 
     private fun startRecording() {
-        val run = runDir
+        val run = curRunDir
         if (!slamRunning || run == null) {
             Log.w(TAG, "SLAM 没在跑，不能录")
             return
@@ -591,12 +600,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 一趟一个目录：`files/maps/<yyyyMMdd-HHmmss>/`。
+     * 一次**会话**（一次「新建地图 / 打开地图」）= 一个目录：`files/maps/<yyyyMMdd-HHmmss>/`。
      *
      * **用时间戳不用 `mapId`** —— mapId 会随进程重启和新建图变，时间戳稳定；
      * 而且「另存为新图」天然就是新目录。
      */
-    private fun newRunDir(): File {
+    private fun newSessionDir(): File {
         // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
         // **绝不能**用 File(null, ...)——那会落到进程的 CWD，在 Android 上就是 "/"。
         val base = getExternalFilesDir(null) ?: filesDir
@@ -604,14 +613,21 @@ class MainActivity : AppCompatActivity() {
         return File(File(base, "maps"), stamp).apply { mkdirs() }
     }
 
-    /** `session-1/`、`session-2/`… 取第一个没被占的号。 */
+    /** `<会话>/run-N/`，N 取第一个没被占的号。**这才是坐标系单元** —— 轨迹在它下面。 */
+    private fun nextRunDir(session: File): File {
+        var n = 1
+        while (File(session, "run-$n").exists()) n++
+        return File(session, "run-$n").apply { mkdirs() }
+    }
+
+    /** `<run-N>/session-M/`，M 取第一个没被占的号。每段录制一个目录，理由见 [startRecording]。 */
     private fun nextSessionDir(run: File): File {
         var n = 1
         while (File(run, "session-$n").exists()) n++
         return File(run, "session-$n")
     }
 
-    /** 这一趟已经录出来的段。 */
+    /** 这一趟已经录出来的段（`run-N/session-M/`）。 */
     private fun sessionDirs(run: File): List<File> =
         run.listFiles { f -> f.isDirectory && f.name.startsWith("session-") }
             ?.sorted() ?: emptyList()
@@ -637,7 +653,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("保存这一趟？")
             .setMessage(msg)
             .setPositiveButton("保存") { _, _ -> keepRun(dir) }
-            .setNegativeButton("不保存") { _, _ -> discardRun(dir) }
+            .setNegativeButton("不保存") { _, _ -> onDropTrajectory(dir) }
             .setOnCancelListener { keepRun(dir) }
             .show()
     }
@@ -649,25 +665,65 @@ class MainActivity : AppCompatActivity() {
         render()
     }
 
-    private fun discardRun(dir: File) {
+    /**
+     * 用户不要这一趟的轨迹了。
+     *
+     * ⚠️ **录过会话就再问一次** —— 那段得走一趟才录得到，成本比轨迹高得多，
+     * 不该跟着轨迹一起没。没录过就直接全删。
+     */
+    private fun onDropTrajectory(dir: File) {
+        val segs = sessionDirs(dir).size
+        if (segs == 0) {
+            discardAll(dir)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("这一趟录了 $segs 段会话")
+            .setMessage(
+                "要保留吗？\n\n" +
+                    "「保留会话」只删掉轨迹相关的（trajectory.txt + run.json）；" +
+                    "「全部删除」连会话一起删。\n\n${dir.absolutePath}"
+            )
+            .setPositiveButton("保留会话") { _, _ -> dropTrajectoryOnly(dir) }
+            .setNegativeButton("全部删除") { _, _ -> discardAll(dir) }
+            .setOnCancelListener { dropTrajectoryOnly(dir) }
+            .show()
+    }
+
+    /** 只删轨迹相关的（`trajectory.txt` + `run.json`），留下会话段目录。 */
+    private fun dropTrajectoryOnly(dir: File) {
+        File(dir, "trajectory.txt").delete()
+        File(dir, "run.json").delete()
+        lastRunDir = dir
+        Log.i(TAG, "丢掉轨迹、保留会话：${dir.absolutePath}")
+        render()
+    }
+
+    private fun discardAll(dir: File) {
         Log.i(TAG, "丢弃这一趟：${dir.absolutePath} ${dir.deleteRecursively()}")
         lastRunDir = null
+        // 整个会话都丢空了就把会话目录也删掉，免得留一地空文件夹。
+        sessionDir?.let { s ->
+            val rest = s.listFiles { f -> f.isDirectory && f.name.startsWith("run-") }
+            if (rest.isNullOrEmpty()) {
+                Log.i(TAG, "会话目录已空，一并删掉：${s.absolutePath} ${s.deleteRecursively()}")
+                sessionDir = null
+            }
+        }
         render()
     }
 
     /**
-     * `run.json`：这一趟的元信息。
+     * `run-N/run.json`：这一趟的元信息。
      * 轨迹只含跟踪 OK 的帧；地图每次重置后轨迹清空重来，所以只有最后一段。
      */
     private fun writeRunMeta(dir: File) {
-        val src = (mapFile?.let { File(it).name } ?: "新建地图")
-            .replace("\\", "\\\\").replace("\"", "\\\"")
         try {
             File(dir, "run.json").writeText(
                 """
                 {
-                  "created": "${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date())}",
-                  "map_source": "$src",
+                  "created": "${nowStamp()}",
+                  "map_source": "${jsonEsc(mapSourceLabel())}",
                   "sessions": ${sessionDirs(dir).size},
                   "traj_points": ${SlamBridge.nativeTrajSize()},
                   "map_resets": ${SlamBridge.nativeResetCount()}
@@ -678,4 +734,32 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "写 run.json 失败", e)
         }
     }
+
+    /**
+     * `<会话>/session.json`：整个会话的汇总。建目录时写一次，之后不动。
+     *
+     * ⚠️ 名字故意不叫 `run.json` —— 免得和 `run-N/run.json` 混淆（一个是会话级、一个是趟级）。
+     */
+    private fun writeSessionMeta(session: File) {
+        try {
+            File(session, "session.json").writeText(
+                """
+                {
+                  "created": "${nowStamp()}",
+                  "map_source": "${jsonEsc(mapSourceLabel())}",
+                  "note": "一次「新建地图/打开地图」= 这个目录；每次「启动 SLAM→结束」是它下面的 run-N/。"
+                }
+                """.trimIndent()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "写 session.json 失败", e)
+        }
+    }
+
+    private fun mapSourceLabel(): String = mapFile?.let { File(it).name } ?: "新建地图"
+
+    private fun jsonEsc(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    private fun nowStamp(): String =
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date())
 }
