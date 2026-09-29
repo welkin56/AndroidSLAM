@@ -9,6 +9,11 @@
 
 namespace slam {
 
+namespace {
+// ORB_SLAM3 `eTrackingState::OK`（Tracking.h:121）。
+constexpr int kTrackingOk = 2;
+}  // namespace
+
 bool orbTrack(ORB_SLAM3::System* sys, const unsigned char* gray, int w, int h,
               double timestamp, const std::vector<ORB_SLAM3::IMU::Point>& imu,
               TrackResult* out) {
@@ -21,8 +26,14 @@ bool orbTrack(ORB_SLAM3::System* sys, const unsigned char* gray, int w, int h,
 
     const Sophus::SE3f Tcw = sys->TrackMonocular(im, timestamp, imu);
 
-    // `Sophus::SE3f` 没有 `empty()`。用 allFinite 判 —— 初始化之前 `Frame::mTcw`
-    // 是没赋过值的 Eigen 对象，可能是 NaN/Inf。
+    out->trackingState = sys->GetTrackingState();
+    out->kfCount = sys->KeyFramesInMap();
+
+    // ⚠️ 只认 OK 的帧。没定位时返回的是**单位阵**，`allFinite()` 照样过，
+    // 存下去就是一堆原点位姿（M5 那趟 224 行里 212 行是 `0 0 0`）。
+    if (out->trackingState != kTrackingOk) return false;
+
+    // 兜住 NaN/Inf。`Sophus::SE3f` 没有 `empty()`。
     if (!Tcw.matrix().allFinite()) return false;
 
     // ⚠️ 存 **Twc**（= Tcw.inverse()），和 `SaveTrajectoryEuRoC`（`System.cc:616-622`）一致 ——

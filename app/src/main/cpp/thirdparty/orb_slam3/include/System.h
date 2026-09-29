@@ -134,6 +134,10 @@ public:
     void Reset();
     void ResetActiveMap();
 
+    // ⚠️ 我们加的。`ResetActiveMap` 原地清空当前图，`Map::mnId` 不变 ——
+    // 所以 KF 数掉到 0 是「重置过」唯一的外部信号。
+    unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }
+
     // All threads will be requested to finish.
     // It waits until all threads have finished.
     // This function must be called before saving the trajectory.

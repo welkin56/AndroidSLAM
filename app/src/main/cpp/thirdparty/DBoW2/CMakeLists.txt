@@ -48,7 +48,7 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 #
 # 后果是真机上的 SIGSEGV：`Frame::ExtractORB` → `ORBextractor` → `cv::GaussianBlur`
 # → **`cv::parallel_for_` 被动态链接器解析到了 libDBoW2.so 那一份** ——
-# 那是 OpenCV 里带**全局线程池**的东西，两个副本的状态互相踩。
+# 那是并行后端的分发点，背后带全局状态（这份 OpenCV 开了 TBB 后端），两个副本互相踩。
 # 完整调用链见 docs/changes/2026-09-28-m5-slam-on-phone.md。
 #
 # 静态链进来之后，整个进程只剩一份 OpenCV 的符号，问题消失。

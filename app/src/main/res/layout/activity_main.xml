@@ -106,14 +106,14 @@
             android:textSize="18sp"
             android:textStyle="bold" />
 
-        <!-- 能点的那个：SLAM 跑着的时候多挂一个落盘消费者。
+        <!-- 录制落盘开关。**开着的时候按「启动 SLAM」会自动开始录** ——
+             不用先启动再回来点一下（那中间有一段录不上）。
              录出来的 session 标了 with_slam，和「录制模式」录的分得开。 -->
-        <Button
-            android:id="@+id/btnRecord"
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swRecord"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:enabled="false"
-            android:text="开始录制"
+            android:text="录制落盘"
             android:textColor="#DE000000" />
 
         <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->

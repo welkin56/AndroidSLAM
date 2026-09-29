@@ -96,6 +96,9 @@ struct Engine {
 
     std::mutex trajMutex;
     std::vector<TrajPoint> traj;
+
+    /** 「地图被重置」的次数。`start()` 归零。 */
+    std::atomic<int> resetCount{0};
 };
 
 // 故意泄漏，见文件头第 2 条。
@@ -165,6 +168,8 @@ void worker(Engine& e) {
     ORB_SLAM3::System* sys = e.sys.load();
     bool haveBase = false;
     double base = 0.0;
+    // 先见过非 0 才算重置 —— 刚构造完本来就一个 KF 都没有。
+    bool sawKfs = false;
 
     for (;;) {
         Frame f;
@@ -209,9 +214,30 @@ void worker(Engine& e) {
         TrackResult r;
         orbTrack(sys, f.gray.data(), f.w, f.h, t, imu, &r);
 
+        // ⚠️ 重置检测**每帧都要做** —— 重置恰恰发生在不 OK 的时候。
+        // 重置会清空当前图（KF 数掉到 0），而坐标系已经重新锚定，
+        // 前一段轨迹拼不上来了 —— 清掉，只留最后一段。
+        if (r.kfCount == 0) {
+            if (sawKfs) {
+                sawKfs = false;
+                {
+                    std::lock_guard<std::mutex> lk(e.trajMutex);
+                    e.traj.clear();
+                }
+                const int n = e.resetCount.fetch_add(1) + 1;
+                printf("[M5] 地图被重置（第 %d 次）—— 轨迹清空重来\n", n);
+                fflush(stdout);
+            }
+        } else {
+            sawKfs = true;
+        }
+
         // 注意这里**没有**和 PC 那边的帧集完全对齐：PC 的 `SaveTrajectoryEuRoC` 是从
         // `mlRelativeFramePoses` 存的（只含被插入的帧），而我们是每帧存。
         // 对照比的是**形状和尺度**，条数对不齐没关系。
+        //
+        // `r.valid` 现在**只在跟踪状态是 OK 时为 true**（见 orb_track.cpp）——
+        // 所以轨迹里不会再有那些原点位姿。
         if (r.valid) savePose(e, r);
     }
 }
@@ -291,7 +317,20 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
     e.imus.push_back(Imu{tsNs, wx, wy, wz, ax, ay, az});
 }
 
-void start() { engine().running.store(true); }
+void start() {
+    Engine& e = engine();
+    // 一次运行 = 一份轨迹：上一趟的清掉，否则文件里会混进上一次的位置。
+    {
+        std::lock_guard<std::mutex> lk(e.trajMutex);
+        e.traj.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(e.poseMutex);
+        e.poseValid = false;
+    }
+    e.resetCount.store(0);
+    e.running.store(true);
+}
 
 void stop() {
     Engine& e = engine();
@@ -315,6 +354,14 @@ int trackingState() {
     ORB_SLAM3::System* sys = engine().sys.load();
     // `GetTrackingState()` 内部加锁（System.cc:1320），可以从任意线程调。
     return sys == nullptr ? -1 : sys->GetTrackingState();
+}
+
+int resetCount() { return engine().resetCount.load(); }
+
+int trajSize() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.trajMutex);
+    return static_cast<int>(e.traj.size());
 }
 
 void dumpTrajectory(const std::string& path) {

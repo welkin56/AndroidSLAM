@@ -95,7 +95,7 @@ set_target_properties(DBoW2 g2o PROPERTIES
 # ⚠️ `orb_track.cpp` 是**我们自己写的**，却编在这个 target 里。为什么：
 # 它要构造 `cv::Mat`，而 `slam_jni` 那个 target **刻意不链 OpenCV** ——
 # 进程里已经有一份静态 OpenCV 了（在 orb_slam3 里），再来一份会让 `cv::` 的全局状态
-# 变成两套。真机上为此崩过一次（两份 `cv::parallel_for_`，它带 OpenCV 的全局线程池），
+# 变成两套。真机上为此崩过一次（两份 `cv::parallel_for_`，背后各带一套 TBB 全局状态），
 # 见 docs/changes/2026-09-28-m5-slam-on-phone.md。**这一层包装就是为了让那条边界成立。**
 add_library(orb_slam3 SHARED
     ${CPP_DIR}/md5.cpp                # 顶掉上游的 -lcrypto
@@ -140,8 +140,8 @@ target_include_directories(orb_slam3 PRIVATE ${CPP_DIR})
 # 这条踩过一次，而且**真机崩了**：DBoW2 现在是**静态库**（见它的 CMakeLists），
 # 而它 `target_link_libraries(DBoW2 ${OpenCV_LIBS})` 用默认签名（= PUBLIC）链着**静态** OpenCV。
 # 用 PUBLIC 链 DBoW2 会把 OpenCV 一路传到 slam_jni —— 于是**同一个进程里出现两份 `cv::`**，
-# 其中 `cv::parallel_for_` 带着 **OpenCV 的全局线程池**：`GaussianBlur` 从这库调进去、
-# 执行到那库那份实现，状态互相踩 → `SIGSEGV`。
+# 其中 `cv::parallel_for_` 背后带着 **TBB 的全局状态**（这份 OpenCV 开了 TBB 后端）：
+# `GaussianBlur` 从这库调进去、执行到那库那份实现，状态互相踩 → `SIGSEGV`。
 #
 # 教训：**「两份逐字节相同的静态库副本」不是体积问题，是正确性问题。**
 # DBoW2 静态链进来之后它的代码已经在 liborb_slam3.so 里，slam_jni 不需要再链它。

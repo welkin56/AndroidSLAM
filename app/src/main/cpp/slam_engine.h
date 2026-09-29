@@ -61,6 +61,12 @@ bool pose(float out16[16]);
 /** ORB-SLAM3 的 `eTrackingState`：-1 还没准备好 / 0 一帧都没进来 / 1 惯性初始化中 / 2 OK / 3 刚丢 / 4 完全丢。 */
 int trackingState();
 
+/** 本次运行里「地图被重置」的次数。`start()` 归零。给 UI 显示用。 */
+int resetCount();
+
+/** 当前轨迹有多少条。只含跟踪 `OK` 的帧。 */
+int trajSize();
+
 // ---------------- 轨迹 ----------------
 
 /**

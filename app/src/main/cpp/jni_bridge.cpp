@@ -187,6 +187,24 @@ Java_com_example_slamcapture_SlamBridge_nativeGetTrackingState(JNIEnv* /*env*/, 
     }
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeResetCount(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::resetCount());
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeTrajSize(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::trajSize());
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
                                                              jstring path) {

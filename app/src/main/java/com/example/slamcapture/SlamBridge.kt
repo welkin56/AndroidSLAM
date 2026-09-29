@@ -91,6 +91,15 @@ object SlamBridge {
     /** ORB-SLAM3 的 `eTrackingState`：-1 还没准备好 / 0 一帧没进来 / 1 惯性初始化中 / 2 OK / 3 刚丢 / 4 完全丢。 */
     external fun nativeGetTrackingState(): Int
 
-    /** 把这一趟的位姿历史写成文件（TUM 格式，和 PC 的 `CameraTrajectory.txt` 同款）。 */
+    /** 本次运行里「地图被重置」的次数。[nativeStart] 归零。给 UI 显示用。 */
+    external fun nativeResetCount(): Int
+
+    /** 当前轨迹有多少条。**只含跟踪 `OK` 的帧** —— 没定位的帧位姿是单位阵，不算数。 */
+    external fun nativeTrajSize(): Int
+
+    /**
+     * 把这一趟的位姿历史写成文件（TUM 格式，和 PC 的 `CameraTrajectory.txt` 同款）。
+     * **一次运行一份** —— [nativeStart] 会把上一趟的清掉。
+     */
     external fun nativeDumpTrajectory(path: String)
 }

@@ -5,9 +5,9 @@
 // 再来一份会让同一个进程里出现**两套 `cv::` 的全局状态**。
 //
 // 真机上为此崩过一次：`Frame::ExtractORB` → `ORBextractor` → `cv::GaussianBlur`
-// → **`cv::parallel_for_` 被解析到了 libDBoW2.so 那一份** —— 那是 OpenCV 里带
-// **全局线程池**的东西，两个副本的状态互相踩。完整调用链见
-// docs/changes/2026-09-28-m5-slam-on-phone.md。
+// → **`cv::parallel_for_` 被解析到了 libDBoW2.so 那一份** —— 那是并行后端的分发点，
+// 背后带全局状态（这份 OpenCV 开了 TBB 后端，是 `theMarket` 那一套），两个副本互相踩。
+// 完整调用链见 docs/changes/2026-09-28-m5-slam-on-phone.md。
 //
 // 所以「构造 `cv::Mat`」这件事必须留在链着 OpenCV 的那一侧 —— 就是这个文件。
 // 它编进 `orb_slam3`，`slam_engine.cpp` 只当它是个普通的 C++ 函数。
@@ -29,6 +29,12 @@ struct TrackResult {
     double qx = 0, qy = 0, qz = 0, qw = 1;
     /** 4x4 **列主序**。 */
     float pose16[16] = {0};
+
+    /** 这一帧的 `eTrackingState`。每帧都填，和 `valid` 无关。 */
+    int trackingState = -1;
+
+    /** 当前图的 KF 数。掉到 0 = 重置过（`Map::mnId` 不变，所以只能看这个）。 */
+    unsigned long kfCount = 0;
 };
 
 /**

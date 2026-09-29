@@ -11,13 +11,18 @@ import android.os.Looper
 import android.util.Log
 import android.widget.Button
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.GravityCompat
 import androidx.drawerlayout.widget.DrawerLayout
 import java.io.File
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * SLAM 主界面。**跑 SLAM 的那一屏。**
@@ -77,7 +82,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var btnSlam: Button
     private lateinit var btnReloc: Button
-    private lateinit var btnRecord: Button
+    private lateinit var swRecord: SwitchCompat
     private lateinit var tvStatus: TextView
     private lateinit var preview: PreviewView
     private lateinit var drawer: DrawerLayout
@@ -114,7 +119,15 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var writer: SessionWriter? = null
     private var recording = false
-    private var lastSessionDir: File? = null
+
+    /**
+     * 这一趟（「启动 SLAM」→「结束」）的目录：`files/maps/<时间戳>/`。
+     * 轨迹和会话都落在它下面 —— **同目录 = 同一坐标系**，这样轨迹能直接投到 2D 地图上。
+     */
+    private var runDir: File? = null
+
+    /** 上一次保留的目录，只给状态栏显示。 */
+    private var lastRunDir: File? = null
 
     // ---------------- 位姿 ----------------
 
@@ -122,7 +135,6 @@ class MainActivity : AppCompatActivity() {
     private val poseBuf = FloatArray(16)
     private var poseValid = false
     private var trkState = TRK_NOT_READY
-    private var lastTrajectory: File? = null
 
     // ---------------- 生命周期 ----------------
 
@@ -132,7 +144,7 @@ class MainActivity : AppCompatActivity() {
 
         btnSlam = findViewById(R.id.btnSlam)
         btnReloc = findViewById(R.id.btnReloc)
-        btnRecord = findViewById(R.id.btnRecord)
+        swRecord = findViewById(R.id.swRecord)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
         drawer = findViewById(R.id.drawer)
@@ -149,7 +161,11 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnMenu).setOnClickListener {
             drawer.openDrawer(GravityCompat.END)
         }
-        btnRecord.setOnClickListener { toggleRecording() }
+        // 开关是**用户的意图**，录制跟着它走：启动 SLAM 时若开着就自动录，
+        // 运行中拨动也立刻生效。所以它一直可点（见 render）。
+        swRecord.setOnCheckedChangeListener { _, checked ->
+            if (checked) startRecording() else stopRecording()
+        }
         // 「重定位」现在点不动（恒灰）。判据是「有没有旧图」（§2.4），还没做。
         btnReloc.setOnClickListener { }
 
@@ -258,8 +274,13 @@ class MainActivity : AppCompatActivity() {
         cam.start()
         cam.beginSettle()   // 收敛对焦然后锁死 —— 锁焦的后果是 fx 只在那个距离上等于 435.2
 
-        SlamBridge.nativeStart()
+        SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
+
+        // 一趟一个目录。**先建目录再问开关** —— 这样自动录和手动拨开走的是同一条路。
+        runDir = newRunDir()
+        if (swRecord.isChecked) startRecording()
+
         Log.i(TAG, "SLAM 开始吃帧")
         // ⚠️ 必须自己把 ticker 叫起来：它在词袋加载完的那一刻就停了（busy 变 false），
         // 而位姿是靠它刷的。不叫的话界面会停在「已就绪」一动不动。
@@ -281,10 +302,14 @@ class MainActivity : AppCompatActivity() {
 
         stopRecording()           // 正在录的话文件一律保留（录到一半也是真数据）
 
-        // 轨迹**只在用户主动停止 / 退出时导出**，切后台不导。
-        // 因为 C++ 那边的位姿历史是**跨「停止/启动」累积**的（进程死才清），
-        // 所以切后台不导不会丢东西 —— 反而能攒成一份完整的。
-        if (reason != "切后台") exportTrajectory()
+        // 轨迹和会话都落在这一趟的目录里。**主动结束**才弹窗问留不留；
+        // 切后台 / 退出直接留着（数据是真的，回来按「启动」是新的一趟）。
+        val dir = runDir
+        runDir = null
+        if (dir != null) {
+            exportTrajectory(dir)
+            if (reason == "用户结束") askKeepRun(dir) else keepRun(dir)
+        }
 
         cam.stop()
         imu?.stop()
@@ -332,18 +357,18 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 落盘开关（抽屉里）----------------
 
-    private fun toggleRecording() {
-        if (recording) stopRecording() else startRecording()
-    }
-
     private fun startRecording() {
-        if (!slamRunning) {
+        val run = runDir
+        if (!slamRunning || run == null) {
             Log.w(TAG, "SLAM 没在跑，不能录")
             return
         }
         if (writer != null) return
 
-        val dir = newSessionDir()
+        // ⚠️ **每一段写自己的目录**（`session-1/`、`session-2/`…）。不能复用同一个 ——
+        // `SessionWriter.start()` 用 `FileOutputStream` 打开 csv 会**截断**，
+        // 而上一段的 PNG 还在磁盘上，结果 csv 和 PNG 对不上，而且坏得很隐蔽。
+        val dir = nextSessionDir(run)
         val w = SessionWriter(dir)
         // ⚠️ 标出来：这样录的和「录制模式」录的才分得清 —— 格式一模一样，
         // 而这段的帧率是被落盘拖低过的，用途也不同（见 SessionWriter.withSlam）。
@@ -352,6 +377,7 @@ class MainActivity : AppCompatActivity() {
         if (w.ioError != null) {
             Log.e(TAG, "建 session 文件失败：${w.ioError}")
             tvStatus.text = "无法创建输出文件：${w.ioError}\n$dir"
+            swRecord.isChecked = false   // 写不进去就别让开关骗人
             return
         }
         writer = w
@@ -368,7 +394,6 @@ class MainActivity : AppCompatActivity() {
         val w = writer
         writer = null
         w?.stop()
-        lastSessionDir = w?.sessionDir
         if (w != null) {
             Log.i(TAG, "停止录制  相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条")
         }
@@ -377,12 +402,10 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 位姿与轨迹 ----------------
 
-    private fun exportTrajectory() {
-        val dir = getExternalFilesDir(null) ?: filesDir
-        val f = File(dir, "trajectory_${System.currentTimeMillis()}.txt")
+    private fun exportTrajectory(dir: File) {
+        val f = File(dir, "trajectory.txt")
         try {
             SlamBridge.nativeDumpTrajectory(f.absolutePath)
-            lastTrajectory = f
         } catch (e: Throwable) {
             Log.e(TAG, "导出轨迹失败", e)
         }
@@ -446,8 +469,8 @@ class MainActivity : AppCompatActivity() {
         // 「重定位」的灰 / 亮只看有没有旧图（§2.4）。还没有 referenceMap，所以恒灰。
         btnReloc.isEnabled = false
 
-        btnRecord.isEnabled = slamRunning
-        btnRecord.text = if (recording) "停止录制" else "开始录制"
+        // 开关**一直可点** —— 它表达的是「这一段要不要录」，所以启动之前就得能设。
+        swRecord.isEnabled = true
 
         // ---- 状态栏 ----
         val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
@@ -472,12 +495,18 @@ class MainActivity : AppCompatActivity() {
                     "位置 m: %.3f, %.3f, %.3f".format(poseBuf[12], poseBuf[13], poseBuf[14])
                 )
             }
+            if (slamRunning) {
+                // ⚠️ 重置次数是**初始化问题最直接的证据** —— 归零重来多少次，一眼看到。
+                if (isNotEmpty()) append("\n")
+                append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
+                val resets = SlamBridge.nativeResetCount()
+                if (resets > 0) append("　⚠️ 地图已重置 $resets 次")
+            }
             val w = writer
             if (recording && w != null) {
                 append("\n录制中：相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条")
             }
-            lastSessionDir?.let { append("\n上一次录制：${it.absolutePath}") }
-            lastTrajectory?.let { append("\n轨迹：${it.absolutePath}") }
+            lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
         tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
     }
@@ -561,12 +590,92 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    private fun newSessionDir(): File {
+    /**
+     * 一趟一个目录：`files/maps/<yyyyMMdd-HHmmss>/`。
+     *
+     * **用时间戳不用 `mapId`** —— mapId 会随进程重启和新建图变，时间戳稳定；
+     * 而且「另存为新图」天然就是新目录。
+     */
+    private fun newRunDir(): File {
         // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
         // **绝不能**用 File(null, ...)——那会落到进程的 CWD，在 Android 上就是 "/"。
         val base = getExternalFilesDir(null) ?: filesDir
-        val dir = File(File(base, "sessions"), "session_${System.currentTimeMillis()}")
-        dir.mkdirs()
-        return dir
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        return File(File(base, "maps"), stamp).apply { mkdirs() }
+    }
+
+    /** `session-1/`、`session-2/`… 取第一个没被占的号。 */
+    private fun nextSessionDir(run: File): File {
+        var n = 1
+        while (File(run, "session-$n").exists()) n++
+        return File(run, "session-$n")
+    }
+
+    /** 这一趟已经录出来的段。 */
+    private fun sessionDirs(run: File): List<File> =
+        run.listFiles { f -> f.isDirectory && f.name.startsWith("session-") }
+            ?.sorted() ?: emptyList()
+
+    // ---------------- 这一趟留不留 ----------------
+
+    /**
+     * 弹窗问「这一趟留不留」。
+     * ⚠️ **「不保存」必须是明确动作** —— 点外面 / 按返回都算保存，免得手滑丢数据。
+     */
+    private fun askKeepRun(dir: File) {
+        val segs = sessionDirs(dir).size
+        val resets = SlamBridge.nativeResetCount()
+        val msg = buildString {
+            append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
+            if (segs > 0) append("，会话 $segs 段")
+            append("\n")
+            if (resets > 0) append("⚠️ 地图被重置 $resets 次 —— 轨迹只保留了最后一段\n")
+            append("\n${dir.absolutePath}")
+            append("\n\n（地图的「另存为新图 / 保存为原图」是 M8，现在只存轨迹和会话。）")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("保存这一趟？")
+            .setMessage(msg)
+            .setPositiveButton("保存") { _, _ -> keepRun(dir) }
+            .setNegativeButton("不保存") { _, _ -> discardRun(dir) }
+            .setOnCancelListener { keepRun(dir) }
+            .show()
+    }
+
+    private fun keepRun(dir: File) {
+        writeRunMeta(dir)
+        lastRunDir = dir
+        Log.i(TAG, "保留这一趟：${dir.absolutePath}")
+        render()
+    }
+
+    private fun discardRun(dir: File) {
+        Log.i(TAG, "丢弃这一趟：${dir.absolutePath} ${dir.deleteRecursively()}")
+        lastRunDir = null
+        render()
+    }
+
+    /**
+     * `run.json`：这一趟的元信息。
+     * 轨迹只含跟踪 OK 的帧；地图每次重置后轨迹清空重来，所以只有最后一段。
+     */
+    private fun writeRunMeta(dir: File) {
+        val src = (mapFile?.let { File(it).name } ?: "新建地图")
+            .replace("\\", "\\\\").replace("\"", "\\\"")
+        try {
+            File(dir, "run.json").writeText(
+                """
+                {
+                  "created": "${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date())}",
+                  "map_source": "$src",
+                  "sessions": ${sessionDirs(dir).size},
+                  "traj_points": ${SlamBridge.nativeTrajSize()},
+                  "map_resets": ${SlamBridge.nativeResetCount()}
+                }
+                """.trimIndent()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "写 run.json 失败", e)
+        }
     }
 }
