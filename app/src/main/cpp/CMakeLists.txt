@@ -14,6 +14,12 @@ project(slam_jni LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 必须在任何 target 创建之前。AGP 的 Debug **既不传 -O 也不定义 NDEBUG**，
+# 而 PC 那份是 Release（-O3 -DNDEBUG）
+#   -O0      真机单帧 600 ms，撞上 ORB-SLAM3 的「时间戳跳变」守卫，反复清图
+#   缺 NDEBUG Optimizer.cc:2837 的 assert 会把 App 打崩（PC 上那个 assert 被编掉了）
+add_compile_options(-O3 -DNDEBUG)
+
 set(CPP_DIR  ${CMAKE_CURRENT_LIST_DIR})
 set(TP_DIR   ${CPP_DIR}/thirdparty)
 set(ORB_ROOT ${TP_DIR}/orb_slam3)
