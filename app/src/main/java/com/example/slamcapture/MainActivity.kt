@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Button
 import android.widget.TextView
@@ -76,6 +77,9 @@ class MainActivity : AppCompatActivity() {
         private const val TICK_MS = 250L
         private const val REQ_CAMERA = 1
 
+        /** 预热时长：相机帧硬按住这么久，让 IMU 先写满。和录制模式同值。 */
+        private const val PREROLL_NS = 300_000_000L
+
         private val DARK_TEXT = Color.parseColor("#DE000000")
         private val RED = Color.parseColor("#C62828")
     }
@@ -112,6 +116,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cam: CameraCapture
     private var imu: ImuCollector? = null
     private var imuThread: HandlerThread? = null
+
+    /** 预热闸：这个时刻之前的相机帧不喂也不录。相机线程读、主线程写。 */
+    @Volatile
+    private var framesFromTsNs = 0L
 
     // ---------------- 落盘（抽屉里的开关）----------------
 
@@ -275,6 +283,10 @@ class MainActivity : AppCompatActivity() {
         }
         c.start(Handler(t.looper))
 
+        // 相机帧硬按住 300 ms，让 IMU 先写满 —— 录制模式一直有这道闸，M5 漏了。
+        // 少了它 IMU 可能比相机晚开始，第一帧就没有预积分。
+        framesFromTsNs = SystemClock.elapsedRealtimeNanos() + PREROLL_NS
+
         preview.setActive(true)
         cam.start()
         cam.beginSettle()   // 收敛对焦然后锁死 —— 锁焦的后果是 fx 只在那个距离上等于 435.2
@@ -337,8 +349,11 @@ class MainActivity : AppCompatActivity() {
      * **三个消费者，各自一道显式闸、各自包 try** —— 一路出岔子不能把另外两路吃掉。
      */
     private fun onCameraFrame(gray: ByteArray, tsNs: Long) {
+        // 预热期内的帧不喂也不录；预览不受影响。
+        val warm = tsNs >= framesFromTsNs
+
         // ① 喂 SLAM。一条 JNI 调用 + 一次拷贝就返回。
-        if (slamRunning) {
+        if (slamRunning && warm) {
             try {
                 SlamBridge.nativePushImage(tsNs, gray, CameraCapture.W, CameraCapture.H)
             } catch (e: Throwable) {
@@ -348,7 +363,7 @@ class MainActivity : AppCompatActivity() {
 
         // ② 落盘（抽屉里的开关）。
         val w = writer
-        if (recording && w != null) {
+        if (recording && warm && w != null) {
             try {
                 w.offerFrame(SessionWriter.FrameItem(tsNs, gray, CameraCapture.W, CameraCapture.H))
             } catch (e: Throwable) {
