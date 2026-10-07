@@ -29,6 +29,14 @@ bool orbTrack(ORB_SLAM3::System* sys, const unsigned char* gray, int w, int h,
     out->trackingState = sys->GetTrackingState();
     out->kfCount = sys->KeyFramesInMap();
 
+    // ⚠️ **Tcw**（世界→相机），和下面存轨迹的 Twc 方向相反。测距要用它 ——
+    // 为什么在这儿带出去见 orb_track.h。这个 memcpy 比那两次 vector 拷贝便宜得多，
+    // 所以不跟着测距开关走。
+    {
+        const Eigen::Matrix4f m_cw = Tcw.matrix();
+        std::memcpy(out->t_cw16, m_cw.data(), sizeof(out->t_cw16));
+    }
+
     // ⚠️ 只认 OK 的帧。没定位时返回的是**单位阵**，`allFinite()` 照样过，
     // 存下去就是一堆原点位姿（M5 那趟 224 行里 212 行是 `0 0 0`）。
     if (out->trackingState != kTrackingOk) return false;

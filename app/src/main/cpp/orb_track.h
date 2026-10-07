@@ -35,6 +35,15 @@ struct TrackResult {
 
     /** 当前图的 KF 数。掉到 0 = 重置过（`Map::mnId` 不变，所以只能看这个）。 */
     unsigned long kfCount = 0;
+
+    /**
+     * 4x4 **列主序**的 `Tcw`（世界 → 相机）。
+     *
+     * `System` 上有 `GetTrackedKeyPointsUn()` / `GetTrackedMapPoints()`，却**拿不到当前帧的
+     * 位姿** —— 所以测距要的那份 `Tcw` 只能从这儿带出去。和 `pose16` 方向相反（那是 Twc），
+     * 别混。
+     */
+    float t_cw16[16] = {0};
 };
 
 /**

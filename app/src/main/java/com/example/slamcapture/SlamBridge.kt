@@ -102,4 +102,11 @@ object SlamBridge {
      * **一次运行一份** —— [nativeStart] 会把上一趟的清掉。
      */
     external fun nativeDumpTrajectory(path: String)
+
+    // —— M6：画面中心的距离读数 ——
+
+    /** 抽屉里那个开关。关掉时 C++ 那边连算都不算，但**不影响 SLAM 跟踪**。 */
+    external fun nativeSetMeasuring(on: Boolean)
+
+    external fun nativeGetMeasure(out: FloatArray): Int
 }

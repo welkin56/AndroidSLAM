@@ -80,6 +80,11 @@ class MainActivity : AppCompatActivity() {
         /** 预热时长：相机帧硬按住这么久，让 IMU 先写满。和录制模式同值。 */
         private const val PREROLL_NS = 300_000_000L
 
+        /** 两个开关的**记忆**。抽屉里那两个，下次进来还是上次的状态。 */
+        private const val PREF = "slamapp"
+        private const val PREF_RECORD = "record"
+        private const val PREF_MEASURE = "measure"
+
         private val DARK_TEXT = Color.parseColor("#DE000000")
         private val RED = Color.parseColor("#C62828")
     }
@@ -87,11 +92,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSlam: Button
     private lateinit var btnReloc: Button
     private lateinit var swRecord: SwitchCompat
+    private lateinit var swMeasure: SwitchCompat
     private lateinit var tvStatus: TextView
     private lateinit var preview: PreviewView
     private lateinit var drawer: DrawerLayout
 
     private val uiHandler = Handler(Looper.getMainLooper())
+
+    /** 两个开关的记忆。是本 App 唯一用 SharedPreferences 的地方。 */
+    private val pref by lazy { getSharedPreferences(PREF, MODE_PRIVATE) }
 
     // ---------------- 页面状态 ----------------
 
@@ -149,6 +158,14 @@ class MainActivity : AppCompatActivity() {
     private var poseValid = false
     private var trkState = TRK_NOT_READY
 
+    // ---------------- 测距（画面中心）----------------
+
+    /** `[0]` 距离m、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标。同样复用。 */
+    private val measureBuf = FloatArray(6)
+
+    /** 给 [PreviewView.Overlay] 用的状态，比 C++ 那三档多一个「跟踪未就绪」。 */
+    private var measureState = PreviewView.MeasureState.NO_TRACK
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -158,9 +175,18 @@ class MainActivity : AppCompatActivity() {
         btnSlam = findViewById(R.id.btnSlam)
         btnReloc = findViewById(R.id.btnReloc)
         swRecord = findViewById(R.id.swRecord)
+        swMeasure = findViewById(R.id.swMeasure)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
         drawer = findViewById(R.id.drawer)
+
+        // 两个开关的**记忆**。在挂监听**之前**恢复 —— 否则恢复这个动作本身会把监听跑一遍
+        // （`swRecord` 那条会去 `startRecording()`，虽然那时 SLAM 没跑、会被自己挡掉）。
+        swRecord.isChecked = pref.getBoolean(PREF_RECORD, false)
+        // 测距也默认关。它和录制一样是**用户拨开才生效**的功能，不替用户决定。
+        swMeasure.isChecked = pref.getBoolean(PREF_MEASURE, false)
+        // ⚠️ 顺手推给 C++ —— 那边默认是关的，不在这儿推一次，两边会不一致。
+        SlamBridge.nativeSetMeasuring(swMeasure.isChecked)
 
         // 相机线程和相机对象活得和 Activity 一样久（和录制页同一个理由：
         // start/stop 只是一条队列上的两个消息，顺序天然确定）。
@@ -177,8 +203,21 @@ class MainActivity : AppCompatActivity() {
         // 开关是**用户的意图**，录制跟着它走：启动 SLAM 时若开着就自动录，
         // 运行中拨动也立刻生效。所以它一直可点（见 render）。
         swRecord.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_RECORD, checked).apply()
             if (checked) startRecording() else stopRecording()
         }
+
+        // 测距同理，只是它作用在画面上而不是磁盘上。**关掉时清掉叠加层** ——
+        // 不然后面 ticker 不再刷它，那个十字会一直挂在画面上。
+        swMeasure.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_MEASURE, checked).apply()
+            SlamBridge.nativeSetMeasuring(checked)
+            if (!checked) {
+                preview.overlay = null
+                measureState = PreviewView.MeasureState.NO_TRACK
+            }
+        }
+
         // 「重定位」现在点不动（恒灰）。判据是「有没有旧图」（§2.4），还没做。
         btnReloc.setOnClickListener { }
 
@@ -339,6 +378,10 @@ class MainActivity : AppCompatActivity() {
         imu = null
         imuThread = null
         preview.setActive(false)
+        // 十字和读数一起收掉。`setActive(false)` 清的是**画面**，不管叠加层 ——
+        // 留着的话下次会有一个「没有画面的十字」挂在黑底上。
+        preview.overlay = null
+        measureState = PreviewView.MeasureState.NO_TRACK
     }
 
     // ---------------- 帧出口 ----------------
@@ -455,6 +498,7 @@ class MainActivity : AppCompatActivity() {
             if (slamRunning) {
                 poseValid = SlamBridge.nativeGetPose(poseBuf)
                 trkState = SlamBridge.nativeGetTrackingState()
+                pollMeasure()
             }
 
             // ⚠️ **先刷，再判断要不要继续。** 反过来写的话，「词袋加载完」那一轮会
@@ -472,6 +516,30 @@ class MainActivity : AppCompatActivity() {
     private fun uiQueueTicker() {
         uiHandler.removeCallbacks(ticker)
         uiHandler.post(ticker)
+    }
+
+    /**
+     * 取一次画面中心的距离读数，交给 [PreviewView] 画。
+     *
+     * ⚠️ 「跟踪未就绪」要**单独一档**。C++ 只回 0/1/2（不可测/勉强/好），而跟踪没就绪时
+     * 它回的也是 0 —— 直接显示成「对准有纹理的地方」是**错的话**，用户会去擦镜头。
+     * 那个状态属于 SLAM，在这儿叠上去（STAGE6 §2.7：沉默和「测不了」必须能区分）。
+     */
+    private fun pollMeasure() {
+        if (!swMeasure.isChecked) {
+            // 开关关着就**别取也别画**。C++ 那边同样不算（`nativeSetMeasuring(false)`）。
+            preview.overlay = null
+            return
+        }
+        val q = SlamBridge.nativeGetMeasure(measureBuf)
+        measureState = if (trkState != TRK_OK) PreviewView.MeasureState.NO_TRACK else when (q) {
+            2 -> PreviewView.MeasureState.GOOD
+            1 -> PreviewView.MeasureState.FAIR
+            else -> PreviewView.MeasureState.NONE
+        }
+        preview.overlay = PreviewView.Overlay(
+            measureState, measureBuf[0], measureBuf[4], measureBuf[5]
+        )
     }
 
     private fun render() {
@@ -493,8 +561,10 @@ class MainActivity : AppCompatActivity() {
         // 「重定位」的灰 / 亮只看有没有旧图（§2.4）。还没有 referenceMap，所以恒灰。
         btnReloc.isEnabled = false
 
-        // 开关**一直可点** —— 它表达的是「这一段要不要录」，所以启动之前就得能设。
+        // 两个开关都**一直可点** —— 它们表达的是「这一段要不要录 / 要不要量」，
+        // 所以启动之前就得能设。
         swRecord.isEnabled = true
+        swMeasure.isEnabled = true
 
         // ---- 状态栏 ----
         val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
@@ -525,6 +595,11 @@ class MainActivity : AppCompatActivity() {
                 append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
                 val resets = SlamBridge.nativeResetCount()
                 if (resets > 0) append("　⚠️ 地图已重置 $resets 次")
+            }
+            // 十字那边的距离。**世界坐标不在这儿显**：平面兜底那条给不出世界坐标，
+            // 显成 0 会误导。要那三个数看 logcat（tag slam，`[M6]`）。
+            if (slamRunning && swMeasure.isChecked && measureState.hasReading) {
+                append("\n距离 %.3f m".format(measureBuf[0]))
             }
             val w = writer
             if (recording && w != null) {

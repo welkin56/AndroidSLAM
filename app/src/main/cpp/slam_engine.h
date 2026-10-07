@@ -4,6 +4,8 @@
 
 #include <string>
 
+#include "measure_center.h"  // slam::CenterMeasure
+
 namespace slam {
 
 // 用 int 报给 Kotlin。四态是必需的：「失败」得能显示出来，
@@ -66,6 +68,24 @@ int resetCount();
 
 /** 当前轨迹有多少条。只含跟踪 `OK` 的帧。 */
 int trajSize();
+
+// ---------------- 测距（画面中心）----------------
+//
+// 十字固定在画面中心，所以**没有「测哪儿」这个参数** —— 每帧顺手算一次就够，
+// 不需要 UI 往返。平滑也在这一侧做（只有 SLAM 线程碰那个环形缓冲）。
+//开不开测距（**主线程调**，抽屉里那个开关）。
+void setMeasuring(bool on);
+
+/** 发布一帧的测量结果（**SLAM 线程调**）。内部做中值平滑，并按变化打日志。 */
+void publishMeasure(const CenterMeasure& m);
+
+/**
+ * 读最近一次测量（**主线程调**）。
+ *
+ * `out` 要 ≥ 6：`[0]` 距离（米）、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标。
+ * 返回 `MeasureQuality`：0 不可测 / 1 勉强 / 2 好。
+ */
+int getMeasure(float out6[6]);
 
 // ---------------- 轨迹 ----------------
 

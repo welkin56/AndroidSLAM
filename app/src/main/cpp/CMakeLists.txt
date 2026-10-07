@@ -106,6 +106,7 @@ set_target_properties(DBoW2 g2o PROPERTIES
 add_library(orb_slam3 SHARED
     ${CPP_DIR}/md5.cpp                # 顶掉上游的 -lcrypto
     ${CPP_DIR}/orb_track.cpp          # 我们写的；为什么编在这儿见上面那段
+    ${CPP_DIR}/measure_center.cpp     # 同上 —— 它碰 `cv::KeyPoint` 和 `MapPoint`
     ${ORB_ROOT}/src/System.cc
     ${ORB_ROOT}/src/Tracking.cc
     ${ORB_ROOT}/src/LocalMapping.cc

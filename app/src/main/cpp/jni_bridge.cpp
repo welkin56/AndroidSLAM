@@ -214,3 +214,33 @@ Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobjec
         __android_log_write(ANDROID_LOG_ERROR, "slam", "[M5] nativeDumpTrajectory 抛异常");
     }
 }
+
+// 抽屉里那个「实时测距」开关。关掉时连算都不算，但**不影响 SLAM 本身**。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeSetMeasuring(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                           jboolean on) {
+    try {
+        slam::setMeasuring(on == JNI_TRUE);
+    } catch (...) {
+    }
+}
+
+// —— M6：画面中心的距离读数 ——
+//
+// 出参写法，和 `nativeGetPose` 同款（理由见 slam_engine.h 里那句「§6 约定 3」）。
+// `out` 要 ≥ 6：[0]=距离m [1..3]=世界 xyz [4]/[5]=图像像素 xy。
+// 返回 0/1/2（不可测/勉强/好）。⚠️ **长度不足必须挡掉** —— 写 6 个 float 会踩坏堆。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetMeasure(JNIEnv* env, jobject /*thiz*/,
+                                                         jfloatArray out) {
+    try {
+        if (env->GetArrayLength(out) < 6) return 0;
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;   // OOM
+        const int q = slam::getMeasure(p);
+        env->ReleaseFloatArrayElements(out, p, 0);
+        return q;
+    } catch (...) {
+        return 0;
+    }
+}

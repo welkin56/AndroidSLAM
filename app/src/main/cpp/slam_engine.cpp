@@ -16,8 +16,10 @@
 // 诊断输出走 printf 就行 —— M2 已经把 fd 1/2 接进 logcat 了（tag `slam`）。
 #include "slam_engine.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +48,12 @@ constexpr size_t kMaxImu = 2000;
 
 // 等帧的超时。让循环能定期回头看看 running。
 constexpr int kWaitMs = 100;
+
+// 测距读数做中值的窗口。30 fps 下约 165 ms —— 够压住抖动，又不会让数字明显滞后于手。
+constexpr size_t kMeasureRing = 5;
+
+// 测量日志的限流间隔。`printf` 是往管道写，卡一下就是毫秒级，而它跑在 SLAM 线程上。
+constexpr long long kMeasureLogMs = 300;
 
 // SLAM 线程的栈大小。**不能省**：`sizeof(Frame)` 是 146 KB，而
 // `Tracking::GrabImageMonocular` 里 `mCurrentFrame = Frame(...)` 是**栈上的临时对象**。
@@ -96,6 +104,17 @@ struct Engine {
 
     std::mutex trajMutex;
     std::vector<TrajPoint> traj;
+
+    /** 抽屉里那个「实时测距」开关。只影响算不算，不影响 SLAM。 */
+    std::atomic<bool> measuring{false};
+
+    /** 最近一次的距离读数（已平滑）。主线程只读。 */
+    std::mutex measureMutex;
+    CenterMeasure measure;
+    /** 中值窗口。和 `measure` 同一把锁 —— 因为 `start()` 要能从主线程把它清掉。 */
+    std::deque<float> measureRing;
+    /** 上次打测量日志的时刻，用来限流。 */
+    long long measureLogAtMs = 0;
 
     /** 「地图被重置」的次数。`start()` 归零。 */
     std::atomic<int> resetCount{0};
@@ -214,6 +233,10 @@ void worker(Engine& e) {
         TrackResult r;
         orbTrack(sys, f.gray.data(), f.w, f.h, t, imu, &r);
 
+        // 测距：开关关着就连算都不算。开着的每一帧都要发布 —— **包括不可测的帧**，
+        // 测不到却留着上一帧的数字，比不显示更坏。
+        if (e.measuring.load()) publishMeasure(centerMeasure(sys, f.w, f.h, r.t_cw16));
+
         // ⚠️ 重置检测**每帧都要做** —— 重置恰恰发生在不 OK 的时候。
         // 重置会清空当前图（KF 数掉到 0），而坐标系已经重新锚定，
         // 前一段轨迹拼不上来了 —— 清掉，只留最后一段。
@@ -328,6 +351,12 @@ void start() {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         e.poseValid = false;
     }
+    {
+        // 上一趟的读数不留到这一趟（免得「刚启动就显示一个数」）。
+        std::lock_guard<std::mutex> lk(e.measureMutex);
+        e.measure = CenterMeasure{};
+        e.measureRing.clear();
+    }
     e.resetCount.store(0);
     e.running.store(true);
 }
@@ -354,6 +383,68 @@ int trackingState() {
     ORB_SLAM3::System* sys = engine().sys.load();
     // `GetTrackingState()` 内部加锁（System.cc:1320），可以从任意线程调。
     return sys == nullptr ? -1 : sys->GetTrackingState();
+}
+
+void setMeasuring(bool on) {
+    Engine& e = engine();
+    e.measuring.store(on);
+    if (!on) {
+        // 关掉就当场清空。留着上一次的读数，UI 那边会显示一个**不会更新的数字**。
+        std::lock_guard<std::mutex> lk(e.measureMutex);
+        e.measure = CenterMeasure{};
+        e.measureRing.clear();
+    }
+}
+
+void publishMeasure(const CenterMeasure& m) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+
+    CenterMeasure out = m;
+    if (m.quality == kNone) {
+        // 当前帧测不到就**立刻**变成不可测 —— 留一个过期数字比不显示更坏。
+        e.measureRing.clear();
+    } else {
+        e.measureRing.push_back(m.distance);
+        while (e.measureRing.size() > kMeasureRing) e.measureRing.pop_front();
+        // 中值，不用均值 —— 对偶尔的误吸附鲁棒（STAGE6 §5 同款理由）。
+        float v[kMeasureRing];
+        size_t n = 0;
+        for (float x : e.measureRing) v[n++] = x;
+        std::sort(v, v + n);
+        out.distance = v[n / 2];
+    }
+
+    // 只在「瞄准的东西变了」时打一行：可测性翻了面，或者读数动了 5 cm 以上。
+    // 每帧都打会把 logcat 刷爆（99% 是重复的），而且管道写卡一下就是毫秒 —— 这是 SLAM 线程。
+    const long long now = nowMs();
+    const bool flipped = (out.quality == kNone) != (e.measure.quality == kNone);
+    const bool moved = out.quality != kNone && e.measure.quality != kNone &&
+                       std::fabs(out.distance - e.measure.distance) > 0.05f;
+    if ((flipped || moved) && now - e.measureLogAtMs >= kMeasureLogMs) {
+        e.measureLogAtMs = now;
+        if (out.quality == kNone) {
+            printf("[M6] 目标丢失 —— 对着有纹理的地方\n");
+        } else {
+            printf("[M6] %.3f m  世界(%.3f, %.3f, %.3f)  像素(%.1f, %.1f)  路径%d 质量%d\n",
+                   out.distance, out.wx, out.wy, out.wz, out.px, out.py, out.method, out.quality);
+        }
+        fflush(stdout);
+    }
+
+    e.measure = out;
+}
+
+int getMeasure(float out6[6]) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    out6[0] = e.measure.distance;
+    out6[1] = e.measure.wx;
+    out6[2] = e.measure.wy;
+    out6[3] = e.measure.wz;
+    out6[4] = e.measure.px;
+    out6[5] = e.measure.py;
+    return e.measure.quality;
 }
 
 int resetCount() { return engine().resetCount.load(); }

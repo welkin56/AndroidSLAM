@@ -3,7 +3,10 @@ package com.example.slamcapture
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.util.AttributeSet
 import android.view.View
 
@@ -41,6 +44,38 @@ class PreviewView @JvmOverloads constructor(
         const val MIN_INTERVAL_NS = 66_000_000L
     }
 
+    /** [Overlay.state] 的四档，从「还没法测」到「测得很准」。 */
+    enum class MeasureState {
+        /**
+         * 跟踪还没到 `OK`。
+         *
+         * ⚠️ 这是 **SLAM 的状态**，不是测量的状态 —— C++ 那边只回后面三档，这一档由 Kotlin
+         * 按跟踪状态叠上去。不分开的话，「还没准备好」会被显示成「对着有纹理的地方」，
+         * 而用户会去擦镜头（STAGE6 §2.7：沉默和「测不了」必须能区分）。
+         */
+        NO_TRACK,
+
+        /** 十字附近没有可用的地图点。 */
+        NONE,
+
+        /** 有读数，但离十字偏远 / 是平面兜底出来的。 */
+        FAIR,
+
+        /** 吸附得很近。 */
+        GOOD;
+
+        /** 有数可读 —— 决定要不要画小圈、显数字。 */
+        val hasReading: Boolean get() = this == FAIR || this == GOOD
+    }
+
+    /**
+     * 十字那一层要画的东西。**不可变**，主线程整体换引用（[overlay] 是 `@Volatile`）——
+     * 分开写几个 float 的话，[onDraw] 会读到半新半旧的一帧。
+     *
+     * `px`/`py` 是**图像像素**坐标（不是屏幕），屏幕位置由 [onDraw] 里那套变换反推。
+     */
+    data class Overlay(val state: MeasureState, val distM: Float, val px: Float, val py: Float)
+
     /** 最新一帧的灰度。相机线程写引用，主线程读引用。数组本身只读。 */
     @Volatile
     private var pending: ByteArray? = null
@@ -77,6 +112,28 @@ class PreviewView @JvmOverloads constructor(
 
     /** 上次收帧的时刻。只在相机线程碰。 */
     private var lastAcceptNs = 0L
+
+    /** 测量叠加层的内容。主线程写（ticker），主线程读（[onDraw]）。 */
+    @Volatile
+    var overlay: Overlay? = null
+
+    private val density = resources.displayMetrics.density
+    private val textSize = 16f * resources.displayMetrics.scaledDensity
+
+    private val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = Color.WHITE
+    }
+    private val snapPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFFFFC107.toInt()   // 琥珀色，和十字的白区分开
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = this@PreviewView.textSize
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    }
 
     /**
      * 开/关画面。主线程调用。
@@ -144,5 +201,52 @@ class PreviewView @JvmOverloads constructor(
         canvas.scale(scale, scale)
         canvas.drawBitmap(bmp, 0f, 0f, null)
         canvas.restore()
+
+        overlay?.let { drawMeasure(canvas, it) }
+    }
+
+    /**
+     * 画十字 + 吸附点 + 读数。
+     *
+     * 只在有画面的时候调 —— 跟着 [onDraw] 上面那道早退走，所以**没启动 SLAM 就没有十字**。
+     */
+    private fun drawMeasure(canvas: Canvas, ov: Overlay) {
+        // ⚠️ **不需要任何变换**：letterbox 是居中的，而 90° 旋转绕的就是中心，
+        // 所以图像中心就是控件中心。STAGE6 §3 那一整节的存在就是为了这一句。
+        val cx = width / 2f
+        val cy = height / 2f
+        val r = 14f * density
+        canvas.drawLine(cx - r, cy, cx + r, cy, crossPaint)
+        canvas.drawLine(cx, cy - r, cx, cy + r, crossPaint)
+
+        // 会吸到哪儿。⚠️ STAGE6 §2.5：**必须画出来** —— 否则按下去之前你不知道会定到哪个点。
+        if (ov.state.hasReading && ov.px >= 0f) {
+            // 图像像素 (px, py) → 屏幕。把上面三步代进去：
+            //   translate(dst.right, dst.top) → rotate(90) → scale(s)
+            //   (px, py) 先缩放成 (px·s, py·s)，绕原点转 90° 变成 (-py·s, px·s)，再平移。
+            canvas.drawCircle(
+                dst.right - ov.py * scale, dst.top + ov.px * scale, 6f * density, snapPaint
+            )
+        }
+
+        val label = when (ov.state) {
+            MeasureState.NO_TRACK -> "等待跟踪…"
+            MeasureState.NONE -> "对准有纹理的地方"
+            MeasureState.FAIR -> "≈ %.2f m（不太准）".format(ov.distM)
+            MeasureState.GOOD -> "%.2f m".format(ov.distM)
+        }
+
+        // 画两遍：先黑描边再白填充，亮背景上也看得清。
+        // ⚠️ **不用 `setShadowLayer`** —— 硬件加速下它不一定生效，而且要给这个 View
+        // 单独关掉硬件加速，代价比多画一遍大。
+        val tx = cx - textPaint.measureText(label) / 2f
+        val ty = cy + r + textSize
+        textPaint.style = Paint.Style.STROKE
+        textPaint.strokeWidth = 3f * density
+        textPaint.color = Color.BLACK
+        canvas.drawText(label, tx, ty, textPaint)
+        textPaint.style = Paint.Style.FILL
+        textPaint.color = Color.WHITE
+        canvas.drawText(label, tx, ty, textPaint)
     }
 }

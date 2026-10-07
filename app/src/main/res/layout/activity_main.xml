@@ -116,6 +116,15 @@
             android:text="录制落盘"
             android:textColor="#DE000000" />
 
+        <!-- 实时测距（画面中心的十字 + 读数）。关掉时 C++ 那边连算都不算。
+             和「录制落盘」一样**记在 SharedPreferences 里**，下次进来还是这个状态。 -->
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swMeasure"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="实时测距"
+            android:textColor="#DE000000" />
+
         <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->
         <Button
             android:id="@+id/btnSaveMap"
