@@ -3461,7 +3461,10 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
             g2o::HyperGraph::Vertex* VS = optimizer.vertex(4*(maxKFid+1)+1);
             if(!VP1 || !VV1 || !VG || !VA || !VP2 || !VV2 || !VGDir || !VS)
             {
-                Verbose::PrintMess("Error" + to_string(VP1->id()) + ", " + to_string(VV1->id()) + ", " + to_string(VG->id()) + ", " + to_string(VA->id()) + ", " + to_string(VP2->id()) + ", " + to_string(VV2->id()) +  ", " + to_string(VGDir->id()) + ", " + to_string(VS->id()), Verbose::VERBOSITY_NORMAL);
+                // ⚠️ 我们改的（上游 bug）：原句在**已经判定有 nullptr 之后**还逐个 `->id()`
+                // 去拼错误串 —— 走到这里必崩（空指针 + 偏移 8）。分支本来就是 continue，
+                // 所以只删这句，**计算路径一个字没变**。见 thirdparty/README.md 第 10 条。
+                Verbose::PrintMess("Error: missing vertex, skip edge", Verbose::VERBOSITY_NORMAL);
 
                 continue;
             }
