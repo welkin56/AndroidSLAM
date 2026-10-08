@@ -224,12 +224,11 @@ class MainActivity : AppCompatActivity() {
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
 
-        // 摸一下 SlamBridge，让 .so 在启动时就加载（JNI_OnLoad 里装着日志重定向）。
-        // 用 nativeHello 不用 nativeLogSelfTest——前者只回一个字符串，不灌七行噪音。
-        Log.i(TAG, "native 探针：" + SlamBridge.nativeHello())
-
         // 读一次构造状态：可能是**上一个 Activity 实例**留下的（从入口页再进来一次）。
         // System 是进程级的，Kotlin 这边每次都要重新问，不能自己记。
+        //
+        // ⚠️ 这一句还是**第一次碰 `SlamBridge`** —— `.so` 在此刻加载，`JNI_OnLoad`
+        // 顺带装上日志重定向（ORB-SLAM3 的 cout/cerr 全靠它）。别把它排到后面去。
         slamState = SlamBridge.nativeState()
         if (slamState == SLAM_LOADING) uiQueueTicker()
 
