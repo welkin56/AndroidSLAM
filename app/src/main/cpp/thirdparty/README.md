@@ -61,8 +61,35 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 7 | `g2o/g2o/core/*.h`（5 个） | `<tr1/unordered_map>`、`<tr1/memory>` → C++11 标准库，`std::tr1::` → `std::` | TR1 是 C++11 之前的 GCC 专有头。clang 定义了 `__GNUC__`，所以它走了 GCC 那条分支 |
 | 8 | `g2o/CMakeLists.txt` | `FIND_PACKAGE(Eigen3 ...)` → 用顶层传进来的 `SLAMAPP_EIGEN_INCLUDE` | 交叉编译时 CMake 的 package 查找被 NDK 锁在 sysroot 里，找不到系统装的 Eigen |
 | 9 | `DBoW2/CMakeLists.txt`、`g2o/CMakeLists.txt` | 删掉 `-march=native` | 那是"按本机 CPU 生成指令"，本机 x86、目标 arm64，直接报 `unknown target CPU 'native'`。它只是优化 |
+| 10 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(Map*, Matrix3d&, double&)` 里那句「顶点缺失」的报错串不再逐个 `->id()` | ⚠️ **这条和上面 9 条性质不同：它是上游的 bug，不是编译迁移。** |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
+
+### 第 10 条说清楚
+
+前 9 条都是「在安卓上编得过」的迁移改动。**第 10 条不是** —— 它是上游一个真实的崩溃：
+
+```cpp
+if(!VP1 || !VV1 || ... || !VS)
+{
+    Verbose::PrintMess("Error" + to_string(VP1->id()) + ", " + ...);   // ← 已经知道有 nullptr 了
+    continue;                                                          //    还逐个解引用
+}
+```
+
+**这句诊断信息，恰恰在它要诊断的那种情况下必然崩**（空指针上读偏移 8 的成员）。
+真机上抓到的 tombstone 是 `SIGSEGV / fault addr 0x8`，
+`addr2line` 定位到 `Optimizer.cc:3464` → `g2o::HyperGraph::Vertex::id()`。
+
+**为什么这不违反「没动算法」**：那个分支本来就 `continue`，跳过这条边是上游的原意；
+删掉的只是一句**永远不会被打印**（`Verbose::th` 是 QUIET）、**且必然崩溃**的字符串拼接。
+**计算路径一个字都没变，所以 PC 对照仍然成立。**
+
+⚠️ 它只是**不崩了**，没有解决「谁把顶点弄空了」（那是 `LocalMapping` 在初始化/重置期间的老问题）。
+但上游本来就打算 `continue` 跳过那条边，所以不崩是对的。
+
+**⚠️ `SLAMAPP/ORB_SLAM3/src/Optimizer.cc` 里同样这一行没改** —— 按上面的规则，
+那边只当上游参照。PC 上如果也撞上这条分支，会崩在同一行。
 
 ## 许可证
 
