@@ -1,0 +1,10 @@
+# Office 编辑时产生的锁文件（如果有人用 Word 打开过 .docx/.md）
+~$*
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.swp

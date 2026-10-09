@@ -26,10 +26,11 @@ set(ORB_ROOT ${TP_DIR}/orb_slam3)
 
 # ---- OpenCV ----
 # 外装：通用、成熟、体积大（872 MB），官方有预编译发布物，没有理由塞进仓库。
-# 默认按本机布局指向 SLAMAPP/OpenCV-android-sdk；换机器用 -DOPENCV_ANDROID_SDK=... 指过去。
+# 默认就在 thirdparty/ 下 —— **别人下载完 SDK 直接丢进 thirdparty/ 就能编**，不用配路径。
+# 换位置用 -DOPENCV_ANDROID_SDK=... 指过去。
 # ⚠️ SDK 的内部目录结构一个字都不能动：OpenCVConfig.cmake 靠自己在树里的位置往上数四级
 # 算出 SDK 根，挪了它就找不到库。
-get_filename_component(_opencv_default ${CPP_DIR}/../../../../../../OpenCV-android-sdk ABSOLUTE)
+get_filename_component(_opencv_default ${TP_DIR}/OpenCV-android-sdk ABSOLUTE)
 set(OPENCV_ANDROID_SDK ${_opencv_default} CACHE PATH "OpenCV 官方 Android SDK 的根目录")
 set(OpenCV_DIR ${OPENCV_ANDROID_SDK}/sdk/native/jni)
 # 它靠 ANDROID_NDK_ABI_NAME 去找 abi-<abi> 子目录，而 NDK 的 toolchain 只设 ANDROID_ABI。

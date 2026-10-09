@@ -1,5 +1,6 @@
 # Gradle 构建输出。
-build/
+/build/
+/app/build/
 .gradle/
 
 local.properties
@@ -7,16 +8,24 @@ local.properties
 # Android Studio / IntelliJ 的索引和窗口布局
 .idea/
 *.iml
-captures/
+/captures/
+
+# Python（tools/ 下是标定脚本）
+__pycache__/
+*.pyc
 
 # NDK 中间产物
 .externalNativeBuild/
 .cxx/
-
+properties
 app/src/main/cpp/compile_commands.json
 
-# 安卓版 Boost
+# 安卓版 Boost / OpenCV 官方 SDK —— 都是「下载完丢进 thirdparty/」，
+# 体积大（185 MB / 872 MB），不进 git。
 app/src/main/cpp/thirdparty/boost-android/
+app/src/main/cpp/thirdparty/OpenCV-android-sdk/
 
 # 系统垃圾
 .DS_Store
+
+/.vscode/

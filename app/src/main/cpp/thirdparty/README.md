@@ -29,11 +29,14 @@
 后三个是 **ORB-SLAM3 作者自己 fork 过的**，不是上游原版，版本必须跟着走 ——
 这就是它们自带、而 Eigen 不自带的区别。
 
-## 外装的（不进 git）
+## 外装的（**不进 git**）
+
+判据是 `git` 管不管，不是**放在哪** —— 下面 OpenCV 和 Boost **目录就在 `thirdparty/` 里**，
+只是被 `.gitignore` 挡住了。**换机器时把它们放回同样的位置就行，路径不用配。**
 
 | 库 | 从哪来 | 为什么不自带 |
 |---|---|---|
-| **OpenCV** | `/home/welkin/SLAMAPP/OpenCV-android-sdk`（官方 Android SDK，872 MB） | 通用、成熟、官方有预编译发布物。换机器用 `-DOPENCV_ANDROID_SDK=...` 指过去 |
+| **OpenCV** | **`thirdparty/OpenCV-android-sdk/`**（官方 Android SDK，872 MB） | 通用、成熟、官方有预编译发布物。**下载完直接丢进 `thirdparty/` 就行** —— `CMakeLists.txt` 默认就在那儿找。放别处用 `-DOPENCV_ANDROID_SDK=...` 指过去 |
 | **Eigen** | `apt install libeigen3-dev` → `/usr/include/eigen3` | 纯头文件、API 稳定、和 ORB-SLAM3 在 PC 上的用法一致 |
 | **Boost** | `./tools/setup-boost-android.sh` | 没有官方安卓发布物，得自己交叉编译；而且它是构建产物，绑死 NDK 版本。跑一次脚本，装到 `boost-android/`（已 gitignore） |
 
