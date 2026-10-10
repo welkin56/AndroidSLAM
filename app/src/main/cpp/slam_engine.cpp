@@ -59,6 +59,9 @@ constexpr int kMeasureRingHold = 3;
 // 测量日志的限流间隔。`printf` 是往管道写，卡一下就是毫秒级，而它跑在 SLAM 线程上。
 constexpr long long kMeasureLogMs = 300;
 
+// 「一直测不到」每隔这么久也打一行。**只在测不到时**，有读数不会打 ⟹ 不刷屏。
+constexpr long long kMeasureStuckMs = 5000;
+
 // SLAM 线程的栈大小。**不能省**：`sizeof(Frame)` 是 146 KB，而
 // `Tracking::GrabImageMonocular` 里 `mCurrentFrame = Frame(...)` 是**栈上的临时对象**。
 // PC 上跑 `mono_inertial_euroc` 用的是主线程（8 MB），Android 的 `std::thread` 只给 1 MB。
@@ -439,35 +442,48 @@ void publishMeasure(const CenterMeasure& m) {
     // 只在「瞄准的东西变了」时打一行：可测性翻了面，或者读数动了 5 cm 以上。
     // 每帧都打会把 logcat 刷爆（99% 是重复的），而且管道写卡一下就是毫秒 —— 这是 SLAM 线程。
     const long long now = nowMs();
+    const long long since = now - e.measureLogAtMs;
     const bool flipped = (out.quality == kNone) != (e.measure.quality == kNone);
     const bool moved = out.quality != kNone && e.measure.quality != kNone &&
                        std::fabs(out.distance - e.measure.distance) > 0.05f;
-    if ((flipped || moved) && now - e.measureLogAtMs >= kMeasureLogMs) {
+    if ((flipped || moved) && since >= kMeasureLogMs) {
         e.measureLogAtMs = now;
         if (out.quality == kNone) {
-            printf("[M6] 目标丢失 —— 对着有纹理的地方\n");
+            printf("[M6] * 测不到  候选%d 支持%d 纹理%d 跨度%.0f%%\n", out.candidates,
+                   out.support, out.texture, out.zSpan * 100.0f);
         } else {
-            printf("[M6] %.3f m  世界(%.3f, %.3f, %.3f)  像素(%.1f, %.1f)"
-                   "  候选%d 支持%d 跨度%.0f%%  %s 路径%d 质量%d\n",
+            printf("[M6] * %.3f m  世界(%.3f, %.3f, %.3f)  像素(%.1f, %.1f)"
+                   "  候选%d 支持%d 纹理%d 跨度%.0f%%  %s 路径%d 质量%d\n",
                    out.distance, out.wx, out.wy, out.wz, out.px, out.py,
-                   out.candidates, out.support, out.zSpan * 100.0f,
+                   out.candidates, out.support, out.texture, out.zSpan * 100.0f,
                    out.source == 1 ? "新选" : "沿用", out.method, out.quality);
         }
+        fflush(stdout);
+    } else if (out.quality == kNone && since >= kMeasureStuckMs) {
+        // ⚠️ **「一直测不到」要留痕。** 不然它在日志里是一片空白 ——
+        // 分不清是开关没开、没候选、还是支持度不够。**这个项目最常见的问题就是它。**
+        // 只在**测不到**时打，有读数就走上面那条 ⟹ 正常使用时不会刷屏。
+        e.measureLogAtMs = now;
+        printf("[M6]   测不到  候选%d 支持%d 纹理%d 跨度%.0f%%\n", out.candidates,
+               out.support, out.texture, out.zSpan * 100.0f);
         fflush(stdout);
     }
 
     e.measure = out;
 }
 
-int getMeasure(float out6[6]) {
+int getMeasure(float out7[7]) {
     Engine& e = engine();
     std::lock_guard<std::mutex> lk(e.measureMutex);
-    out6[0] = e.measure.distance;
-    out6[1] = e.measure.wx;
-    out6[2] = e.measure.wy;
-    out6[3] = e.measure.wz;
-    out6[4] = e.measure.px;
-    out6[5] = e.measure.py;
+    out7[0] = e.measure.distance;
+    out7[1] = e.measure.wx;
+    out7[2] = e.measure.wy;
+    out7[3] = e.measure.wz;
+    out7[4] = e.measure.px;
+    out7[5] = e.measure.py;
+    // 十字附近有多少**特征点**（不管有没有地图点）。UI 拿它区分两种情况：
+    //   有纹理但没建进图 → 「对着它多停一会儿」；没纹理 → 「换个地方」。
+    out7[6] = static_cast<float>(e.measure.texture);
     return e.measure.quality;
 }
 

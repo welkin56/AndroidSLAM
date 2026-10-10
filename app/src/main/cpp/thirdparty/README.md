@@ -65,6 +65,7 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 8 | `g2o/CMakeLists.txt` | `FIND_PACKAGE(Eigen3 ...)` → 用顶层传进来的 `SLAMAPP_EIGEN_INCLUDE` | 交叉编译时 CMake 的 package 查找被 NDK 锁在 sysroot 里，找不到系统装的 Eigen |
 | 9 | `DBoW2/CMakeLists.txt`、`g2o/CMakeLists.txt` | 删掉 `-march=native` | 那是"按本机 CPU 生成指令"，本机 x86、目标 arm64，直接报 `unknown target CPU 'native'`。它只是优化 |
 | 10 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(Map*, Matrix3d&, double&)` 里那句「顶点缺失」的报错串不再逐个 `->id()` | ⚠️ **这条和上面 9 条性质不同：它是上游的 bug，不是编译迁移。** |
+| 11 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(...)`（多参数那个重载）里检测到 `!mpImuPreintegrated` 之后**补了 `continue`** | 同上 —— **上游 bug，和第 10 条同源** |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 
@@ -93,6 +94,32 @@ if(!VP1 || !VV1 || ... || !VS)
 
 **⚠️ `SLAMAPP/ORB_SLAM3/src/Optimizer.cc` 里同样这一行没改** —— 按上面的规则，
 那边只当上游参照。PC 上如果也撞上这条分支，会崩在同一行。
+
+### 第 11 条说清楚
+
+**和第 10 条是同一个模子**：ORB-SLAM3 里有一类「**检测到 → 打印 → 照样用**」的写法。
+
+```cpp
+if(!pKFi->mpImuPreintegrated)
+    std::cout << "Not preintegrated measurement" << std::endl;   // ← 检测到了
+
+pKFi->mpImuPreintegrated->SetNewBias(...);                        // ← 然后照样解引用 ✗ 崩
+```
+
+真机 tombstone：`SIGSEGV / fault addr 0x8a8`，
+`pthread_mutex_lock` ← `IMU::Preintegrated::SetNewBias` ← `Optimizer::InertialOptimization`
+← `LocalMapping::InitializeIMU` ← `LocalMapping::Run`。
+
+**修法**：补 `continue` —— 没有预积分就没法参与惯性优化，
+**和上面几行按 `isBad()` / `mnId` 过滤是同一套逻辑** ✓
+
+**⚠️ 触发条件是偶发的**：需要「某个关键帧没有 IMU 预积分」。
+日志里伴随 `Empty IMU measurements vector!!!` 和 `Not preintegrated measurement`。
+历次运行出现 0~1 次。
+
+**⚠️ 还有三处同源但没崩过、也没修的**（用户决定「下次崩了再说」）：
+`Optimizer.cc` 里三处 `new EdgeInertialGS(pKFi->mpImuPreintegrated)` ——
+**顶点非空 ≠ 预积分非空**，所以那三处的空检查护不住它。**崩了就来这儿看。**
 
 ## 许可证
 

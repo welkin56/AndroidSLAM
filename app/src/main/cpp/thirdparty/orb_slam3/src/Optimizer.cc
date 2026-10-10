@@ -3139,8 +3139,11 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
         {
             if(pKFi->isBad() || pKFi->mPrevKF->mnId>maxKFid)
                 continue;
+            // ⚠️ 我们改的（上游 bug，和 README 第 10 条同源）：原句只打印一句，**没有 continue**，
+            //    下一行照样解引用空指针 —— 必崩（真机 tombstone: pthread_mutex_lock / fault 0x8a8）。
+            //    没有预积分就没法参与惯性优化，跳过这个关键帧和上面按 isBad()/mnId 过滤是同一套逻辑。
             if(!pKFi->mpImuPreintegrated)
-                std::cout << "Not preintegrated measurement" << std::endl;
+                continue;
 
             pKFi->mpImuPreintegrated->SetNewBias(pKFi->mPrevKF->GetImuBias());
             g2o::HyperGraph::Vertex* VP1 = optimizer.vertex(pKFi->mPrevKF->mnId);

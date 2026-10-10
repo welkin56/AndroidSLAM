@@ -83,10 +83,10 @@ void publishMeasure(const CenterMeasure& m);
 /**
  * 读最近一次测量（**主线程调**）。
  *
- * `out` 要 ≥ 6：`[0]` 距离（米）、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标。
- * 返回 `MeasureQuality`：0 不可测 / 1 勉强 / 2 好。
+ * `out` 要 ≥ 7：`[0]` 距离（米）、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标、
+ * `[6]` 十字附近的**特征点**数（不管有没有地图点）。返回 `MeasureQuality`。
  */
-int getMeasure(float out6[6]);
+int getMeasure(float out7[7]);
 
 // ---------------- 轨迹 ----------------
 

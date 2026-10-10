@@ -161,7 +161,7 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 测距（画面中心）----------------
 
     /** `[0]` 距离m、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标。同样复用。 */
-    private val measureBuf = FloatArray(6)
+    private val measureBuf = FloatArray(7)
 
     /** 给 [PreviewView.Overlay] 用的状态，比 C++ 那三档多一个「跟踪未就绪」。 */
     private var measureState = PreviewView.MeasureState.NO_TRACK
@@ -594,11 +594,15 @@ class MainActivity : AppCompatActivity() {
                 append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
                 val resets = SlamBridge.nativeResetCount()
                 if (resets > 0) append("　⚠️ 地图已重置 $resets 次")
-            }
-            // 十字那边的距离。**世界坐标不在这儿显**：平面兜底那条给不出世界坐标，
-            // 显成 0 会误导。要那三个数看 logcat（tag slam，`[M6]`）。
-            if (slamRunning && swMeasure.isChecked && measureState.hasReading) {
-                append("\n距离 %.3f m".format(measureBuf[0]))
+                // ⚠️ 只加**纹理**，不加距离 —— 这一行太长会**折行**，`tvStatus` 一变高
+                // 就把预览挤下去（那个距离十字旁边本来就有）。
+                // **世界坐标也不在这儿显**：平面兜底那条给不出，显成 0 会误导
+                // （要看那三个数读 logcat，tag `slam` 的 `[M6]`）。
+                if (swMeasure.isChecked) {
+                    // 纹理 = 十字附近有几个**特征点**（不管有没有地图点）。
+                    // **没读数时也有值** ⟹ 正好告诉用户「这地方为什么测不了」。
+                    append("　纹理 %.0f".format(measureBuf[6]))
+                }
             }
             val w = writer
             if (recording && w != null) {

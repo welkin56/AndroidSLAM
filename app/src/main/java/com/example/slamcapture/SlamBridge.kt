@@ -100,5 +100,6 @@ object SlamBridge {
     /** 抽屉里那个开关。关掉时 C++ 那边连算都不算，但**不影响 SLAM 跟踪**。 */
     external fun nativeSetMeasuring(on: Boolean)
 
+    /** ⚠️ `out` **必须 ≥ 7**（短了直接返回「不可测」）：`[0]`距离 `[1..3]`世界xyz `[4][5]`图像xy `[6]`附近特征点数。 */
     external fun nativeGetMeasure(out: FloatArray): Int
 }
