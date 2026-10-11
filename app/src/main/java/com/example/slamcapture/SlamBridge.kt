@@ -102,4 +102,18 @@ object SlamBridge {
 
     /** ⚠️ `out` **必须 ≥ 7**（短了直接返回「不可测」）：`[0]`距离 `[1..3]`世界xyz `[4][5]`图像xy `[6]`附近特征点数。 */
     external fun nativeGetMeasure(out: FloatArray): Int
+
+    /**
+     * 多点折线：把一批**世界坐标**投回当帧图像像素，给 UI 画线。
+     *
+     * `world` 是紧凑的 `xyz` 三元组；`out` 要 ≥ `world.size`（**每点 3 个**：
+     * `px, py, 在不在相机前方`）。返回在相机前方的个数。
+     *
+     * ⚠️ **相机后方的点也给了坐标** —— 是画外一个**朝那个方向**的点，所以
+     * 「一端在相机后面」的线段仍然有方向可画（只要一端可见，这条边就可见）。
+     * 第三个 float 才是「它其实在后面」。
+     *
+     * ⚠️ **只影响画，不影响距离** —— 点之间的距离是纯世界坐标的算式，和位姿无关。
+     */
+    external fun nativeProjectPoints(world: FloatArray, out: FloatArray): Int
 }

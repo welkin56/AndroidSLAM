@@ -5,6 +5,8 @@
 //    刻意不链 OpenCV（理由见 orb_track.h）。
 #pragma once
 
+#include <string>
+
 namespace ORB_SLAM3 {
 class System;
 class MapPoint;
@@ -62,5 +64,20 @@ struct CenterMeasureState {
  */
 CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_cw[16],
                             CenterMeasureState* st);
+
+// ---------------- 投影：把已钉住的世界点画回画面 ----------------
+// 只管**画**，不管距离 —— 点之间的距离是纯世界坐标的算式，和位姿无关。
+
+/** 读一次内参给 [projectWorld] 用。幂等；读失败就留 0（投影全返回 0）。 */
+void initIntrinsics(const std::string& settingsPath);
+
+/**
+ * 世界 → 当帧图像像素。`out` 收 **`3n`** 个：每点 `px, py, 在不在相机前方`。返回前方的个数。
+ *
+ * ⚠️ **相机后方的点也写坐标**（不是 -1）—— 把 `z` 夹到一个正的小量，于是它落到
+ * **画面外、朝那个方向**。这样「一端在相机后面」的线段**仍然有方向可画**
+ * （要的就是：只要一端可见，这条边就可见）。第三个 float 才说明它其实是后面的。
+ */
+int projectWorld(const float* worldXyz, int n, const float t_cw[16], float* out);
 
 }  // namespace slam

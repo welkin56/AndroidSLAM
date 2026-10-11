@@ -88,6 +88,17 @@ void publishMeasure(const CenterMeasure& m);
  */
 int getMeasure(float out7[7]);
 
+/**
+ * 把一批**世界坐标**投到当帧图像像素（**主线程调**）。`out` 收 **`3n`** 个：
+ * 每点 `px, py, 在不在相机前方`。位姿由这一侧自己取，调用方不用传。返回前方的个数。
+ *
+ * ⚠️ **相机后方的点也有坐标**（朝那个方向的画外点）—— 这样「一端在相机后面」的线段
+ * 仍然画得出来。第三个数才说明它其实是后面的。细节见 `measure_center.h`。
+ *
+ * 只给「多点折线」把已钉住的点画回画面用 —— 距离本身不经过这里。
+ */
+int projectPoints(const float* worldXyz, int n, float* out);
+
 // ---------------- 轨迹 ----------------
 
 /**

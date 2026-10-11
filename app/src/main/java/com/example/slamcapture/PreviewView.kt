@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.util.AttributeSet
@@ -68,13 +70,29 @@ class PreviewView @JvmOverloads constructor(
         val hasReading: Boolean get() = this == FAIR || this == GOOD
     }
 
+    /** 已经钉住的一个点。`low` = 它当初是平面兜底来的（不太准），画成空心圈。 */
+    data class Mark(val px: Float, val py: Float, val low: Boolean)
+
+    /** 一段折线。四个坐标都是**图像像素**，`label` 是它的长度。 */
+    data class Seg(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val label: String)
+
     /**
      * 十字那一层要画的东西。**不可变**，主线程整体换引用（[overlay] 是 `@Volatile`）——
      * 分开写几个 float 的话，[onDraw] 会读到半新半旧的一帧。
      *
-     * `px`/`py` 是**图像像素**坐标（不是屏幕），屏幕位置由 [onDraw] 里那套变换反推。
+     * `px`/`py` 是**图像像素**坐标（不是屏幕），屏幕位置由 [toScreen] 反推。
+     * `marks`/`segs` 只放**投得出来**的点 —— 相机后方和屏幕外的在这里已经被滤掉了。
+     * `live` 是「上一个点 → 十字」那段还在拉的橡皮筋，画成虚线。
      */
-    data class Overlay(val state: MeasureState, val distM: Float, val px: Float, val py: Float)
+    data class Overlay(
+        val state: MeasureState,
+        val distM: Float,
+        val px: Float,
+        val py: Float,
+        val marks: List<Mark> = emptyList(),
+        val segs: List<Seg> = emptyList(),
+        val live: Seg? = null,
+    )
 
     /** 最新一帧的灰度。相机线程写引用，主线程读引用。数组本身只读。 */
     @Volatile
@@ -113,9 +131,13 @@ class PreviewView @JvmOverloads constructor(
     /** 上次收帧的时刻。只在相机线程碰。 */
     private var lastAcceptNs = 0L
 
-    /** 测量叠加层的内容。主线程写（ticker），主线程读（[onDraw]）。 */
-    @Volatile
-    var overlay: Overlay? = null
+    /**
+     * **每画新的一帧**时调一次，拿这一刻要画的叠加层。主线程。
+     */
+    var overlaySupplier: (() -> Overlay?)? = null
+
+    /** 本帧要画的叠加层，由 [overlaySupplier] 在新帧上填。 */
+    private var overlay: Overlay? = null
 
     private val density = resources.displayMetrics.density
     private val textSize = 16f * resources.displayMetrics.scaledDensity
@@ -133,6 +155,62 @@ class PreviewView @JvmOverloads constructor(
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textSize = this@PreviewView.textSize
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    }
+
+    // ---- 多点折线。青色 = 「我自己画的东西」，和十字的白、吸附圈的琥珀区分开 ----
+
+    /** 折线本身，以及**低置信度**的标记点（描边 = 空心圈）。 */
+    private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFF00E5FF.toInt()
+    }
+
+    /** 高置信度的标记点（实心）。 */
+    private val markSolidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF00E5FF.toInt()
+    }
+
+    /** 「上一个点 → 十字」那段橡皮筋，虚线以表明**还没定**。 */
+    private val livePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        color = 0xFF00E5FF.toInt()
+        pathEffect = DashPathEffect(floatArrayOf(10f * density, 8f * density), 0f)
+    }
+
+    /** 段标签比十字旁边那个读数小一号 —— 它会有好几条，不能抢主读数的位置。 */
+    private val segTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 13f * resources.displayMetrics.scaledDensity
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    }
+
+    /** [toScreen] 的复用输出。**不能同时拿两个** —— 要用两个点的地方得传两个不同的。 */
+    private val ptA = PointF()
+    private val ptB = PointF()
+
+    /**
+     * 图像像素 → 控件的屏幕坐标。
+     *
+     * 把 [onDraw] 里那三步代进去：`translate(dst.right, dst.top)` → `rotate(90)` → `scale(s)`
+     * ⟹ 先缩放成 `(px·s, py·s)`，绕原点转 90° 变成 `(−py·s, px·s)`，再平移。
+     *
+     * ⚠️ **只有这一处做这个变换。** 写错的话标记会和场景错位，而**看起来像「SLAM 不准」**。
+     */
+    private fun toScreen(px: Float, py: Float, out: PointF) {
+        out.set(dst.right - py * scale, dst.top + px * scale)
+    }
+
+    /** 黑描边 + 白填充画两遍 —— 亮背景上也看得清。别用 `setShadowLayer`（硬件加速下不一定生效）。 */
+    private fun drawOutlinedText(canvas: Canvas, text: String, x: Float, y: Float, p: Paint) {
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3f * density
+        p.color = Color.BLACK
+        canvas.drawText(text, x, y, p)
+        p.style = Paint.Style.FILL
+        p.color = Color.WHITE
+        canvas.drawText(text, x, y, p)
     }
 
     /**
@@ -193,6 +271,8 @@ class PreviewView @JvmOverloads constructor(
             for (i in argb.indices) argb[i] = lut[g[i].toInt() and 0xFF]
             bmp.setPixels(argb, 0, W, 0, 0, W, H)   // 复用缓冲，不分配
             drawn = g
+            // 叠加层跟着**新帧**更新，不跟着 ticker —— 见 overlaySupplier 上面那段。
+            overlay = overlaySupplier?.invoke()
         }
 
         canvas.save()
@@ -211,6 +291,16 @@ class PreviewView @JvmOverloads constructor(
      * 只在有画面的时候调 —— 跟着 [onDraw] 上面那道早退走，所以**没启动 SLAM 就没有十字**。
      */
     private fun drawMeasure(canvas: Canvas, ov: Overlay) {
+        // ---- 已钉住的折线。先画线（在最下面），标记点和十字压在上面 ----
+        for (s in ov.segs) drawSeg(canvas, s, markPaint)
+        ov.live?.let { drawSeg(canvas, it, livePaint) }  // 还在拉的橡皮筋，虚线
+        for (m in ov.marks) {
+            toScreen(m.px, m.py, ptA)
+            canvas.drawCircle(ptA.x, ptA.y, 7f * density,
+                              if (m.low) markPaint else markSolidPaint)
+        }
+
+        // ---- 十字 ----
         // ⚠️ **不需要任何变换**：letterbox 是居中的，而 90° 旋转绕的就是中心，
         // 所以图像中心就是控件中心。STAGE6 §3 那一整节的存在就是为了这一句。
         val cx = width / 2f
@@ -221,12 +311,8 @@ class PreviewView @JvmOverloads constructor(
 
         // 会吸到哪儿。⚠️ STAGE6 §2.5：**必须画出来** —— 否则按下去之前你不知道会定到哪个点。
         if (ov.state.hasReading && ov.px >= 0f) {
-            // 图像像素 (px, py) → 屏幕。把上面三步代进去：
-            //   translate(dst.right, dst.top) → rotate(90) → scale(s)
-            //   (px, py) 先缩放成 (px·s, py·s)，绕原点转 90° 变成 (-py·s, px·s)，再平移。
-            canvas.drawCircle(
-                dst.right - ov.py * scale, dst.top + ov.px * scale, 6f * density, snapPaint
-            )
+            toScreen(ov.px, ov.py, ptA)
+            canvas.drawCircle(ptA.x, ptA.y, 6f * density, snapPaint)
         }
 
         val label = when (ov.state) {
@@ -235,18 +321,17 @@ class PreviewView @JvmOverloads constructor(
             MeasureState.FAIR -> "≈ %.2f m（不太准）".format(ov.distM)
             MeasureState.GOOD -> "%.2f m".format(ov.distM)
         }
+        drawOutlinedText(canvas, label, cx - textPaint.measureText(label) / 2f,
+                         cy + r + textSize, textPaint)
+    }
 
-        // 画两遍：先黑描边再白填充，亮背景上也看得清。
-        // ⚠️ **不用 `setShadowLayer`** —— 硬件加速下它不一定生效，而且要给这个 View
-        // 单独关掉硬件加速，代价比多画一遍大。
-        val tx = cx - textPaint.measureText(label) / 2f
-        val ty = cy + r + textSize
-        textPaint.style = Paint.Style.STROKE
-        textPaint.strokeWidth = 3f * density
-        textPaint.color = Color.BLACK
-        canvas.drawText(label, tx, ty, textPaint)
-        textPaint.style = Paint.Style.FILL
-        textPaint.color = Color.WHITE
-        canvas.drawText(label, tx, ty, textPaint)
+    /** 一段折线 + 挂在中点的长度标签。 */
+    private fun drawSeg(canvas: Canvas, s: Seg, line: Paint) {
+        toScreen(s.x0, s.y0, ptA)
+        toScreen(s.x1, s.y1, ptB)
+        canvas.drawLine(ptA.x, ptA.y, ptB.x, ptB.y, line)
+        drawOutlinedText(canvas, s.label,
+                         (ptA.x + ptB.x) / 2f - segTextPaint.measureText(s.label) / 2f,
+                         (ptA.y + ptB.y) / 2f, segTextPaint)
     }
 }

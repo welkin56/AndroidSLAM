@@ -6,12 +6,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
 
 #include "MapPoint.h"
+#include "Settings.h"
 #include "System.h"
 
 namespace slam {
@@ -71,6 +74,9 @@ constexpr size_t kMinPlanePoints = 5;
 
 /** 相机后方的点不算数。 */
 constexpr float kMinZ = 0.05f;
+
+/** 投影出来的像素夹在这个范围里 —— 相机后方的点会算出天文数字，没必要真带出去。 */
+constexpr float kProjClamp = 20000.f;
 
 struct Center {
     float u, v;
@@ -419,12 +425,76 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
         out.quality = kFair;  // 兜底出来的，一律不当「好」
         out.method = 2;
         out.distance = z;
-        // ⚠️ **不给世界坐标**：沿光轴只知道深度，要变成点得知道十字的归一化方向，那要内参。
-        // STAGE6 §2.3 的「两点距离」将来要用它 —— 到时候再加 `System::GetK()`。
+        // 世界坐标**能给**：十字恒等于主点（见 centerPx），那条视线在相机系里恰好是 (0,0,1)。
+        // ⚠️ 和 centerPx 同一个假设，改那个要一起改。
+        const Eigen::Vector3f pw = Tcw.block<3, 3>(0, 0).transpose() * Eigen::Vector3f(0.f, 0.f, z) + cam;
+        out.wx = pw.x();
+        out.wy = pw.y();
+        out.wz = pw.z();
         out.px = c.u;
         out.py = c.v;
     }
     return out;
+}
+
+// ---------------- 投影 ----------------
+
+namespace {
+/** [initIntrinsics] 填一次。0 = 没有内参，[projectWorld] 全返回 -1。 */
+float gFx = 0, gFy = 0, gCx = 0, gCy = 0;
+}  // namespace
+
+void initIntrinsics(const std::string& settingsPath) {
+    if (gFx != 0) return;
+
+    printf("[M6] initIntrinsics: 开始读内参，settings=%s\n", settingsPath.c_str());
+    fflush(stdout);
+
+    // ⚠️ 走 `Settings` 的公开接口 —— `Tracking::mK` 是 protected，`System` 不给 K。
+    // 唯一真相仍是 phone.yaml，不在这儿抄常量。
+    ORB_SLAM3::Settings s(settingsPath, static_cast<int>(ORB_SLAM3::System::IMU_MONOCULAR));
+    ORB_SLAM3::GeometricCamera* cam = s.camera1();
+    if (cam == nullptr) {
+        printf("[M6] ⚠️ initIntrinsics 失败：camera1() 是空的 ⟹ 多点折线画不出来\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 0..3 = fx, fy, cx, cy（顺序见 Tracking.cc:549-553）。
+    gFx = cam->getParameter(0);
+    gFy = cam->getParameter(1);
+    gCx = cam->getParameter(2);
+    gCy = cam->getParameter(3);
+
+    printf("[M6] 投影内参 fx=%.3f fy=%.3f cx=%.3f cy=%.3f\n", gFx, gFy, gCx, gCy);
+    fflush(stdout);
+}
+
+int projectWorld(const float* worldXyz, int n, const float t_cw[16], float* out) {
+    if (worldXyz == nullptr || out == nullptr || n <= 0) return 0;
+    if (gFx == 0) return 0;
+
+    // `t_cw` 是列主序：元素 (r,c) 在 [c*4+r]。pc = Rcw·pw + tcw。
+    int hits = 0;
+    for (int i = 0; i < n; ++i) {
+        const float* w = worldXyz + 3 * i;
+        const float x = t_cw[0] * w[0] + t_cw[4] * w[1] + t_cw[8] * w[2] + t_cw[12];
+        const float y = t_cw[1] * w[0] + t_cw[5] * w[1] + t_cw[9] * w[2] + t_cw[13];
+        const float z = t_cw[2] * w[0] + t_cw[6] * w[1] + t_cw[10] * w[2] + t_cw[14];
+
+        const bool front = z >= kMinZ;
+        // ⚠️ 后面的点把 z **夹成正的小量**，而不是丢掉 —— 这样它落到画面外、**朝那个方向**。
+        // 转过手机时端点正好从前面穿到后面，夹出来的方向就是正确的渐近方向，
+        // 于是「一端在相机后面」的线段仍然画得出来，而且是往对的方向。
+        const float zc = front ? z : kMinZ;
+
+        float* o = out + 3 * i;
+        o[0] = std::min(std::max(gFx * x / zc + gCx, -kProjClamp), kProjClamp);
+        o[1] = std::min(std::max(gFy * y / zc + gCy, -kProjClamp), kProjClamp);
+        o[2] = front ? 1.f : 0.f;
+        if (front) ++hits;
+    }
+    return hits;
 }
 
 }  // namespace slam

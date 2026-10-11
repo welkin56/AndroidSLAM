@@ -57,6 +57,58 @@
             android:layout_weight="1"
             android:background="#000000" />
 
+        <!-- 多点折线测距。**绑死在「实时测距」开关上** —— 关着就 GONE。
+             ⚠️ 预览是 weight=1 ⟹ 这一行出现/消失时预览高度变一次。那是拨开关那一下，不是每帧跳。 -->
+        <LinearLayout
+            android:id="@+id/rowMeasure"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:paddingTop="4dp"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/btnAddPoint"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:minWidth="0dp"
+                android:text="加点"
+                android:textColor="@color/measure_button_text" />
+
+            <Button
+                android:id="@+id/btnBreakChain"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:minWidth="0dp"
+                android:text="断开"
+                android:textColor="@color/measure_button_text" />
+
+            <Button
+                android:id="@+id/btnUndoPoint"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:minWidth="0dp"
+                android:text="撤销"
+                android:textColor="@color/measure_button_text" />
+
+            <Button
+                android:id="@+id/btnResetPoints"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:text="重置"
+                android:textColor="@color/measure_button_text" />
+        </LinearLayout>
+
         <!-- 两个按钮放最下面，好按。「重定位」灰着是**有理由的灰** —— 还没有旧图（§2.2），
              不是"还没实现"。 -->
         <LinearLayout

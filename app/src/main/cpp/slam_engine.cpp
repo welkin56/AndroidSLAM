@@ -49,6 +49,9 @@ constexpr size_t kMaxImu = 2000;
 // 等帧的超时。让循环能定期回头看看 running。
 constexpr int kWaitMs = 100;
 
+// ORB_SLAM3 `eTrackingState::OK`（Tracking.h:121）。和 measure_center.cpp 里那个同义。
+constexpr int kTrackingOk = 2;
+
 // 测距读数做中值的窗口。锁定之后它只需要压**毫米级**的位姿噪声，小窗口滞后更小。
 constexpr size_t kMeasureRing = 3;
 
@@ -106,7 +109,10 @@ struct Engine {
     std::deque<Imu> imus;
 
     std::mutex poseMutex;
+    /** **Twc**（相机 → 世界）。给 Kotlin 显示位置用 —— `[12..14]` 就是相机在世界里的坐标。 */
     float pose[16] = {0};
+    /** **Tcw**（世界 → 相机）。投影用。⚠️ 和 `pose` **方向相反**，别混（混了的表现见 projectPoints）。 */
+    float t_cw[16] = {0};
     bool poseValid = false;
 
     std::mutex trajMutex;
@@ -171,6 +177,11 @@ void construct(Engine& e) {
                         .count();
     e.sys.store(s);
     e.state.store(State::kReady);
+
+    // 投影要内参（幂等，从 settings 读，不抄常量）。**放 System 造好之后** ——
+    // 一是不占 `init()` 那个主线程，二是构造失败时不用白付这一次解析。
+    initIntrinsics(e.settings);
+
     printf("[M5] System 构造完成，耗时 %lld ms\n", (long long)ms);
     fflush(stdout);
 }
@@ -179,6 +190,7 @@ void savePose(Engine& e, const TrackResult& r) {
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         std::memcpy(e.pose, r.pose16, sizeof(e.pose));
+        std::memcpy(e.t_cw, r.t_cw16, sizeof(e.t_cw));
         e.poseValid = true;
     }
 
@@ -485,6 +497,51 @@ int getMeasure(float out7[7]) {
     //   有纹理但没建进图 → 「对着它多停一会儿」；没纹理 → 「换个地方」。
     out7[6] = static_cast<float>(e.measure.texture);
     return e.measure.quality;
+}
+
+namespace {
+/** ⚠️ **临时诊断，拿到数据就删。** 投影为什么返回 0 —— 只在原因变化时打一行。 */
+void logProjBail(int why) {
+    static int last = 0;
+    if (why == last) return;
+    last = why;
+    if (why == 1) printf("[M6] ⚠️ 投影返回 0：跟踪不是 OK\n");
+    if (why == 2) printf("[M6] ⚠️ 投影返回 0：还没有位姿\n");
+    if (why == 3) printf("[M6] ⚠️ 投影返回 0：点全在相机后方（多半是位姿方向搞反了）\n");
+    fflush(stdout);
+}
+}  // namespace
+
+int projectPoints(const float* worldXyz, int n, float* out) {
+    if (worldXyz == nullptr || out == nullptr || n <= 0) return 0;
+    Engine& e = engine();
+
+    // ⚠️ 跟踪不是 OK 时 `e.pose` 是**上一帧 OK 时的旧值**（`savePose` 只在 `r.valid` 时调）
+    // —— 拿它投影会把标记画到错的地方，而且看起来像「贴在屏幕上不动」。
+    // 和 `centerMeasure` 那道闸同理：不是 OK 就没什么可说的。
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (sys == nullptr || sys->GetTrackingState() != kTrackingOk) {
+        logProjBail(1);
+        return 0;
+    }
+
+    // 位姿在锁下拷一份就走，投影本身不持锁 —— 调用方是主线程，别让它等 SLAM 线程。
+    float t[16];
+    {
+        std::lock_guard<std::mutex> lk(e.poseMutex);
+        if (!e.poseValid) {
+            logProjBail(2);
+            return 0;
+        }
+        // ⚠️ **必须是 `t_cw`，不是 `pose`。** `pose` 是 Twc（方向相反）——
+        // 拿它当 Tcw 用的话每个点的 `z` 都是负的，全部被判成「在相机后方」，
+        // 表现是**一个标记都画不出来，而且一声不吭**（`projectWorld` 只是返回 0）。
+        std::memcpy(t, e.t_cw, sizeof(t));
+    }
+
+    const int hits = projectWorld(worldXyz, n, t, out);
+    if (hits == 0) logProjBail(3);
+    return hits;
 }
 
 int resetCount() { return engine().resetCount.load(); }

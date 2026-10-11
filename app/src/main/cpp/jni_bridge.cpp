@@ -218,3 +218,28 @@ Java_com_example_slamcapture_SlamBridge_nativeGetMeasure(JNIEnv* env, jobject /*
         return 0;
     }
 }
+
+// 「多点折线」：把已钉住的世界坐标投回当帧像素，给 UI 画线用。**和距离无关。**
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeProjectPoints(JNIEnv* env, jobject /*thiz*/,
+                                                            jfloatArray world, jfloatArray out) {
+    try {
+        const jsize n = env->GetArrayLength(world) / 3;
+        if (n <= 0 || env->GetArrayLength(out) < n * 3) return 0;   // out 是 3n：px, py, 前方标记
+
+        jfloat* w = env->GetFloatArrayElements(world, nullptr);
+        if (w == nullptr) return 0;   // OOM
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) {
+            env->ReleaseFloatArrayElements(world, w, JNI_ABORT);
+            return 0;
+        }
+
+        const int hits = slam::projectPoints(w, n, o);
+        env->ReleaseFloatArrayElements(world, w, JNI_ABORT);  // 只读
+        env->ReleaseFloatArrayElements(out, o, 0);            // 写回
+        return static_cast<jint>(hits);
+    } catch (...) {
+        return 0;
+    }
+}
