@@ -34,6 +34,7 @@
 #include <pthread.h>
 
 #include "ImuTypes.h"
+#include "MapPoint.h"
 #include "System.h"
 #include "orb_track.h"
 
@@ -135,6 +136,20 @@ struct Engine {
 
     /** 「地图被重置」的次数。`start()` 归零。 */
     std::atomic<int> resetCount{0};
+
+    /**
+     * 折线上的一个点。**存 `MapPoint*` 而不是只存坐标** —— 坐标会变，身份不会。
+     * 理由见 `slam_engine.h` 那一整段。
+     */
+    struct Pinned {
+        ORB_SLAM3::MapPoint* mp = nullptr;  // nullptr = 平面兜底来的，没身份，只能冻着
+        float pw[3] = {0, 0, 0};            // 兜底/失效时的坐标，也当每帧的刷新缓存
+        bool low = false;                   // 平面兜底/勉强来的（画空心圈）
+        bool startsChain = false;           // 它是一条新折线的起点
+        bool closed = false;                // 它之后「断开」了
+    };
+    /** 折线。和 `measure` 用同一把锁 —— `addPinned` 要读它。**全部主线程碰。** */
+    std::vector<Pinned> pinned;
 };
 
 // 故意泄漏，见文件头第 2 条。
@@ -499,49 +514,160 @@ int getMeasure(float out7[7]) {
     return e.measure.quality;
 }
 
+// ---------------- 多点折线 ----------------
+
 namespace {
-/** ⚠️ **临时诊断，拿到数据就删。** 投影为什么返回 0 —— 只在原因变化时打一行。 */
-void logProjBail(int why) {
+/** 投影不可用（没位姿 / 跟踪不是 OK）—— **只在原因变化时打一行**，不刷屏。 */
+void logNoPose(int why) {
     static int last = 0;
     if (why == last) return;
     last = why;
-    if (why == 1) printf("[M6] ⚠️ 投影返回 0：跟踪不是 OK\n");
-    if (why == 2) printf("[M6] ⚠️ 投影返回 0：还没有位姿\n");
-    if (why == 3) printf("[M6] ⚠️ 投影返回 0：点全在相机后方（多半是位姿方向搞反了）\n");
+    if (why == 1) printf("[M6] ⚠️ 投影不可用：跟踪不是 OK（折线整条不画）\n");
+    if (why == 2) printf("[M6] ⚠️ 投影不可用：还没有位姿（折线整条不画）\n");
     fflush(stdout);
 }
 }  // namespace
 
-int projectPoints(const float* worldXyz, int n, float* out) {
-    if (worldXyz == nullptr || out == nullptr || n <= 0) return 0;
+bool addPinned(int snapTo) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+
+    Engine::Pinned p;
+    if (snapTo >= 0) {
+        // 吸到已有点：**复制它的身份**，不是用十字当前命中的那个
+        //（那个只是碰巧很近的另一个地图点，之后会各漂各的）。
+        if (snapTo >= static_cast<int>(e.pinned.size())) return false;
+        const Engine::Pinned& src = e.pinned[snapTo];
+        p.mp = src.mp;
+        p.pw[0] = src.pw[0];
+        p.pw[1] = src.pw[1];
+        p.pw[2] = src.pw[2];
+        p.low = src.low;
+    } else {
+        if (e.measure.quality == kNone) return false;  // 没读数就没什么可钉的
+        p.mp = e.measure.mp;
+        p.pw[0] = e.measure.wx;
+        p.pw[1] = e.measure.wy;
+        p.pw[2] = e.measure.wz;
+        p.low = (e.measure.quality != kGood);
+    }
+
+    // 断开之后，下一个点就是**新一条折线**的起点。**这一侧自己判** ——
+    // 于是 Kotlin 一条链状态都不用存，全读回去（两边不会对不上）。
+    p.startsChain = e.pinned.empty() || e.pinned.back().closed;
+    e.pinned.push_back(p);
+    return true;
+}
+
+void undoPinned() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    if (!e.pinned.empty()) e.pinned.pop_back();
+}
+
+void clearPinned() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    e.pinned.clear();
+}
+
+void closePinnedChain() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    if (!e.pinned.empty()) e.pinned.back().closed = true;
+}
+
+namespace {
+float dist3(const float* a, const float* b) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+}  // namespace
+
+int getPinned(float* out, int cap) {
+    if (out == nullptr || cap < 5) return 0;
     Engine& e = engine();
 
-    // ⚠️ 跟踪不是 OK 时 `e.pose` 是**上一帧 OK 时的旧值**（`savePose` 只在 `r.valid` 时调）
-    // —— 拿它投影会把标记画到错的地方，而且看起来像「贴在屏幕上不动」。
-    // 和 `centerMeasure` 那道闸同理：不是 OK 就没什么可说的。
-    ORB_SLAM3::System* sys = e.sys.load();
-    if (sys == nullptr || sys->GetTrackingState() != kTrackingOk) {
-        logProjBail(1);
-        return 0;
-    }
-
-    // 位姿在锁下拷一份就走，投影本身不持锁 —— 调用方是主线程，别让它等 SLAM 线程。
+    // ⚠️ `poseMutex` 和 `measureMutex` **不嵌套**：先把位姿拷出来、放锁，再拿测量那把。
+    // 反过来的话就和 `savePose` 的取锁顺序相反，迟早死锁。
+    // ⚠️ **必须是 `t_cw`，不是 `pose`。** `pose` 是 Twc（方向相反）—— 拿它当 Tcw 用的话
+    // 每个点的 z 都是负的，全部被判成「在相机后方」，表现是**一个标记都画不出来，
+    // 而且一声不吭**。这条真机上栽过一次。
     float t[16];
+    bool havePose = false;
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
-        if (!e.poseValid) {
-            logProjBail(2);
-            return 0;
+        if (e.poseValid) {
+            std::memcpy(t, e.t_cw, sizeof(t));
+            havePose = true;
         }
-        // ⚠️ **必须是 `t_cw`，不是 `pose`。** `pose` 是 Twc（方向相反）——
-        // 拿它当 Tcw 用的话每个点的 `z` 都是负的，全部被判成「在相机后方」，
-        // 表现是**一个标记都画不出来，而且一声不吭**（`projectWorld` 只是返回 0）。
-        std::memcpy(t, e.t_cw, sizeof(t));
+    }
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (!havePose || sys == nullptr || sys->GetTrackingState() != kTrackingOk) {
+        // 跟踪不是 OK 时 `t_cw` 是**上一帧 OK 时的旧值** —— 拿它投影会把标记画到
+        // 错的地方，而且看起来像「贴在屏幕上不动」。
+        havePose = false;
+        logNoPose(sys == nullptr || sys->GetTrackingState() != kTrackingOk ? 1 : 2);
     }
 
-    const int hits = projectWorld(worldXyz, n, t, out);
-    if (hits == 0) logProjBail(3);
-    return hits;
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    // ⚠️ `(cap-1)/4` 而不是 `cap/4` —— 下面还要写 `out[4n]`（`liveLen`），
+    // 用 `cap/4` 的话 `n == cap/4` 时那个下标正好差一个越界（cap=32 时 n=8 要 33 个）。
+    const int n = std::min(static_cast<int>(e.pinned.size()), (cap - 1) / 4);
+    if (n <= 0) return 0;
+
+    for (int i = 0; i < n; ++i) {
+        Engine::Pinned& p = e.pinned[i];
+
+        // ① 刷新 —— **问地图点要最新坐标**。这是这一整套东西存在的理由：
+        //    存坐标快照的话，BA 一动地图，折线和场景就错开了。
+        //    没身份（平面兜底来的）或者已经失效的，只能留上一份。
+        if (p.mp != nullptr && !p.mp->isBad()) {
+            const Eigen::Vector3f w = p.mp->GetWorldPos();
+            p.pw[0] = w.x();
+            p.pw[1] = w.y();
+            p.pw[2] = w.z();
+        }
+
+        float* o = out + 4 * i;
+        // ⓪ **先清零** —— `projectWorld` 在下面那些情况下会一个字都不写，
+        //    不清零就会把上一帧的残留带出去（px/py 是旧的）。
+        o[0] = 0.f;
+        o[1] = 0.f;
+        float flags = 0.f;
+        if (p.startsChain) flags += 2.f;
+        if (p.closed) flags += 4.f;
+        if (p.low) flags += 8.f;
+
+        // ② 投影。每点单独调（n 很小），省一个临时缓冲。
+        if (havePose) {
+            float proj[3];
+            if (projectWorld(p.pw, 1, t, proj) == 1) {
+                o[0] = proj[0];
+                o[1] = proj[1];
+                flags += 1.f;  // bit0 = 在相机前方
+            }
+        }
+
+        // ③ 到下一个点的长度。下一段是新折线起点时不成立 ⟹ 0。
+        float len = 0.f;
+        if (i + 1 < n && !e.pinned[i + 1].startsChain) len = dist3(p.pw, e.pinned[i + 1].pw);
+        o[2] = flags;
+        o[3] = len;
+    }
+
+    // 橡皮筋：最后一个点 → 十字。**断开 / 没读数时是 -1**。
+    // ⚠️ 没读数时 `e.measure.wx/wy/wz` 是 0 —— 拿它算就是从最后一个点量到**世界原点**，
+    //    会出一个巨大的假数。
+    float live = -1.f;
+    const Engine::Pinned& last = e.pinned[n - 1];
+    if (!last.closed && e.measure.quality != kNone) {
+        const float cur[3] = {e.measure.wx, e.measure.wy, e.measure.wz};
+        live = dist3(last.pw, cur);
+    }
+    out[4 * n] = live;
+
+    return n;
 }
 
 int resetCount() { return engine().resetCount.load(); }

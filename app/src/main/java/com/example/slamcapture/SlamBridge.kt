@@ -103,17 +103,33 @@ object SlamBridge {
     /** ⚠️ `out` **必须 ≥ 7**（短了直接返回「不可测」）：`[0]`距离 `[1..3]`世界xyz `[4][5]`图像xy `[6]`附近特征点数。 */
     external fun nativeGetMeasure(out: FloatArray): Int
 
+    // —— 多点折线 ——
+    //
+    // ⚠️ **折线整个存在 C++ 侧**，因为它要存 `MapPoint*`。存坐标快照是不行的：
+    // BA 一直在挪地图点，走一圈之后快照就和地图差开了 —— 标记飘到空中，
+    // **而且长度数字也跟着错**。刷新 / 投影 / 算长度一次给完，这一侧只负责画。
+
     /**
-     * 多点折线：把一批**世界坐标**投回当帧图像像素，给 UI 画线。
+     * 把当前读数钉成一个点。没有有效读数返回 false。
      *
-     * `world` 是紧凑的 `xyz` 三元组；`out` 要 ≥ `world.size`（**每点 3 个**：
-     * `px, py, 在不在相机前方`）。返回在相机前方的个数。
-     *
-     * ⚠️ **相机后方的点也给了坐标** —— 是画外一个**朝那个方向**的点，所以
-     * 「一端在相机后面」的线段仍然有方向可画（只要一端可见，这条边就可见）。
-     * 第三个 float 才是「它其实在后面」。
-     *
-     * ⚠️ **只影响画，不影响距离** —— 点之间的距离是纯世界坐标的算式，和位姿无关。
+     * `snapTo >= 0` = **复制第 `snapTo` 个点的身份**（吸到已有点用）；
+     * -1 = 用十字当前的读数。
      */
-    external fun nativeProjectPoints(world: FloatArray, out: FloatArray): Int
+    external fun nativeAddPinned(snapTo: Int): Boolean
+
+    external fun nativeUndoPinned()
+
+    external fun nativeClearPinned()
+
+    /** 「断开」：最后一个点之后不再拉橡皮筋，下一个点会另起一条折线。 */
+    external fun nativeClosePinnedChain()
+
+    /**
+     * 读折线。`out` 要 ≥ `4n + 1`，**返回实际写了几个点**（可能小于真实点数 —— 那时扩容后下一帧再来）。
+     *
+     * 每点 4 个：`px py flags lenToNext`，最后一个是 `liveLen`（最后一个点 → 十字；<0 = 没有）。
+     *
+     * `flags` 的位：bit0 在相机前方 / bit1 新折线起点 / bit2 之后断开 / bit3 不太准。
+     */
+    external fun nativeGetPinned(out: FloatArray): Int
 }

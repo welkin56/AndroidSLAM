@@ -379,6 +379,7 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
     // ============ ④ 出结果 ============
     if (have) {
         out.method = 1;
+        out.mp = mp;  // 折线靠它认住身份（世界坐标会变，见 header）
         out.distance = pc.norm();  // 斜距，和激光测距仪报的是同一种量
         // ⚠️ 用 `GetWorldPos()` 而不是环里的 `pw` —— 前者是最新的（BA 一直在动点）。
         const Eigen::Vector3f pw = mp->GetWorldPos();

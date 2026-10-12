@@ -219,26 +219,52 @@ Java_com_example_slamcapture_SlamBridge_nativeGetMeasure(JNIEnv* env, jobject /*
     }
 }
 
-// 「多点折线」：把已钉住的世界坐标投回当帧像素，给 UI 画线用。**和距离无关。**
-extern "C" JNIEXPORT jint JNICALL
-Java_com_example_slamcapture_SlamBridge_nativeProjectPoints(JNIEnv* env, jobject /*thiz*/,
-                                                            jfloatArray world, jfloatArray out) {
+// 「多点折线」。刷新、投影、算长度**全在 C++ 一次给完** —— 因为折线存的是 `MapPoint*`，
+// 那个东西只在 C++ 侧拿得到。见 slam_engine.h 那一整段。
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeAddPinned(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                        jint snapTo) {
     try {
-        const jsize n = env->GetArrayLength(world) / 3;
-        if (n <= 0 || env->GetArrayLength(out) < n * 3) return 0;   // out 是 3n：px, py, 前方标记
+        return slam::addPinned(static_cast<int>(snapTo)) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
 
-        jfloat* w = env->GetFloatArrayElements(world, nullptr);
-        if (w == nullptr) return 0;   // OOM
-        jfloat* o = env->GetFloatArrayElements(out, nullptr);
-        if (o == nullptr) {
-            env->ReleaseFloatArrayElements(world, w, JNI_ABORT);
-            return 0;
-        }
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeUndoPinned(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::undoPinned();
+    } catch (...) {
+    }
+}
 
-        const int hits = slam::projectPoints(w, n, o);
-        env->ReleaseFloatArrayElements(world, w, JNI_ABORT);  // 只读
-        env->ReleaseFloatArrayElements(out, o, 0);            // 写回
-        return static_cast<jint>(hits);
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeClearPinned(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::clearPinned();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeClosePinnedChain(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::closePinnedChain();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetPinned(JNIEnv* env, jobject /*thiz*/,
+                                                        jfloatArray out) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;   // OOM
+        const int n = slam::getPinned(p, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, p, 0);   // 写回
+        return static_cast<jint>(n);
     } catch (...) {
         return 0;
     }

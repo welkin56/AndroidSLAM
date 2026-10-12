@@ -26,7 +26,7 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.sqrt
+import kotlin.math.abs
 
 /**
  * SLAM 主界面。**跑 SLAM 的那一屏。**
@@ -98,6 +98,15 @@ class MainActivity : AppCompatActivity() {
          * （那个吸地图点，这个吸标记点）。**手感参数，跑完再定。**
          */
         private const val kPointSnapPx = 20f
+
+        /** 折线读回来的缓冲**至少留这么多点的余量**。见 [readPinned] 里那段。 */
+        private const val kPinnedSlack = 8
+
+        /** `nativeGetPinned` 每点第 3 个 float 的位。**和 `slam_engine.cpp` 那侧一一对应。** */
+        private const val kFlagFront = 1       // 在相机前方
+        private const val kFlagChainStart = 2  // 它是一条新折线的起点
+        private const val kFlagClosed = 4      // 它之后「断开」了
+        private const val kFlagLow = 8         // 不太准（平面兜底/勉强）⟹ 画空心圈
     }
 
     private lateinit var btnSlam: Button
@@ -186,33 +195,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnResetPoints: Button
 
     /**
-     * 一个已钉住的点。
+     * 折线**整个存在 C++ 侧** —— 它要存 `MapPoint*`（世界坐标会变，身份不会）。
+     * 这一侧只留一个**读回来的缓冲**，照着画：刷新 / 投影 / 算长度全在那边一次给完。
      *
-     * - `low` —— 当初是平面兜底来的（不太准），画成空心圈
-     * - `startsChain` —— **它是一条新折线的起点**（和上一个点之间不画线）
-     * - `closed` —— 「断开」按在它身上了 ⟹ 它之后不再拉橡皮筋
+     * 布局：每点 4 个 `px py flags lenToNext`，最后一个是 `liveLen`（<0 = 没有橡皮筋）。
      */
-    private class Pinned(val w: FloatArray, val low: Boolean, val startsChain: Boolean) {
-        var closed = false
-    }
+    private var pinnedBuf = FloatArray(4 * 8 + 1)
 
-    /** **折线顺序**。存的是世界坐标 —— 所以 `‖w_i − w_j‖` 就是长度，和位姿无关。 */
-    private val pinned = ArrayList<Pinned>()
+    /** 上一次读回来几个点。**只信这个，别拿 `pinnedBuf.size` 当点数**（那是容量）。 */
+    private var pinnedN = 0
 
-    /**
-     * 当前这条折线还开着吗 —— 开着才从最后一个点拉橡皮筋。
-     *
-     * **完全从 `pinned` 推出来**，不另存一个「断开了」的布尔量：
-     * 那样「撤销」就得分情况去还原它，很容易两边对不上。
-     */
-    private val chainOpen: Boolean get() = pinned.isNotEmpty() && !pinned.last().closed
+    /** 当前这条折线还开着吗 —— 开着才拉橡皮筋，也才让「断开」可点。 */
+    private val chainOpen: Boolean
+        get() = pinnedN > 0 && (pinnedBuf[(pinnedN - 1) * 4 + 2].toInt() and kFlagClosed) == 0
 
-    /** 每段的长度文字。**只在 [rebuildSegLabels] 里重算** —— 逐帧算它是白烧，理由在那条注释里。 */
-    private var segLabels: List<String> = emptyList()
-
-    /** 给 [SlamBridge.nativeProjectPoints] 的复用缓冲：输入 `3n`、输出 `2n`。 */
-    private var projIn = FloatArray(0)
-    private var projOut = FloatArray(0)
+    /** 段标签缓存：上次的值 + 上次的文字。见 [segLabel]。 */
+    private val segLast = ArrayList<Float>()
+    private val segLabels = ArrayList<String>()
 
     /** 上一次见到的「地图重置次数」。涨了 ⟹ 世界系换过 ⟹ 老点全废。 */
     private var resetCountSeen = 0
@@ -274,16 +273,16 @@ class MainActivity : AppCompatActivity() {
             render()
         }
 
-        // 多点折线：加点 / 断开 / 撤销 / 重置。**距离全在 Kotlin 算**，一个 native 调用都不用
-        //（唯一那个 native 调用是投影，只为了把标记画到屏幕上）。
+        // 多点折线：加点 / 断开 / 撤销 / 重置。**折线整个存在 C++ 侧**（它要存 `MapPoint*`），
+        // 这一侧只调它、然后把结果读回来画。
         btnAddPoint.setOnClickListener { addPinnedPoint() }
         btnBreakChain.setOnClickListener { breakChain() }
         btnUndoPoint.setOnClickListener {
-            if (pinned.isNotEmpty()) pinned.removeAt(pinned.size - 1)
+            SlamBridge.nativeUndoPinned()
             refreshPinned()
         }
         btnResetPoints.setOnClickListener {
-            pinned.clear()
+            SlamBridge.nativeClearPinned()
             refreshPinned()
         }
 
@@ -604,99 +603,125 @@ class MainActivity : AppCompatActivity() {
         // 用 `>` 而不是 `!=`：`nativeStart()` 会把计数归零，那不算重置。
         val resets = SlamBridge.nativeResetCount()
         if (resets > resetCountSeen) {
-            pinned.clear()
-            rebuildSegLabels()
+            SlamBridge.nativeClearPinned()
+            segLast.clear()
+            segLabels.clear()
         }
         resetCountSeen = resets
 
+        readMeasure()
+    }
+
+    /**
+     * 读一次画面中心的测量，顺手把 [measureState] 定下来。返回 C++ 那个质量码。
+     *
+     * ⚠️ **两处都调它**：ticker 上那次（4Hz）管**按钮的灰亮**，`buildOverlay` 里那次（15Hz）
+     * 管**画**。少任何一处都会「一半新一半旧」。
+     */
+    private fun readMeasure(): Int {
         val q = SlamBridge.nativeGetMeasure(measureBuf)
         measureState = if (trkState != TRK_OK) PreviewView.MeasureState.NO_TRACK else when (q) {
             2 -> PreviewView.MeasureState.GOOD
             1 -> PreviewView.MeasureState.FAIR
             else -> PreviewView.MeasureState.NONE
         }
+        return q
     }
 
     // ---------------- 多点折线 ----------------
 
     /**
-     * 折线变了：重算段长文字 + 刷按钮状态。
+     * 折线变了：读一次 + 刷按钮状态。
      *
      * **不用手动重画叠加层** —— 它跟着下一帧（≤66ms）自己就更新，见 [PreviewView.overlaySupplier]。
      */
     private fun refreshPinned() {
-        rebuildSegLabels()
+        readPinned()
         render()
     }
 
     /**
-     * 重算每段的长度文字（`segLabels[i]` = 第 i 段；断了的那段是空串）。
+     * 读一次折线到 [pinnedBuf]，点数写进 [pinnedN]。**主线程**。
      *
-     * ⚠️ **只在 `pinned` 变了之后调，绝不逐帧调。** 长度是 `‖w_i − w_j‖`，**和位姿无关** ——
-     * 手机怎么动它都不变。而 `String.format` 一次要几十微秒，20 段 × 15fps 就是**毫秒级**，
-     * 和 `onDraw` 里那 30 万像素的展开一个量级。**逐帧算纯属白烧。**
+     * ⚠️ 容量不够时 C++ **只写装得下的那几个**（它返回「实际写了几个」—— 这样调用方
+     * 不会去读没写过的内存）。所以看到「写满」就扩容。
+     *
+     * **留 8 个点的余量**，而加点一次只加一个、每次加完立刻重读 ⟹ **正常用法碰不到截断**。
+     * 真撞上了也只是**那一帧少画一个点**，下一帧就好（不为「批量加载」那种不存在的场景
+     * 加一层重读循环）。
      */
-    private fun rebuildSegLabels() {
-        segLabels = List(maxOf(0, pinned.size - 1)) { i ->
-            if (pinned[i + 1].startsChain) ""   // 断开的处没有线段
-            else "%.3f m".format(dist(pinned[i].w, pinned[i + 1].w))
+    private fun readPinned(): Int {
+        pinnedN = SlamBridge.nativeGetPinned(pinnedBuf)
+        // ⚠️ **保持余量，不是「满了才扩」。** 满了才扩的话那一帧**已经被 C++ 截断了**
+        // （它只写装得下的那几个），会少画几个点。余量掉到 [kPinnedSlack] 以下就提前扩，
+        // 于是**截断那条路正常永远走不到**。
+        // 和现有大小一起翻倍，是为了别每加一个点就重分配一次。
+        val cap = (pinnedBuf.size - 1) / 4   // C++ 最多能写几个（那个 -1 留给 liveLen）
+        if (cap - pinnedN < kPinnedSlack) {
+            pinnedBuf = FloatArray(maxOf(4 * (pinnedN + kPinnedSlack) + 1, pinnedBuf.size * 2))
         }
+        return pinnedN
     }
 
-    /** 把已钉住的点投到当帧像素。返回**共享缓冲** `projOut`（`2n`）；没位姿/没内参返回 null。 */
-    private fun projectPinned(): FloatArray? {
-        val n = pinned.size
-        if (n == 0) return null
-        if (projIn.size < n * 3) projIn = FloatArray(n * 3)
-        if (projOut.size < n * 3) projOut = FloatArray(n * 3)
-        for (i in 0 until n) {
-            val w = pinned[i].w
-            projIn[i * 3] = w[0]
-            projIn[i * 3 + 1] = w[1]
-            projIn[i * 3 + 2] = w[2]
+    /**
+     * 段标签。**只在变化超过 0.5mm 时才重新 `format`。**
+     *
+     * ⚠️ 长度现在**每帧都在变** —— 地图一直在收敛，两点的距离跟着变（这是刷新要的效果，
+     * 不是抖动）。所以不能像以前那样「只在点变了时算」；但也不该每帧都 `String.format`
+     * （几十微秒 × 段数 × 15fps 是毫秒级）。显示到毫米，**比半毫米更小的变化不该让
+     * 字符串重排** —— 那只会让标签闪。
+     */
+    private fun segLabel(i: Int, v: Float): String {
+        while (segLast.size <= i) {
+            segLast.add(-1f)
+            segLabels.add("")
         }
-        // 返回 0 = 全部在相机后方（或没位姿/没内参）⟹ 这一段没什么可画的。
-        return if (SlamBridge.nativeProjectPoints(projIn, projOut) == 0) null else projOut
-    }
-
-    private fun dist(a: FloatArray, b: FloatArray): Float {
-        val dx = a[0] - b[0]
-        val dy = a[1] - b[1]
-        val dz = a[2] - b[2]
-        return sqrt(dx * dx + dy * dy + dz * dz)
+        if (segLast[i] < 0f || abs(v - segLast[i]) > 5e-4f) {
+            segLast[i] = v
+            segLabels[i] = "%.3f m".format(v)
+        }
+        return segLabels[i]
     }
 
     private fun buildOverlay(): PreviewView.Overlay {
-        val p = projectPinned()
-        val n = pinned.size
+        // ⚠️ **这里也要读一次测量。** 叠加层是 15fps 画的，而 ticker 上的 `pollMeasure`
+        // 只有 4Hz —— 只靠它的话，标记和折线是平滑的，**十字读数、琥珀吸附圈、橡皮筋的
+        // 另一端却在一秒跳 4 次**，一头平滑一头在跳，比全都慢更难看。
+        readMeasure()
+        val n = readPinned()
         val marks = ArrayList<PreviewView.Mark>(n)
         val segs = ArrayList<PreviewView.Seg>(maxOf(0, n - 1))
         var live: PreviewView.Seg? = null
 
-        // 每点 3 个：`px, py, 在不在相机前方`。
+        // 每点 4 个：`px py flags lenToNext`。
         //   - **标记点**只画在相机前方的（后面的那个坐标是「朝那个方向的画外点」，画了没意义）
         //   - **线段**只要有一端在相机前方就画 —— 另一端用的是那个画外点，
         //     于是线会朝正确的方向延伸到屏幕外、被画布裁掉（要的就是这个）
-        if (p != null) {
-            for (i in 0 until n) {
-                if (p[i * 3 + 2] == 0f) continue
-                marks.add(PreviewView.Mark(p[i * 3], p[i * 3 + 1], pinned[i].low))
-            }
-            for (i in 0 until n - 1) {
-                // 「断开」过的地方不连线 —— 那就是把折线切成两条。
-                if (pinned[i + 1].startsChain) continue
-                if (p[i * 3 + 2] == 0f && p[(i + 1) * 3 + 2] == 0f) continue
-                segs.add(PreviewView.Seg(
-                    p[i * 3], p[i * 3 + 1], p[(i + 1) * 3], p[(i + 1) * 3 + 1], segLabels[i]))
-            }
-            // 橡皮筋：最后一个点 → 十字。**断开之后就不拉了**（`chainOpen`）。
-            // 橡皮筋的另一端永远是十字（在画面里），所以只要求最后一个点在相机前方。
-            if (chainOpen && measureState.hasReading && measureBuf[4] >= 0f &&
-                p[(n - 1) * 3 + 2] != 0f) {
-                val cur = floatArrayOf(measureBuf[1], measureBuf[2], measureBuf[3])
-                live = PreviewView.Seg(
-                    p[(n - 1) * 3], p[(n - 1) * 3 + 1], measureBuf[4], measureBuf[5],
-                    "%.3f m".format(dist(pinned[n - 1].w, cur)))
+        for (i in 0 until n) {
+            val o = i * 4
+            val f = pinnedBuf[o + 2].toInt()
+            if (f and kFlagFront == 0) continue
+            marks.add(PreviewView.Mark(pinnedBuf[o], pinnedBuf[o + 1], f and kFlagLow != 0))
+        }
+        for (i in 0 until n - 1) {
+            val a = i * 4
+            val b = a + 4
+            val fa = pinnedBuf[a + 2].toInt()
+            val fb = pinnedBuf[b + 2].toInt()
+            // 「断开」过的地方不连线 —— 那就是把折线切成两条。
+            if (fb and kFlagChainStart != 0) continue
+            if (fa and kFlagFront == 0 && fb and kFlagFront == 0) continue
+            segs.add(PreviewView.Seg(pinnedBuf[a], pinnedBuf[a + 1], pinnedBuf[b], pinnedBuf[b + 1],
+                                     segLabel(i, pinnedBuf[a + 3])))
+        }
+        // 橡皮筋：最后一个点 → 十字。**断开 / 没读数时那侧给的是 -1**。
+        // 另一端永远是十字（在画面里），所以只要求最后一个点在相机前方。
+        if (n > 0 && measureBuf[4] >= 0f) {
+            val o = (n - 1) * 4
+            val liveLen = pinnedBuf[n * 4]
+            if (liveLen >= 0f && pinnedBuf[o + 2].toInt() and kFlagFront != 0) {
+                live = PreviewView.Seg(pinnedBuf[o], pinnedBuf[o + 1], measureBuf[4], measureBuf[5],
+                                       "%.3f m".format(liveLen))
             }
         }
         return PreviewView.Overlay(measureState, measureBuf[0], measureBuf[4], measureBuf[5],
@@ -706,48 +731,41 @@ class MainActivity : AppCompatActivity() {
     /**
      * 把当前读数钉成一个点。
      *
-     * 先试**吸到已有点**：用当帧投影的像素距离判，因为用户是按**屏幕上看到的**判断
-     * 「是不是同一个角」的 —— 世界距离阈值在不同景深下含义完全不同。
+     * 先试**吸到已有点**：用**上一帧那份缓冲**里的投影判像素距离（≤66ms 旧，够用）——
+     * 因为用户是按**屏幕上看到的**判断「是不是同一个角」的，世界距离阈值在不同景深下
+     * 含义完全不同。
+     *
+     * ⚠️ 判出下标之后交给 C++ **复制那个点的身份**，不是「把当前读数钉下去」——
+     * 后者存的是十字命中的**另一个**地图点（只是碰巧很近），之后两个点会**各漂各的**。
      */
     private fun addPinnedPoint() {
         if (!measureState.hasReading) return
 
-        // 断开之后，下一个点就是**新一条折线**的起点。
-        val startsChain = !chainOpen
-
-        val p = projectPinned()
-        if (p != null) {
-            val cx = CameraCapture.W * 0.5f
-            val cy = CameraCapture.H * 0.5f
-            for (i in 0 until pinned.size) {
-                if (p[i * 3 + 2] == 0f) continue
-                val dx = p[i * 3] - cx
-                val dy = p[i * 3 + 1] - cy
-                if (dx * dx + dy * dy <= kPointSnapPx * kPointSnapPx) {
-                    // 精确闭合到那个角：**直接复用它的世界坐标**，不是新建一个几乎重合的点。
-                    pinned.add(Pinned(pinned[i].w, pinned[i].low, startsChain))
-                    refreshPinned()
-                    return
-                }
+        var snapTo = -1
+        val cx = CameraCapture.W * 0.5f
+        val cy = CameraCapture.H * 0.5f
+        for (i in 0 until pinnedN) {
+            val o = i * 4
+            if (pinnedBuf[o + 2].toInt() and kFlagFront == 0) continue
+            val dx = pinnedBuf[o] - cx
+            val dy = pinnedBuf[o + 1] - cy
+            if (dx * dx + dy * dy <= kPointSnapPx * kPointSnapPx) {
+                snapTo = i
+                break
             }
         }
-        pinned.add(Pinned(
-            floatArrayOf(measureBuf[1], measureBuf[2], measureBuf[3]),
-            measureState == PreviewView.MeasureState.FAIR, startsChain))
-        refreshPinned()
+        if (SlamBridge.nativeAddPinned(snapTo)) refreshPinned()
     }
 
     /**
      * 「断开」：当前这条折线到此为止。
      *
      * **点全部留着**，只是不再从最后一个点拉橡皮筋，下一个「加点」会**另起一条**。
-     *
-     * 「开没开」完全从 `pinned` 推（见 [chainOpen]），不另存布尔量 ——
-     * 那样「撤销」就得按情况还原它，两边很容易对不上。撤销掉那个点，断开自然也就没了。
+     * 「开没开」完全从读回来的 flags 推（见 [chainOpen]），这一侧一条链状态都不存 ——
+     * 那样「撤销」就得按情况还原它，两边很容易对不上。
      */
     private fun breakChain() {
-        if (!chainOpen) return
-        pinned.last().closed = true
+        SlamBridge.nativeClosePinnedChain()
         refreshPinned()
     }
 
@@ -782,8 +800,8 @@ class MainActivity : AppCompatActivity() {
         btnAddPoint.isEnabled = swMeasure.isChecked && measureState.hasReading
         // 「断开」只在折线**还开着**的时候有意义（已经断开了再按是空操作 ⟹ 灰着）。
         btnBreakChain.isEnabled = swMeasure.isChecked && chainOpen
-        btnUndoPoint.isEnabled = pinned.isNotEmpty()
-        btnResetPoints.isEnabled = pinned.isNotEmpty()
+        btnUndoPoint.isEnabled = pinnedN > 0
+        btnResetPoints.isEnabled = pinnedN > 0
 
         // ---- 状态栏 ----
         val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"

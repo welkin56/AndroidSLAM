@@ -26,6 +26,12 @@ struct CenterMeasure {
     int method = 0;      // 1 = 地图点，2 = 局部平面
     float distance = 0;  // 相机心 → 目标，米
     float wx = 0, wy = 0, wz = 0;  // `method == 2` 时无效
+
+    /**
+     * 命中的地图点，`method == 1` 时非空。
+     */
+    ORB_SLAM3::MapPoint* mp = nullptr;
+
     float px = -1, py = -1;        // 命中处的图像像素，给 UI 画小圈
 
     int source = 0;    // 1 新选 / 2 沿用锁定。日志用
