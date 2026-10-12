@@ -103,10 +103,9 @@ class MainActivity : AppCompatActivity() {
         private const val kPinnedSlack = 8
 
         /** `nativeGetPinned` 每点第 3 个 float 的位。**和 `slam_engine.cpp` 那侧一一对应。** */
-        private const val kFlagFront = 1       // 在相机前方
-        private const val kFlagChainStart = 2  // 它是一条新折线的起点
-        private const val kFlagClosed = 4      // 它之后「断开」了
-        private const val kFlagLow = 8         // 不太准（平面兜底/勉强）⟹ 画空心圈
+        private const val kFlagFront = 1   // 在相机前方
+        private const val kFlagClosed = 2  // 它之后「断开」了
+        private const val kFlagLow = 4     // 不太准（平面兜底/勉强）⟹ 画空心圈
     }
 
     private lateinit var btnSlam: Button
@@ -198,16 +197,19 @@ class MainActivity : AppCompatActivity() {
      * 折线**整个存在 C++ 侧** —— 它要存 `MapPoint*`（世界坐标会变，身份不会）。
      * 这一侧只留一个**读回来的缓冲**，照着画：刷新 / 投影 / 算长度全在那边一次给完。
      *
-     * 布局：每点 4 个 `px py flags lenToNext`，最后一个是 `liveLen`（<0 = 没有橡皮筋）。
+     * 布局：每点 3 个 `px py flags`；每段 5 个 `x0 y0 x1 y1 len`；最后 5 个是橡皮筋。
      */
-    private var pinnedBuf = FloatArray(4 * 8 + 1)
+    private var pinnedBuf = FloatArray(8 * 8 + 1)
 
     /** 上一次读回来几个点。**只信这个，别拿 `pinnedBuf.size` 当点数**（那是容量）。 */
     private var pinnedN = 0
 
     /** 当前这条折线还开着吗 —— 开着才拉橡皮筋，也才让「断开」可点。 */
     private val chainOpen: Boolean
-        get() = pinnedN > 0 && (pinnedBuf[(pinnedN - 1) * 4 + 2].toInt() and kFlagClosed) == 0
+        get() = pinnedN > 0 && (pinnedBuf[1 + (pinnedN - 1) * 3 + 2].toInt() and kFlagClosed) == 0
+
+    /** 第 i 段那 5 个数在缓冲里的起点。 */
+    private fun segAt(i: Int) = 1 + 3 * pinnedN + 5 * i
 
     /** 段标签缓存：上次的值 + 上次的文字。见 [segLabel]。 */
     private val segLast = ArrayList<Float>()
@@ -656,9 +658,9 @@ class MainActivity : AppCompatActivity() {
         // （它只写装得下的那几个），会少画几个点。余量掉到 [kPinnedSlack] 以下就提前扩，
         // 于是**截断那条路正常永远走不到**。
         // 和现有大小一起翻倍，是为了别每加一个点就重分配一次。
-        val cap = (pinnedBuf.size - 1) / 4   // C++ 最多能写几个（那个 -1 留给 liveLen）
+        val cap = (pinnedBuf.size - 1) / 8   // C++ 最多能写几个点（那个 -1 留给橡皮筋那块）
         if (cap - pinnedN < kPinnedSlack) {
-            pinnedBuf = FloatArray(maxOf(4 * (pinnedN + kPinnedSlack) + 1, pinnedBuf.size * 2))
+            pinnedBuf = FloatArray(maxOf(8 * (pinnedN + kPinnedSlack) + 1, pinnedBuf.size * 2))
         }
         return pinnedN
     }
@@ -693,35 +695,28 @@ class MainActivity : AppCompatActivity() {
         val segs = ArrayList<PreviewView.Seg>(maxOf(0, n - 1))
         var live: PreviewView.Seg? = null
 
-        // 每点 4 个：`px py flags lenToNext`。
-        //   - **标记点**只画在相机前方的（后面的那个坐标是「朝那个方向的画外点」，画了没意义）
-        //   - **线段**只要有一端在相机前方就画 —— 另一端用的是那个画外点，
-        //     于是线会朝正确的方向延伸到屏幕外、被画布裁掉（要的就是这个）
+        // 每点 3 个：`px py flags`。**标记点**只画在相机前方的。
         for (i in 0 until n) {
-            val o = i * 4
+            val o = 1 + i * 3
             val f = pinnedBuf[o + 2].toInt()
             if (f and kFlagFront == 0) continue
             marks.add(PreviewView.Mark(pinnedBuf[o], pinnedBuf[o + 1], f and kFlagLow != 0))
         }
+        // 每段 5 个：`x0 y0 x1 y1 len` —— **两个端点都是 C++ 算好的**，
+        // 包括「一端在相机后面」时那个朝正确方向的画外点。这里只认 `len`。
         for (i in 0 until n - 1) {
-            val a = i * 4
-            val b = a + 4
-            val fa = pinnedBuf[a + 2].toInt()
-            val fb = pinnedBuf[b + 2].toInt()
-            // 「断开」过的地方不连线 —— 那就是把折线切成两条。
-            if (fb and kFlagChainStart != 0) continue
-            if (fa and kFlagFront == 0 && fb and kFlagFront == 0) continue
-            segs.add(PreviewView.Seg(pinnedBuf[a], pinnedBuf[a + 1], pinnedBuf[b], pinnedBuf[b + 1],
-                                     segLabel(i, pinnedBuf[a + 3])))
+            val o = segAt(i)
+            if (pinnedBuf[o + 4] < 0f) continue
+            segs.add(PreviewView.Seg(pinnedBuf[o], pinnedBuf[o + 1], pinnedBuf[o + 2], pinnedBuf[o + 3],
+                                     segLabel(i, pinnedBuf[o + 4])))
         }
-        // 橡皮筋：最后一个点 → 十字。**断开 / 没读数时那侧给的是 -1**。
-        // 另一端永远是十字（在画面里），所以只要求最后一个点在相机前方。
-        if (n > 0 && measureBuf[4] >= 0f) {
-            val o = (n - 1) * 4
-            val liveLen = pinnedBuf[n * 4]
-            if (liveLen >= 0f && pinnedBuf[o + 2].toInt() and kFlagFront != 0) {
-                live = PreviewView.Seg(pinnedBuf[o], pinnedBuf[o + 1], measureBuf[4], measureBuf[5],
-                                       "%.3f m".format(liveLen))
+        // 橡皮筋：最后一个点 → 十字。**断开 / 没读数 / 两端都在相机后面时那侧给的是 -1**。
+        if (n > 0) {
+            val lo = segAt(n - 1)
+            if (pinnedBuf[lo + 4] >= 0f) {
+                live = PreviewView.Seg(pinnedBuf[lo], pinnedBuf[lo + 1],
+                                       pinnedBuf[lo + 2], pinnedBuf[lo + 3],
+                                       "%.3f m".format(pinnedBuf[lo + 4]))
             }
         }
         return PreviewView.Overlay(measureState, measureBuf[0], measureBuf[4], measureBuf[5],
@@ -745,7 +740,7 @@ class MainActivity : AppCompatActivity() {
         val cx = CameraCapture.W * 0.5f
         val cy = CameraCapture.H * 0.5f
         for (i in 0 until pinnedN) {
-            val o = i * 4
+            val o = 1 + i * 3
             if (pinnedBuf[o + 2].toInt() and kFlagFront == 0) continue
             val dx = pinnedBuf[o] - cx
             val dy = pinnedBuf[o + 1] - cy

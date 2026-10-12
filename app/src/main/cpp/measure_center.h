@@ -74,16 +74,16 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
 // ---------------- 投影：把已钉住的世界点画回画面 ----------------
 // 只管**画**，不管距离 —— 点之间的距离是纯世界坐标的算式，和位姿无关。
 
-/** 读一次内参给 [projectWorld] 用。幂等；读失败就留 0（投影全返回 0）。 */
+/** 读一次内参。幂等。 */
 void initIntrinsics(const std::string& settingsPath);
 
 /**
- * 世界 → 当帧图像像素。`out` 收 **`3n`** 个：每点 `px, py, 在不在相机前方`。返回前方的个数。
+ * 取内参给调用方自己算投影。没读到（`initIntrinsics` 没跑成）返回 false。
  *
- * ⚠️ **相机后方的点也写坐标**（不是 -1）—— 把 `z` 夹到一个正的小量，于是它落到
- * **画面外、朝那个方向**。这样「一端在相机后面」的线段**仍然有方向可画**
- * （要的就是：只要一端可见，这条边就可见）。第三个 float 才说明它其实是后面的。
+ * ⚠️ **为什么不是「世界坐标 → 像素」一个函数包掉**：一条线段的方向**要由两端共同决定**，
+ * 不能只看一个点 —— 点的屏幕位置只由视线方向决定，**深度不影响**，所以单看它推不出
+ * 线段该往哪走。投影因此搬到了 `slam_engine.cpp` 里**逐线段**做。
  */
-int projectWorld(const float* worldXyz, int n, const float t_cw[16], float* out);
+bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy);
 
 }  // namespace slam

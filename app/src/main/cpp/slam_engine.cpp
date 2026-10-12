@@ -526,11 +526,75 @@ void logNoPose(int why) {
     if (why == 2) printf("[M6] ⚠️ 投影不可用：还没有位姿（折线整条不画）\n");
     fflush(stdout);
 }
+
+/** 点的上限。也给 `addPinned` 当软上限。 */
+constexpr int kMaxPinned = 128;
+
+/** 相机后面的点插值到这儿。**取多少只决定它落多远，不改变方向。** */
+constexpr float kNearZ = 0.02f;
+
+/** 像素夹取 —— 贴着相机平面的点会算出天文数字。 */
+constexpr float kProjClamp = 20000.f;
+
+/** 内参。第一次 [getPinned] 时懒读。**只在主线程碰。** */
+struct Intr {
+    float fx = 0, fy = 0, cx = 0, cy = 0;
+    bool ok = false;
+};
+Intr gIntr;
+
+/** 世界 → 相机。列主序：元素 (r,c) 在 [c*4+r]；pc = Rcw·pw + tcw。 */
+inline Eigen::Vector3f toCam(const float t[16], const float* w) {
+    return Eigen::Vector3f(
+        t[0] * w[0] + t[4] * w[1] + t[8] * w[2] + t[12],
+        t[1] * w[0] + t[5] * w[1] + t[9] * w[2] + t[13],
+        t[2] * w[0] + t[6] * w[1] + t[10] * w[2] + t[14]);
+}
+
+/** 相机系的一点 → 图像像素。**z 必须 > 0**。 */
+inline void project1(const Eigen::Vector3f& p, float* xy) {
+    xy[0] = std::min(std::max(gIntr.fx * p.x() / p.z() + gIntr.cx, -kProjClamp), kProjClamp);
+    xy[1] = std::min(std::max(gIntr.fy * p.y() / p.z() + gIntr.cy, -kProjClamp), kProjClamp);
+}
+
+/**
+ * 相机后面的 `back`，沿线段朝前面那头插值到 `z = kNearZ`。
+ *
+ * ⚠️ 方向**必须由两端共同决定**（点的屏幕位置只由视线方向决定，单看它推不出线段往哪走）。
+ * 把 z 夹成一个常数是错的 —— 那等于宣称两端同深度，真机上画过横跨屏幕的线。
+ */
+Eigen::Vector3f pullToFront(const Eigen::Vector3f& back, const Eigen::Vector3f& front) {
+    const float dz = front.z() - back.z();
+    if (dz <= 1e-6f) return back;   // 退化；下面会判掉
+    return back + ((kNearZ - back.z()) / dz) * (front - back);
+}
+
+/** 一条线段在画面上的两个端点。**两端都在相机后面 ⟹ false（这条不画）**。 */
+bool segPixels(const Eigen::Vector3f& a, const Eigen::Vector3f& b, float* xy4) {
+    const bool fa = a.z() > 0.f;
+    const bool fb = b.z() > 0.f;
+    if (!fa && !fb) return false;
+
+    const Eigen::Vector3f pa = fa ? a : pullToFront(a, b);
+    const Eigen::Vector3f pb = fb ? b : pullToFront(b, a);
+    if (pa.z() <= 0.f || pb.z() <= 0.f) return false;
+
+    project1(pa, xy4);
+    project1(pb, xy4 + 2);
+    return true;
+}
+
+float dist3(const float* a, const float* b) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
 }  // namespace
 
 bool addPinned(int snapTo) {
     Engine& e = engine();
     std::lock_guard<std::mutex> lk(e.measureMutex);
+
+    if (e.pinned.size() >= kMaxPinned) return false;
 
     Engine::Pinned p;
     if (snapTo >= 0) {
@@ -577,22 +641,17 @@ void closePinnedChain() {
     if (!e.pinned.empty()) e.pinned.back().closed = true;
 }
 
-namespace {
-float dist3(const float* a, const float* b) {
-    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
-}  // namespace
-
 int getPinned(float* out, int cap) {
-    if (out == nullptr || cap < 5) return 0;
+    // 布局：`1 + 3n + 5(n-1) + 5` = `8n + 1`；`(cap-1)/8` 是能装下的点数
+    //（`-1` 留给 `liveLen` 那块，用它算上界才不越界）。
+    if (out == nullptr) return 0;
     Engine& e = engine();
 
+    if (!gIntr.ok) gIntr.ok = cameraIntrinsics(&gIntr.fx, &gIntr.fy, &gIntr.cx, &gIntr.cy);
+
     // ⚠️ `poseMutex` 和 `measureMutex` **不嵌套**：先把位姿拷出来、放锁，再拿测量那把。
-    // 反过来的话就和 `savePose` 的取锁顺序相反，迟早死锁。
-    // ⚠️ **必须是 `t_cw`，不是 `pose`。** `pose` 是 Twc（方向相反）—— 拿它当 Tcw 用的话
-    // 每个点的 z 都是负的，全部被判成「在相机后方」，表现是**一个标记都画不出来，
-    // 而且一声不吭**。这条真机上栽过一次。
+    // ⚠️ **必须是 `t_cw`，不是 `pose`**（`pose` 是 Twc，方向相反）—— 拿它当 Tcw 用的话
+    // 每个点的 z 都是负的，全部被判成「在相机后方」，一个标记都画不出来，而且一声不吭。
     float t[16];
     bool havePose = false;
     {
@@ -605,67 +664,69 @@ int getPinned(float* out, int cap) {
     ORB_SLAM3::System* sys = e.sys.load();
     if (!havePose || sys == nullptr || sys->GetTrackingState() != kTrackingOk) {
         // 跟踪不是 OK 时 `t_cw` 是**上一帧 OK 时的旧值** —— 拿它投影会把标记画到
-        // 错的地方，而且看起来像「贴在屏幕上不动」。
+        // 错的地方，看起来像「贴在屏幕上不动」。
         havePose = false;
         logNoPose(sys == nullptr || sys->GetTrackingState() != kTrackingOk ? 1 : 2);
     }
 
     std::lock_guard<std::mutex> lk(e.measureMutex);
-    // ⚠️ `(cap-1)/4` 而不是 `cap/4` —— 下面还要写 `out[4n]`（`liveLen`），
-    // 用 `cap/4` 的话 `n == cap/4` 时那个下标正好差一个越界（cap=32 时 n=8 要 33 个）。
-    const int n = std::min(static_cast<int>(e.pinned.size()), (cap - 1) / 4);
+    const int n = std::min(static_cast<int>(e.pinned.size()),
+                           std::min((cap - 1) / 8, kMaxPinned));
     if (n <= 0) return 0;
+    const int segBase = 1 + 3 * n;
 
+    // ① 每个点的相机系坐标 + 刷新世界坐标。
+    //    刷新是这一整套东西存在的理由：**BA 一直在挪地图点**，存快照的话走一圈就和场景错开。
+    //    没身份（平面兜底来的）或已失效的，只能留上一份。
+    Eigen::Vector3f pc[kMaxPinned];
     for (int i = 0; i < n; ++i) {
         Engine::Pinned& p = e.pinned[i];
-
-        // ① 刷新 —— **问地图点要最新坐标**。这是这一整套东西存在的理由：
-        //    存坐标快照的话，BA 一动地图，折线和场景就错开了。
-        //    没身份（平面兜底来的）或者已经失效的，只能留上一份。
         if (p.mp != nullptr && !p.mp->isBad()) {
             const Eigen::Vector3f w = p.mp->GetWorldPos();
             p.pw[0] = w.x();
             p.pw[1] = w.y();
             p.pw[2] = w.z();
         }
+        pc[i] = havePose ? toCam(t, p.pw) : Eigen::Vector3f(0, 0, -1);
+    }
 
-        float* o = out + 4 * i;
-        // ⓪ **先清零** —— `projectWorld` 在下面那些情况下会一个字都不写，
-        //    不清零就会把上一帧的残留带出去（px/py 是旧的）。
-        o[0] = 0.f;
-        o[1] = 0.f;
+    // ② 标记点 + flags（bit0 在相机前方 / bit1 之后断开 / bit2 不太准）
+    for (int i = 0; i < n; ++i) {
+        const Engine::Pinned& p = e.pinned[i];
+        float* o = out + 1 + 3 * i;
+        o[0] = -1.f;
+        o[1] = -1.f;
         float flags = 0.f;
-        if (p.startsChain) flags += 2.f;
-        if (p.closed) flags += 4.f;
-        if (p.low) flags += 8.f;
-
-        // ② 投影。每点单独调（n 很小），省一个临时缓冲。
-        if (havePose) {
-            float proj[3];
-            if (projectWorld(p.pw, 1, t, proj) == 1) {
-                o[0] = proj[0];
-                o[1] = proj[1];
-                flags += 1.f;  // bit0 = 在相机前方
-            }
+        if (pc[i].z() > 0.f) {
+            project1(pc[i], o);
+            flags += 1.f;
         }
-
-        // ③ 到下一个点的长度。下一段是新折线起点时不成立 ⟹ 0。
-        float len = 0.f;
-        if (i + 1 < n && !e.pinned[i + 1].startsChain) len = dist3(p.pw, e.pinned[i + 1].pw);
+        if (p.closed) flags += 2.f;
+        if (p.low) flags += 4.f;
         o[2] = flags;
-        o[3] = len;
     }
 
-    // 橡皮筋：最后一个点 → 十字。**断开 / 没读数时是 -1**。
-    // ⚠️ 没读数时 `e.measure.wx/wy/wz` 是 0 —— 拿它算就是从最后一个点量到**世界原点**，
-    //    会出一个巨大的假数。
-    float live = -1.f;
-    const Engine::Pinned& last = e.pinned[n - 1];
-    if (!last.closed && e.measure.quality != kNone) {
-        const float cur[3] = {e.measure.wx, e.measure.wy, e.measure.wz};
-        live = dist3(last.pw, cur);
+    // ③ 每段：**两个屏幕端点 + 长度**。几何全在这儿算完，Kotlin 只管画。
+    for (int i = 0; i < n - 1; ++i) {
+        float* o = out + segBase + 5 * i;
+        if (e.pinned[i + 1].startsChain || !segPixels(pc[i], pc[i + 1], o)) {
+            o[0] = o[1] = o[2] = o[3] = 0.f;
+            o[4] = -1.f;   // < 0 ⟹ 这条不画
+            continue;
+        }
+        o[4] = dist3(e.pinned[i].pw, e.pinned[i + 1].pw);
     }
-    out[4 * n] = live;
+
+    // ④ 橡皮筋：最后一个点 → 当前十字命中点。断开 / 没读数 / 两端都在后面 ⟹ -1。
+    // ⚠️ 没读数时 `e.measure.wx/wy/wz` 是 0 —— 拿它算就是从最后一个点量到**世界原点**。
+    float* lv = out + segBase + 5 * (n - 1);
+    lv[0] = lv[1] = lv[2] = lv[3] = 0.f;
+    lv[4] = -1.f;
+    const Engine::Pinned& last = e.pinned[n - 1];
+    if (havePose && !last.closed && e.measure.quality != kNone) {
+        const float cur[3] = {e.measure.wx, e.measure.wy, e.measure.wz};
+        if (segPixels(pc[n - 1], toCam(t, cur), lv)) lv[4] = dist3(last.pw, cur);
+    }
 
     return n;
 }

@@ -92,6 +92,17 @@ $ adb logcat -b crash -d | grep -c SIGSEGV   →  0
 
 ## 遗留
 
+- 📌 **2026-10-12 追加：又崩了一次，但和这条不是同一个洞。**
+  栈：`LocalMapping::InitializeIMU → Optimizer::InertialOptimization → g2o →
+  **EdgeInertialGS::computeError** → **Preintegrated::GetDeltaRotation** →
+  **Sophus::defaultEnsure**（抛）→ abort`。
+  **⚠️ 上面那个 `continue` 就在这个 `EdgeInertialGS` 前面**（`Optimizer.cc:3139` vs `:3163`）
+  —— **空预积分已经进不去了** ⟹ **这次不是空指针**。
+  `defaultEnsure` 只在**值非法（NaN/Inf）**时抛 ⟹ **这次是 NaN**：要么来自
+  `GetDeltaRotation` 的**重积分**，要么来自传进去的**偏置顶点估计**。**没查出来。**
+  复现时又没崩，而且**主 logcat 缓冲滚掉了**，崩溃前的上下文没了 ⟹ 留到下次复现再查
+  （要 **`adb logcat -b all -v time` 从头录**，别等崩了再抓）。
+  见 [2026-10-12](2026-10-12-polyline-edge-direction.md)。
 - ⚠️ **三处 `EdgeInertialGS` 的空洞**（见「决策」三）
 - **`mTinit` 跨会话累加** —— `ScaleRefinement` 会在任意地图状态下触发（老账）
 - **「谁把预积分/顶点弄空」没解决** —— 只加了防御
