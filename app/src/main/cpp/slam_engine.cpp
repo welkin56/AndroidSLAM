@@ -34,6 +34,7 @@
 #include <pthread.h>
 
 #include "ImuTypes.h"
+#include "MapPoint.h"
 #include "System.h"
 #include "orb_track.h"
 
@@ -48,6 +49,9 @@ constexpr size_t kMaxImu = 2000;
 
 // 等帧的超时。让循环能定期回头看看 running。
 constexpr int kWaitMs = 100;
+
+// ORB_SLAM3 `eTrackingState::OK`（Tracking.h:121）。和 measure_center.cpp 里那个同义。
+constexpr int kTrackingOk = 2;
 
 // 测距读数做中值的窗口。锁定之后它只需要压**毫米级**的位姿噪声，小窗口滞后更小。
 constexpr size_t kMeasureRing = 3;
@@ -106,7 +110,10 @@ struct Engine {
     std::deque<Imu> imus;
 
     std::mutex poseMutex;
+    /** **Twc**（相机 → 世界）。给 Kotlin 显示位置用 —— `[12..14]` 就是相机在世界里的坐标。 */
     float pose[16] = {0};
+    /** **Tcw**（世界 → 相机）。投影用。⚠️ 和 `pose` **方向相反**，别混（混了的表现见 projectPoints）。 */
+    float t_cw[16] = {0};
     bool poseValid = false;
 
     std::mutex trajMutex;
@@ -129,6 +136,20 @@ struct Engine {
 
     /** 「地图被重置」的次数。`start()` 归零。 */
     std::atomic<int> resetCount{0};
+
+    /**
+     * 折线上的一个点。**存 `MapPoint*` 而不是只存坐标** —— 坐标会变，身份不会。
+     * 理由见 `slam_engine.h` 那一整段。
+     */
+    struct Pinned {
+        ORB_SLAM3::MapPoint* mp = nullptr;  // nullptr = 平面兜底来的，没身份，只能冻着
+        float pw[3] = {0, 0, 0};            // 兜底/失效时的坐标，也当每帧的刷新缓存
+        bool low = false;                   // 平面兜底/勉强来的（画空心圈）
+        bool startsChain = false;           // 它是一条新折线的起点
+        bool closed = false;                // 它之后「断开」了
+    };
+    /** 折线。和 `measure` 用同一把锁 —— `addPinned` 要读它。**全部主线程碰。** */
+    std::vector<Pinned> pinned;
 };
 
 // 故意泄漏，见文件头第 2 条。
@@ -171,6 +192,11 @@ void construct(Engine& e) {
                         .count();
     e.sys.store(s);
     e.state.store(State::kReady);
+
+    // 投影要内参（幂等，从 settings 读，不抄常量）。**放 System 造好之后** ——
+    // 一是不占 `init()` 那个主线程，二是构造失败时不用白付这一次解析。
+    initIntrinsics(e.settings);
+
     printf("[M5] System 构造完成，耗时 %lld ms\n", (long long)ms);
     fflush(stdout);
 }
@@ -179,6 +205,7 @@ void savePose(Engine& e, const TrackResult& r) {
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         std::memcpy(e.pose, r.pose16, sizeof(e.pose));
+        std::memcpy(e.t_cw, r.t_cw16, sizeof(e.t_cw));
         e.poseValid = true;
     }
 
@@ -485,6 +512,223 @@ int getMeasure(float out7[7]) {
     //   有纹理但没建进图 → 「对着它多停一会儿」；没纹理 → 「换个地方」。
     out7[6] = static_cast<float>(e.measure.texture);
     return e.measure.quality;
+}
+
+// ---------------- 多点折线 ----------------
+
+namespace {
+/** 投影不可用（没位姿 / 跟踪不是 OK）—— **只在原因变化时打一行**，不刷屏。 */
+void logNoPose(int why) {
+    static int last = 0;
+    if (why == last) return;
+    last = why;
+    if (why == 1) printf("[M6] ⚠️ 投影不可用：跟踪不是 OK（折线整条不画）\n");
+    if (why == 2) printf("[M6] ⚠️ 投影不可用：还没有位姿（折线整条不画）\n");
+    fflush(stdout);
+}
+
+/** 点的上限。也给 `addPinned` 当软上限。 */
+constexpr int kMaxPinned = 128;
+
+/** 相机后面的点插值到这儿。**取多少只决定它落多远，不改变方向。** */
+constexpr float kNearZ = 0.02f;
+
+/** 像素夹取 —— 贴着相机平面的点会算出天文数字。 */
+constexpr float kProjClamp = 20000.f;
+
+/** 内参。第一次 [getPinned] 时懒读。**只在主线程碰。** */
+struct Intr {
+    float fx = 0, fy = 0, cx = 0, cy = 0;
+    bool ok = false;
+};
+Intr gIntr;
+
+/** 世界 → 相机。列主序：元素 (r,c) 在 [c*4+r]；pc = Rcw·pw + tcw。 */
+inline Eigen::Vector3f toCam(const float t[16], const float* w) {
+    return Eigen::Vector3f(
+        t[0] * w[0] + t[4] * w[1] + t[8] * w[2] + t[12],
+        t[1] * w[0] + t[5] * w[1] + t[9] * w[2] + t[13],
+        t[2] * w[0] + t[6] * w[1] + t[10] * w[2] + t[14]);
+}
+
+/** 相机系的一点 → 图像像素。**z 必须 > 0**。 */
+inline void project1(const Eigen::Vector3f& p, float* xy) {
+    xy[0] = std::min(std::max(gIntr.fx * p.x() / p.z() + gIntr.cx, -kProjClamp), kProjClamp);
+    xy[1] = std::min(std::max(gIntr.fy * p.y() / p.z() + gIntr.cy, -kProjClamp), kProjClamp);
+}
+
+/**
+ * 相机后面的 `back`，沿线段朝前面那头插值到 `z = kNearZ`。
+ *
+ * ⚠️ 方向**必须由两端共同决定**（点的屏幕位置只由视线方向决定，单看它推不出线段往哪走）。
+ * 把 z 夹成一个常数是错的 —— 那等于宣称两端同深度，真机上画过横跨屏幕的线。
+ */
+Eigen::Vector3f pullToFront(const Eigen::Vector3f& back, const Eigen::Vector3f& front) {
+    const float dz = front.z() - back.z();
+    if (dz <= 1e-6f) return back;   // 退化；下面会判掉
+    return back + ((kNearZ - back.z()) / dz) * (front - back);
+}
+
+/** 一条线段在画面上的两个端点。**两端都在相机后面 ⟹ false（这条不画）**。 */
+bool segPixels(const Eigen::Vector3f& a, const Eigen::Vector3f& b, float* xy4) {
+    const bool fa = a.z() > 0.f;
+    const bool fb = b.z() > 0.f;
+    if (!fa && !fb) return false;
+
+    const Eigen::Vector3f pa = fa ? a : pullToFront(a, b);
+    const Eigen::Vector3f pb = fb ? b : pullToFront(b, a);
+    if (pa.z() <= 0.f || pb.z() <= 0.f) return false;
+
+    project1(pa, xy4);
+    project1(pb, xy4 + 2);
+    return true;
+}
+
+float dist3(const float* a, const float* b) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+}  // namespace
+
+bool addPinned(int snapTo) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+
+    if (e.pinned.size() >= kMaxPinned) return false;
+
+    Engine::Pinned p;
+    if (snapTo >= 0) {
+        // 吸到已有点：**复制它的身份**，不是用十字当前命中的那个
+        //（那个只是碰巧很近的另一个地图点，之后会各漂各的）。
+        if (snapTo >= static_cast<int>(e.pinned.size())) return false;
+        const Engine::Pinned& src = e.pinned[snapTo];
+        p.mp = src.mp;
+        p.pw[0] = src.pw[0];
+        p.pw[1] = src.pw[1];
+        p.pw[2] = src.pw[2];
+        p.low = src.low;
+    } else {
+        if (e.measure.quality == kNone) return false;  // 没读数就没什么可钉的
+        p.mp = e.measure.mp;
+        p.pw[0] = e.measure.wx;
+        p.pw[1] = e.measure.wy;
+        p.pw[2] = e.measure.wz;
+        p.low = (e.measure.quality != kGood);
+    }
+
+    // 断开之后，下一个点就是**新一条折线**的起点。**这一侧自己判** ——
+    // 于是 Kotlin 一条链状态都不用存，全读回去（两边不会对不上）。
+    p.startsChain = e.pinned.empty() || e.pinned.back().closed;
+    e.pinned.push_back(p);
+    return true;
+}
+
+void undoPinned() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    if (!e.pinned.empty()) e.pinned.pop_back();
+}
+
+void clearPinned() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    e.pinned.clear();
+}
+
+void closePinnedChain() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    if (!e.pinned.empty()) e.pinned.back().closed = true;
+}
+
+int getPinned(float* out, int cap) {
+    // 布局：`1 + 3n + 5(n-1) + 5` = `8n + 1`；`(cap-1)/8` 是能装下的点数
+    //（`-1` 留给 `liveLen` 那块，用它算上界才不越界）。
+    if (out == nullptr) return 0;
+    Engine& e = engine();
+
+    if (!gIntr.ok) gIntr.ok = cameraIntrinsics(&gIntr.fx, &gIntr.fy, &gIntr.cx, &gIntr.cy);
+
+    // ⚠️ `poseMutex` 和 `measureMutex` **不嵌套**：先把位姿拷出来、放锁，再拿测量那把。
+    // ⚠️ **必须是 `t_cw`，不是 `pose`**（`pose` 是 Twc，方向相反）—— 拿它当 Tcw 用的话
+    // 每个点的 z 都是负的，全部被判成「在相机后方」，一个标记都画不出来，而且一声不吭。
+    float t[16];
+    bool havePose = false;
+    {
+        std::lock_guard<std::mutex> lk(e.poseMutex);
+        if (e.poseValid) {
+            std::memcpy(t, e.t_cw, sizeof(t));
+            havePose = true;
+        }
+    }
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (!havePose || sys == nullptr || sys->GetTrackingState() != kTrackingOk) {
+        // 跟踪不是 OK 时 `t_cw` 是**上一帧 OK 时的旧值** —— 拿它投影会把标记画到
+        // 错的地方，看起来像「贴在屏幕上不动」。
+        havePose = false;
+        logNoPose(sys == nullptr || sys->GetTrackingState() != kTrackingOk ? 1 : 2);
+    }
+
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    const int n = std::min(static_cast<int>(e.pinned.size()),
+                           std::min((cap - 1) / 8, kMaxPinned));
+    if (n <= 0) return 0;
+    const int segBase = 1 + 3 * n;
+
+    // ① 每个点的相机系坐标 + 刷新世界坐标。
+    //    刷新是这一整套东西存在的理由：**BA 一直在挪地图点**，存快照的话走一圈就和场景错开。
+    //    没身份（平面兜底来的）或已失效的，只能留上一份。
+    Eigen::Vector3f pc[kMaxPinned];
+    for (int i = 0; i < n; ++i) {
+        Engine::Pinned& p = e.pinned[i];
+        if (p.mp != nullptr && !p.mp->isBad()) {
+            const Eigen::Vector3f w = p.mp->GetWorldPos();
+            p.pw[0] = w.x();
+            p.pw[1] = w.y();
+            p.pw[2] = w.z();
+        }
+        pc[i] = havePose ? toCam(t, p.pw) : Eigen::Vector3f(0, 0, -1);
+    }
+
+    // ② 标记点 + flags（bit0 在相机前方 / bit1 之后断开 / bit2 不太准）
+    for (int i = 0; i < n; ++i) {
+        const Engine::Pinned& p = e.pinned[i];
+        float* o = out + 1 + 3 * i;
+        o[0] = -1.f;
+        o[1] = -1.f;
+        float flags = 0.f;
+        if (pc[i].z() > 0.f) {
+            project1(pc[i], o);
+            flags += 1.f;
+        }
+        if (p.closed) flags += 2.f;
+        if (p.low) flags += 4.f;
+        o[2] = flags;
+    }
+
+    // ③ 每段：**两个屏幕端点 + 长度**。几何全在这儿算完，Kotlin 只管画。
+    for (int i = 0; i < n - 1; ++i) {
+        float* o = out + segBase + 5 * i;
+        if (e.pinned[i + 1].startsChain || !segPixels(pc[i], pc[i + 1], o)) {
+            o[0] = o[1] = o[2] = o[3] = 0.f;
+            o[4] = -1.f;   // < 0 ⟹ 这条不画
+            continue;
+        }
+        o[4] = dist3(e.pinned[i].pw, e.pinned[i + 1].pw);
+    }
+
+    // ④ 橡皮筋：最后一个点 → 当前十字命中点。断开 / 没读数 / 两端都在后面 ⟹ -1。
+    // ⚠️ 没读数时 `e.measure.wx/wy/wz` 是 0 —— 拿它算就是从最后一个点量到**世界原点**。
+    float* lv = out + segBase + 5 * (n - 1);
+    lv[0] = lv[1] = lv[2] = lv[3] = 0.f;
+    lv[4] = -1.f;
+    const Engine::Pinned& last = e.pinned[n - 1];
+    if (havePose && !last.closed && e.measure.quality != kNone) {
+        const float cur[3] = {e.measure.wx, e.measure.wy, e.measure.wz};
+        if (segPixels(pc[n - 1], toCam(t, cur), lv)) lv[4] = dist3(last.pw, cur);
+    }
+
+    return n;
 }
 
 int resetCount() { return engine().resetCount.load(); }

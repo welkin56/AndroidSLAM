@@ -102,4 +102,44 @@ object SlamBridge {
 
     /** ⚠️ `out` **必须 ≥ 7**（短了直接返回「不可测」）：`[0]`距离 `[1..3]`世界xyz `[4][5]`图像xy `[6]`附近特征点数。 */
     external fun nativeGetMeasure(out: FloatArray): Int
+
+    // —— 多点折线 ——
+    //
+    // ⚠️ **折线整个存在 C++ 侧**，因为它要存 `MapPoint*`。存坐标快照是不行的：
+    // BA 一直在挪地图点，走一圈之后快照就和地图差开了 —— 标记飘到空中，
+    // **而且长度数字也跟着错**。刷新 / 投影 / 算长度一次给完，这一侧只负责画。
+
+    /**
+     * 把当前读数钉成一个点。没有有效读数返回 false。
+     *
+     * `snapTo >= 0` = **复制第 `snapTo` 个点的身份**（吸到已有点用）；
+     * -1 = 用十字当前的读数。
+     */
+    external fun nativeAddPinned(snapTo: Int): Boolean
+
+    external fun nativeUndoPinned()
+
+    external fun nativeClearPinned()
+
+    /** 「断开」：最后一个点之后不再拉橡皮筋，下一个点会另起一条折线。 */
+    external fun nativeClosePinnedChain()
+
+    /**
+     * 读折线：**刷新坐标、投影、算长度全在这一侧做完**，Kotlin 只管画。
+     *
+     * `out` 要 ≥ `8n + 1`，**返回实际写了几个点**（可能小于真实点数 —— 那时扩容后下一帧再来）。
+     *
+     * ```
+     * out[0] = n
+     * 每点 3 个：px py flags
+     * 每段 5 个：x0 y0 x1 y1 len      ← **已经是画面上的两个端点**；len < 0 ⟹ 不画
+     * 最后 5 个：x0 y0 x1 y1 liveLen  ← 橡皮筋（最后一个点 → 十字）；liveLen < 0 ⟹ 没有
+     * ```
+     *
+     * `flags` 的位：bit0 在相机前方 / bit1 之后断开 / bit2 不太准。
+     *
+     * ⚠️ 线段两端**有时不是真实投影** —— 端点在相机后面时是「沿线段插值到相机平面前一点点」
+     * 再投的，于是线朝**正确方向**延伸出屏幕、被画布裁掉。细节见 `slam_engine.cpp`。
+     */
+    external fun nativeGetPinned(out: FloatArray): Int
 }

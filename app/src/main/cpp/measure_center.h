@@ -5,6 +5,8 @@
 //    刻意不链 OpenCV（理由见 orb_track.h）。
 #pragma once
 
+#include <string>
+
 namespace ORB_SLAM3 {
 class System;
 class MapPoint;
@@ -24,6 +26,12 @@ struct CenterMeasure {
     int method = 0;      // 1 = 地图点，2 = 局部平面
     float distance = 0;  // 相机心 → 目标，米
     float wx = 0, wy = 0, wz = 0;  // `method == 2` 时无效
+
+    /**
+     * 命中的地图点，`method == 1` 时非空。
+     */
+    ORB_SLAM3::MapPoint* mp = nullptr;
+
     float px = -1, py = -1;        // 命中处的图像像素，给 UI 画小圈
 
     int source = 0;    // 1 新选 / 2 沿用锁定。日志用
@@ -62,5 +70,20 @@ struct CenterMeasureState {
  */
 CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_cw[16],
                             CenterMeasureState* st);
+
+// ---------------- 投影：把已钉住的世界点画回画面 ----------------
+// 只管**画**，不管距离 —— 点之间的距离是纯世界坐标的算式，和位姿无关。
+
+/** 读一次内参。幂等。 */
+void initIntrinsics(const std::string& settingsPath);
+
+/**
+ * 取内参给调用方自己算投影。没读到（`initIntrinsics` 没跑成）返回 false。
+ *
+ * ⚠️ **为什么不是「世界坐标 → 像素」一个函数包掉**：一条线段的方向**要由两端共同决定**，
+ * 不能只看一个点 —— 点的屏幕位置只由视线方向决定，**深度不影响**，所以单看它推不出
+ * 线段该往哪走。投影因此搬到了 `slam_engine.cpp` 里**逐线段**做。
+ */
+bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy);
 
 }  // namespace slam

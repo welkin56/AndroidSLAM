@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  多点折线那排按钮的文字色。
+
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="true" android:color="#FFFFFFFF" />
+    <item android:color="#4DFFFFFF" />
+</selector>

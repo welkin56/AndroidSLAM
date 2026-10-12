@@ -88,6 +88,37 @@ void publishMeasure(const CenterMeasure& m);
  */
 int getMeasure(float out7[7]);
 
+// ---------------- 多点折线 ----------------
+// 刷新 + 投影 + 算长度**一次给完**，Kotlin 只负责画。
+// 全部**主线程调**。
+
+/**
+ * 把当前读数钉成一个点。没有有效读数返回 false。
+ *
+ * ⚠️ `snapTo >= 0` 时**复制第 `snapTo` 个点的身份**（`mp` / `pw` / `low` 全抄），
+ * 而不是用十字当前命中的那个 —— 那个只是**碰巧很近的另一个地图点**，之后会各漂各的。
+ */
+bool addPinned(int snapTo);
+
+void undoPinned();
+void clearPinned();
+
+/** 「断开」：最后一个点之后不再拉橡皮筋，下一个点会另起一条折线。 */
+void closePinnedChain();
+
+/**
+ * 读折线：**刷新坐标 → 投影 → 算长度**，一次给完。
+ *
+ * `out` 要 ≥ `4n + 1`：每点 4 个 `px py flags lenToNext`，最后一个是 `liveLen`
+ * （最后一个点 → 十字；没读数或已断开时是 -1）。
+ *
+ * `flags` 的位：bit0 在相机前方 / bit1 新折线起点 / bit2 之后断开 / bit3 不太准（空心圈）。
+ *
+ * ⚠️ **返回「实际写了几个点」**（`≤ cap/4`）。容量不够时这一帧少画一个，
+ * 调用方看到写满就扩容 —— **不能返回真实点数**，那调用方会去读没写过的内存。
+ */
+int getPinned(float* out, int cap);
+
 // ---------------- 轨迹 ----------------
 
 /**

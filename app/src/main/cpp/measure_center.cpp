@@ -6,12 +6,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
 
 #include "MapPoint.h"
+#include "Settings.h"
 #include "System.h"
 
 namespace slam {
@@ -373,6 +376,7 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
     // ============ ④ 出结果 ============
     if (have) {
         out.method = 1;
+        out.mp = mp;  // 折线靠它认住身份（世界坐标会变，见 header）
         out.distance = pc.norm();  // 斜距，和激光测距仪报的是同一种量
         // ⚠️ 用 `GetWorldPos()` 而不是环里的 `pw` —— 前者是最新的（BA 一直在动点）。
         const Eigen::Vector3f pw = mp->GetWorldPos();
@@ -419,12 +423,58 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
         out.quality = kFair;  // 兜底出来的，一律不当「好」
         out.method = 2;
         out.distance = z;
-        // ⚠️ **不给世界坐标**：沿光轴只知道深度，要变成点得知道十字的归一化方向，那要内参。
-        // STAGE6 §2.3 的「两点距离」将来要用它 —— 到时候再加 `System::GetK()`。
+        // 世界坐标**能给**：十字恒等于主点（见 centerPx），那条视线在相机系里恰好是 (0,0,1)。
+        // ⚠️ 和 centerPx 同一个假设，改那个要一起改。
+        const Eigen::Vector3f pw = Tcw.block<3, 3>(0, 0).transpose() * Eigen::Vector3f(0.f, 0.f, z) + cam;
+        out.wx = pw.x();
+        out.wy = pw.y();
+        out.wz = pw.z();
         out.px = c.u;
         out.py = c.v;
     }
     return out;
+}
+
+// ---------------- 投影 ----------------
+
+namespace {
+/** [initIntrinsics] 填一次。0 = 没读到，[cameraIntrinsics] 会返回 false。 */
+float gFx = 0, gFy = 0, gCx = 0, gCy = 0;
+}  // namespace
+
+void initIntrinsics(const std::string& settingsPath) {
+    if (gFx != 0) return;
+
+    printf("[M6] initIntrinsics: 开始读内参，settings=%s\n", settingsPath.c_str());
+    fflush(stdout);
+
+    // ⚠️ 走 `Settings` 的公开接口 —— `Tracking::mK` 是 protected，`System` 不给 K。
+    // 唯一真相仍是 phone.yaml，不在这儿抄常量。
+    ORB_SLAM3::Settings s(settingsPath, static_cast<int>(ORB_SLAM3::System::IMU_MONOCULAR));
+    ORB_SLAM3::GeometricCamera* cam = s.camera1();
+    if (cam == nullptr) {
+        printf("[M6] ⚠️ initIntrinsics 失败：camera1() 是空的 ⟹ 多点折线画不出来\n");
+        fflush(stdout);
+        return;
+    }
+
+    // 0..3 = fx, fy, cx, cy（顺序见 Tracking.cc:549-553）。
+    gFx = cam->getParameter(0);
+    gFy = cam->getParameter(1);
+    gCx = cam->getParameter(2);
+    gCy = cam->getParameter(3);
+
+    printf("[M6] 投影内参 fx=%.3f fy=%.3f cx=%.3f cy=%.3f\n", gFx, gFy, gCx, gCy);
+    fflush(stdout);
+}
+
+bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy) {
+    if (gFx == 0) return false;
+    *fx = gFx;
+    *fy = gFy;
+    *cx = gCx;
+    *cy = gCy;
+    return true;
 }
 
 }  // namespace slam

@@ -218,3 +218,54 @@ Java_com_example_slamcapture_SlamBridge_nativeGetMeasure(JNIEnv* env, jobject /*
         return 0;
     }
 }
+
+// 「多点折线」。刷新、投影、算长度**全在 C++ 一次给完** —— 因为折线存的是 `MapPoint*`，
+// 那个东西只在 C++ 侧拿得到。见 slam_engine.h 那一整段。
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeAddPinned(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                        jint snapTo) {
+    try {
+        return slam::addPinned(static_cast<int>(snapTo)) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeUndoPinned(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::undoPinned();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeClearPinned(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::clearPinned();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeClosePinnedChain(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::closePinnedChain();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetPinned(JNIEnv* env, jobject /*thiz*/,
+                                                        jfloatArray out) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;   // OOM
+        const int n = slam::getPinned(p, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, p, 0);   // 写回
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
