@@ -29,3 +29,4 @@ app/src/main/cpp/thirdparty/OpenCV-android-sdk/
 .DS_Store
 
 /.vscode/
+/*.sh
