@@ -775,6 +775,120 @@ void System::SaveTrajectoryEuRoC(const string &filename)
     cout << endl << "End of saving trajectory to " << filename << " ..." << endl;
 }
 
+int System::GetFrameTrajectorySize()
+{
+    if (mpTracker == nullptr)
+        return 0;
+    unique_lock<mutex> lockTraj(mpTracker->mMutexTraj);
+    return static_cast<int>(mpTracker->mlRelativeFramePoses.size());
+}
+
+void System::ClearFrameTrajectory()
+{
+    if (mpTracker != nullptr)
+        mpTracker->ClearTrajectory();
+}
+
+int System::GetFrameTrajectory(float* out, int cap)
+{
+    if (out == nullptr || mpTracker == nullptr)
+        return 0;
+
+    // ⚠️ 必须拿这把锁：`Tracking` 线程正在往这四张表里 push，而 `System::mMutexState`
+    //    不包括它们（那个只保护三个快照字段）。
+    unique_lock<mutex> lockTraj(mpTracker->mMutexTraj);
+
+    const list<Sophus::SE3f>& vRel = mpTracker->mlRelativeFramePoses;
+    const list<KeyFrame*>& vRef = mpTracker->mlpReferences;
+    const list<double>& vT = mpTracker->mlFrameTimes;
+    const list<bool>& vLost = mpTracker->mlbLost;
+
+    // 四张表平行；短的那个当上界。
+    size_t n = vRel.size();
+    n = std::min(n, vRef.size());
+    n = std::min(n, vT.size());
+    n = std::min(n, vLost.size());
+    if (n == 0 || cap < 8)
+        return 0;
+
+    const size_t maxPts = std::min<size_t>(cap / 8, 4096);
+    const size_t stride = std::max<size_t>(1, (n + maxPts - 1) / maxPts);
+
+    // ⚠️ 不用 `mpAtlas->GetCurrentMap()` —— 它在坏图窗口里是 `while(IsBad()) usleep(3000)`，
+    //    从主线程调会**冻死界面**。改用「最后一个有效参考帧属于哪张图」，语义一样、不会挂。
+    //    附带好处：重置之后老帧的参考帧在旧图上 ⟹ **自动被滤掉**，不用自己清轨迹。
+    Map* pMap = nullptr;
+    for (list<KeyFrame*>::const_reverse_iterator it = vRef.rbegin(); it != vRef.rend(); ++it)
+        if (*it) { pMap = (*it)->GetMap(); break; }
+    if (pMap == nullptr)
+        return 0;
+
+    // 一帧的拼装。`rel` 是「相对 `pKF`」的位姿（当场记的，**不变**），
+    // `pKF->GetPose()` 是**会变**的（BA 一直在优化它）—— 现乘 ⟹ 轨迹自动跟着优化走。
+    // ⚠️ 和上游 `SaveTrajectoryEuRoC` 有两处**故意不同**：
+    //    · **不乘 `pKF->mImuCalib.mTbc`** —— 那会转到 body/IMU 系，而实时位姿是**相机系**；
+    //    · **不乘首帧偏移 `Twb`** —— 那会挪到 EuRoC 的真值系，而我们要的是**地图坐标系**。
+    //    两条都是为了「轨迹和当前位置（`poseBuf`）在同一个系里」，否则两者会错开。
+    auto compose = [&](const Sophus::SE3f& rel, KeyFrame* pKF, double t, float* o) -> bool {
+        if (pKF == nullptr) return false;
+        // 参考帧被剔了就沿生成树往上爬（上游原样）。
+        // ⚠️ 上游这个循环**没有上界** —— 链坏了（成环 / 爬到 null）就转不出来。加一个。
+        Sophus::SE3f Trw;
+        int hops = 0;
+        while (pKF->isBad())
+        {
+            if (++hops > 64) return false;
+            Trw = Trw * pKF->mTcp;
+            pKF = pKF->GetParent();
+            if (pKF == nullptr) return false;
+        }
+        if (pKF->GetMap() != pMap) return false;   // 别的图的帧（重置之前那些）
+
+        const Sophus::SE3f Twc = (rel * Trw * pKF->GetPose()).inverse();
+        const Eigen::Quaternionf q = Twc.unit_quaternion();
+        const Eigen::Vector3f tw = Twc.translation();
+        o[0] = static_cast<float>(t);
+        o[1] = tw(0); o[2] = tw(1); o[3] = tw(2);
+        o[4] = q.x(); o[5] = q.y(); o[6] = q.z(); o[7] = q.w();
+        return true;
+    };
+
+    // ⚠️ 四个迭代器**一起推** —— 关联的是「位置」，不是「算过没算」。
+    //    所以跳过一万条不拼装，「rel[i] 配 refs[i]」也永远不破。
+    list<Sophus::SE3f>::const_iterator itRel = vRel.begin();
+    list<KeyFrame*>::const_iterator itRef = vRef.begin();
+    list<double>::const_iterator itT = vT.begin();
+    list<bool>::const_iterator itLost = vLost.begin();
+
+    int m = 0;                     // 已写出的点数
+    size_t emitted = 0;            // 走过的**有效**帧数（跟丢的不算）
+    Sophus::SE3f lastRel;          // 最后一个有效帧的那几个值 —— 存下来很便宜
+    KeyFrame* lastKF = nullptr;
+    double lastT = 0;
+    bool hasLast = false;
+
+    for (size_t i = 0; i < n; ++i, ++itRel, ++itRef, ++itT, ++itLost)
+    {
+        if (*itLost) continue;     // 跟丢的帧不存（上游也这么干）
+        lastRel = *itRel; lastKF = *itRef; lastT = *itT; hasLast = true;
+
+        // ⚠️ 按**有效帧**计数，不按 list 下标 —— 按下标的话，跟丢一帧后面整条网格就错位了。
+        // ⚠️ `continue` **在 `compose` 之前** —— 这才是抽稀的意义：
+        //    走列表只是推指针（便宜），矩阵乘只做选中的那 ≤maxPts 个。
+        const size_t slot = emitted++;
+        if (slot % stride != 0) continue;
+        if (m * 8 + 8 > cap) break;
+        if (compose(lastRel, lastKF, lastT, out + 8 * m)) ++m;
+    }
+
+    // 补最后一个**有效帧**，让轨迹的头贴着当前位置
+    //（它不在网格上时才补 —— 在的话上面已经写过了，再补就重复）。
+    if (hasLast && m > 0 && (emitted - 1) % stride != 0 && (m + 1) * 8 <= cap)
+        if (compose(lastRel, lastKF, lastT, out + 8 * m)) ++m;
+
+    return m;
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 

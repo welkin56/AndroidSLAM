@@ -88,12 +88,7 @@ struct Imu {
     float ax = 0, ay = 0, az = 0;
 };
 
-/** 一条轨迹记录。字段和 `SaveTrajectoryEuRoC` 写的 8 列一一对应。 */
-struct TrajPoint {
-    double t = 0;
-    float x = 0, y = 0, z = 0;
-    float qx = 0, qy = 0, qz = 0, qw = 1;
-};
+// 轨迹读上游那份「相对参考关键帧」的表 —— 见 `System::GetFrameTrajectory`。
 
 struct Engine {
     std::atomic<State> state{State::kIdle};
@@ -119,8 +114,9 @@ struct Engine {
     float t_cw[16] = {0};
     bool poseValid = false;
 
+    /** 拉上游那份轨迹的中转缓冲（8 个 float/点，上游的格式）。只在主线程碰。 */
     std::mutex trajMutex;
-    std::vector<TrajPoint> traj;
+    std::vector<float> trajFull;
 
     /** 抽屉里那个「实时测距」开关。只影响算不算，不影响 SLAM。 */
     std::atomic<bool> measuring{false};
@@ -205,19 +201,10 @@ void construct(Engine& e) {
 }
 
 void savePose(Engine& e, const TrackResult& r) {
-    {
-        std::lock_guard<std::mutex> lk(e.poseMutex);
-        std::memcpy(e.pose, r.pose16, sizeof(e.pose));
-        std::memcpy(e.t_cw, r.t_cw16, sizeof(e.t_cw));
-        e.poseValid = true;
-    }
-
-    TrajPoint p;
-    p.t = r.t;
-    p.x = (float)r.x; p.y = (float)r.y; p.z = (float)r.z;
-    p.qx = (float)r.qx; p.qy = (float)r.qy; p.qz = (float)r.qz; p.qw = (float)r.qw;
-    std::lock_guard<std::mutex> lk(e.trajMutex);
-    e.traj.push_back(p);
+    std::lock_guard<std::mutex> lk(e.poseMutex);
+    std::memcpy(e.pose, r.pose16, sizeof(e.pose));
+    std::memcpy(e.t_cw, r.t_cw16, sizeof(e.t_cw));
+    e.poseValid = true;
 }
 
 // 常驻循环：先构造，然后一直取帧、跟踪、存位姿。M4 那版是「构造完就退出」。
@@ -293,24 +280,17 @@ void worker(Engine& e) {
         if (r.kfCount == 0) {
             if (sawKfs) {
                 sawKfs = false;
-                {
-                    std::lock_guard<std::mutex> lk(e.trajMutex);
-                    e.traj.clear();
-                }
+                // 轨迹不用清：上游那张表里，重置之前那些帧的参考关键帧在**旧图**上，
+                // 读的时候会被「跨图」那条判据自动滤掉。
                 const int n = e.resetCount.fetch_add(1) + 1;
-                printf("[M5] 地图被重置（第 %d 次）—— 轨迹清空重来\n", n);
+                printf("[M5] 地图被重置（第 %d 次）\n", n);
                 fflush(stdout);
             }
         } else {
             sawKfs = true;
         }
 
-        // 注意这里**没有**和 PC 那边的帧集完全对齐：PC 的 `SaveTrajectoryEuRoC` 是从
-        // `mlRelativeFramePoses` 存的（只含被插入的帧），而我们是每帧存。
-        // 对照比的是**形状和尺度**，条数对不齐没关系。
-        //
-        // `r.valid` 现在**只在跟踪状态是 OK 时为 true**（见 orb_track.cpp）——
-        // 所以轨迹里不会再有那些原点位姿。
+        // `r.valid` 只在跟踪状态是 OK 时为 true（见 orb_track.cpp）。
         if (r.valid) savePose(e, r);
     }
 }
@@ -392,11 +372,8 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
 
 void start() {
     Engine& e = engine();
-    // 一次运行 = 一份轨迹：上一趟的清掉，否则文件里会混进上一次的位置。
-    {
-        std::lock_guard<std::mutex> lk(e.trajMutex);
-        e.traj.clear();
-    }
+    // 一次运行 = 一份轨迹。上游那张表从不清理，不清的话会跨 run 累加。
+    if (ORB_SLAM3::System* sys = e.sys.load()) sys->ClearFrameTrajectory();
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         e.poseValid = false;
@@ -737,65 +714,60 @@ int getPinned(float* out, int cap) {
 int resetCount() { return engine().resetCount.load(); }
 
 int trajSize() {
-    Engine& e = engine();
-    std::lock_guard<std::mutex> lk(e.trajMutex);
-    return static_cast<int>(e.traj.size());
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 0 : sys->GetFrameTrajectorySize();
 }
 
 int getTrajectory(float* out, int cap) {
     if (out == nullptr || cap < 3) return 0;
     Engine& e = engine();
-    std::lock_guard<std::mutex> lk(e.trajMutex);
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (sys == nullptr) return 0;
 
-    const int n = static_cast<int>(e.traj.size());
     const int maxPts = std::min(cap / 3, kTrajExportMax);
-    if (n <= 0 || maxPts <= 0) return 0;
+    if (maxPts <= 0) return 0;
 
-    // 均匀网格 `0, k, 2k, …`。⚠️ **从前往后**，这样 n 涨的时候这些点**不动**。
-    // （从最新往回抽的话，每加一个点整套就挪一格，折线会一直抖。）
-    const int k = std::max(1, (n + maxPts - 1) / maxPts);
-    int m = 0;
-    for (int i = 0; i < n && m < maxPts - 1; i += k) {
-        const TrajPoint& p = e.traj[i];
-        out[3 * m] = p.x;
-        out[3 * m + 1] = p.y;
-        out[3 * m + 2] = p.z;
-        ++m;
+    std::lock_guard<std::mutex> lk(e.trajMutex);
+    if (static_cast<int>(e.trajFull.size()) < maxPts * 8) e.trajFull.resize(maxPts * 8);
+    // 抽稀在上游做（那边才知道总帧数）；这边只把 8 个里的 xyz 挑出来。
+    const int n = sys->GetFrameTrajectory(e.trajFull.data(), maxPts * 8);
+    for (int i = 0; i < n; ++i) {
+        out[3 * i] = e.trajFull[8 * i + 1];
+        out[3 * i + 1] = e.trajFull[8 * i + 2];
+        out[3 * i + 2] = e.trajFull[8 * i + 3];
     }
-    // 再补一个**最新点**让线头贴着当前位置。它正好是网格点时不用补 ——
-    // 那种情况下上一个循环已经写过，所以不会出现「尾巴一顿一顿」。
-    if (m > 0 && (m - 1) * k != n - 1) {
-        const TrajPoint& p = e.traj[n - 1];
-        out[3 * m] = p.x;
-        out[3 * m + 1] = p.y;
-        out[3 * m + 2] = p.z;
-        ++m;
-    }
-    return m;
+    return n;
 }
 
 void dumpTrajectory(const std::string& path) {
     Engine& e = engine();
-    std::vector<TrajPoint> copy;
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (sys == nullptr) return;
+
+    int n = 0;
     {
         std::lock_guard<std::mutex> lk(e.trajMutex);
-        copy = e.traj;
+        for (int cap = 8 * 4096; ; cap *= 2) {
+            e.trajFull.resize(cap);
+            n = sys->GetFrameTrajectory(e.trajFull.data(), cap);
+            if (n < cap / 8 || cap >= 8 * 400000) break;
+        }
     }
+    if (n <= 0) return;
 
     std::ofstream f(path);
     if (!f.is_open()) {
         printf("[M5] 轨迹写不出去：%s\n", path.c_str());
         return;
     }
-    // 格式和 `SaveTrajectoryEuRoC` 逐列对齐（`System.cc:622`）——
-    // `时间(秒) tx ty tz qx qy qz qw`，空格分隔。**故意不用逗号**：
-    // 这样和 PC 跑出来的 CameraTrajectory.txt 就是同款，对照时直接 diff。
+    // `时间(秒) tx ty tz qx qy qz qw`，空格分隔。列和 `SaveTrajectoryEuRoC` 一样，
     f << std::setprecision(9);
-    for (const TrajPoint& p : copy) {
-        f << p.t << " " << p.x << " " << p.y << " " << p.z << " "
-          << p.qx << " " << p.qy << " " << p.qz << " " << p.qw << "\n";
+    for (int i = 0; i < n; ++i) {
+        const float* p = e.trajFull.data() + 8 * i;
+        f << p[0] << " " << p[1] << " " << p[2] << " " << p[3] << " "
+          << p[4] << " " << p[5] << " " << p[6] << " " << p[7] << "\n";
     }
-    printf("[M5] 轨迹导出 %zu 条 → %s\n", copy.size(), path.c_str());
+    printf("[M5] 轨迹导出 %d 条 → %s\n", n, path.c_str());
     fflush(stdout);
 }
 
