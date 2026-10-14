@@ -215,6 +215,17 @@ class MainActivity : AppCompatActivity() {
     private val segLast = ArrayList<Float>()
     private val segLabels = ArrayList<String>()
 
+    // ---------------- 2D 地图小窗 ----------------
+
+    private lateinit var mapView: MapView
+
+    /**
+     * 给 [MapView] 的轨迹缓冲，复用。`3 × kTrajExportMax`。
+     *
+     * ⚠️ **不用扩容取全** —— 那侧是 stride 抽稀的**形状**契约，和 `pinnedBuf` 正好相反。
+     */
+    private val trajBuf = FloatArray(3 * 512)
+
     /** 上一次见到的「地图重置次数」。涨了 ⟹ 世界系换过 ⟹ 老点全废。 */
     private var resetCountSeen = 0
 
@@ -230,6 +241,7 @@ class MainActivity : AppCompatActivity() {
         swMeasure = findViewById(R.id.swMeasure)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
+        mapView = findViewById(R.id.mapView)
         drawer = findViewById(R.id.drawer)
         rowMeasure = findViewById(R.id.rowMeasure)
         btnAddPoint = findViewById(R.id.btnAddPoint)
@@ -453,6 +465,8 @@ class MainActivity : AppCompatActivity() {
         // 没帧就没有叠加层，也就不用担心「没有画面的十字挂在黑底上」。
         preview.setActive(false)
         measureState = PreviewView.MeasureState.NO_TRACK
+        // ticker 停了，小窗不会再被喂 ⟹ 在这儿补一次，**把整趟的图定格下来**（复盘好看）。
+        refreshMap()
     }
 
     // ---------------- 帧出口 ----------------
@@ -844,6 +858,46 @@ class MainActivity : AppCompatActivity() {
             lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
         tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
+
+        // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
+        refreshMap()
+    }
+
+    // ---------------- 2D 地图小窗 ----------------
+
+    /** 读一次轨迹塞给小窗。**纯读 + 换引用**，算和画都在 [MapView] 那边。 */
+    private fun refreshMap() {
+        val n = SlamBridge.nativeGetTrajectory(trajBuf)
+        // ⚠️ **不沉默**：空窗也要说清为什么空。**分开四态**（STAGE6 §2.7）——
+        // 「加载中」和「没启动」混成一句的话，用户会去擦镜头。
+        val hint = when {
+            slamState == SLAM_LOADING -> "词袋加载中…"
+            slamState == SLAM_FAILED -> "构造失败"
+            !slamRunning -> "SLAM 未启动"
+            n == 0 && trkState != TRK_OK -> "跟踪未就绪"
+            n == 0 -> "等待定位…"
+            else -> null
+        }
+        // 朝向：相机光轴投到 XY 地面。`poseBuf` 是 **Twc**（列主序），
+        // 所以**第 3 列**就是相机系 `+z`（光轴）在世界里的方向。
+        // ⚠️ 只挡**除零**（真的正下方，方位角无定义）。**不挡「朝下」** ——
+        //    低头测地板时那点水平分量仍然是**稳定的方位角**（晃 1° 就动 1°）。
+        var dx = 0f
+        var dy = 0f
+        if (poseValid) {
+            val fx = poseBuf[8]
+            val fy = poseBuf[9]
+            val len = Math.hypot(fx.toDouble(), fy.toDouble()).toFloat()
+            if (len > 1e-6f) {
+                dx = fx / len
+                dy = fy / len
+            }
+        }
+        mapView.submit(MapView.Snapshot(
+            trajBuf, n,
+            if (poseValid) poseBuf[12] else 0f,
+            if (poseValid) poseBuf[13] else 0f,
+            poseValid, hint, dx, dy))
     }
 
     /**

@@ -179,6 +179,21 @@ Java_com_example_slamcapture_SlamBridge_nativeTrajSize(JNIEnv* /*env*/, jobject 
     }
 }
 
+// 2D 地图要的轨迹：stride 抽稀的 xyz 三元组。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetTrajectory(JNIEnv* env, jobject /*thiz*/,
+                                                            jfloatArray out) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;   // OOM
+        const int n = slam::getTrajectory(p, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, p, 0);   // 写回
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
                                                              jstring path) {

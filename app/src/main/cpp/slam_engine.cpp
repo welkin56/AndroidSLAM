@@ -66,6 +66,9 @@ constexpr long long kMeasureLogMs = 300;
 // 「一直测不到」每隔这么久也打一行。**只在测不到时**，有读数不会打 ⟹ 不刷屏。
 constexpr long long kMeasureStuckMs = 5000;
 
+/** 导给 2D 地图的轨迹点数上限。画面上只有 140dp，再多也看不出来。 */
+constexpr int kTrajExportMax = 512;
+
 // SLAM 线程的栈大小。**不能省**：`sizeof(Frame)` 是 146 KB，而
 // `Tracking::GrabImageMonocular` 里 `mCurrentFrame = Frame(...)` 是**栈上的临时对象**。
 // PC 上跑 `mono_inertial_euroc` 用的是主线程（8 MB），Android 的 `std::thread` 只给 1 MB。
@@ -737,6 +740,38 @@ int trajSize() {
     Engine& e = engine();
     std::lock_guard<std::mutex> lk(e.trajMutex);
     return static_cast<int>(e.traj.size());
+}
+
+int getTrajectory(float* out, int cap) {
+    if (out == nullptr || cap < 3) return 0;
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.trajMutex);
+
+    const int n = static_cast<int>(e.traj.size());
+    const int maxPts = std::min(cap / 3, kTrajExportMax);
+    if (n <= 0 || maxPts <= 0) return 0;
+
+    // 均匀网格 `0, k, 2k, …`。⚠️ **从前往后**，这样 n 涨的时候这些点**不动**。
+    // （从最新往回抽的话，每加一个点整套就挪一格，折线会一直抖。）
+    const int k = std::max(1, (n + maxPts - 1) / maxPts);
+    int m = 0;
+    for (int i = 0; i < n && m < maxPts - 1; i += k) {
+        const TrajPoint& p = e.traj[i];
+        out[3 * m] = p.x;
+        out[3 * m + 1] = p.y;
+        out[3 * m + 2] = p.z;
+        ++m;
+    }
+    // 再补一个**最新点**让线头贴着当前位置。它正好是网格点时不用补 ——
+    // 那种情况下上一个循环已经写过，所以不会出现「尾巴一顿一顿」。
+    if (m > 0 && (m - 1) * k != n - 1) {
+        const TrajPoint& p = e.traj[n - 1];
+        out[3 * m] = p.x;
+        out[3 * m + 1] = p.y;
+        out[3 * m + 2] = p.z;
+        ++m;
+    }
+    return m;
 }
 
 void dumpTrajectory(const std::string& path) {

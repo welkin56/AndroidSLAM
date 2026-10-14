@@ -48,14 +48,28 @@
                 android:textColor="#DE000000" />
         </LinearLayout>
 
-        <!-- 画面。黑底既是 letterbox 的黑边，也是「没有画面时露出来的东西」。
-             ⚠️ 现在没人喂它（M5 才接相机），所以它就是个黑框。 -->
-        <com.example.slamcapture.PreviewView
-            android:id="@+id/preview"
+        <!-- 画面 + 右上角的 2D 地图小窗。
+             ⚠️ 小窗**浮在预览上面**（画中画），所以预览得包进 FrameLayout。
+             小窗不接管触摸（View 默认 onTouchEvent 返回 false）⟹ 点它等于点预览。 -->
+        <FrameLayout
+            android:id="@+id/previewWrap"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"
-            android:background="#000000" />
+            android:layout_weight="1">
+
+            <com.example.slamcapture.PreviewView
+                android:id="@+id/preview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#000000" />
+
+            <com.example.slamcapture.MapView
+                android:id="@+id/mapView"
+                android:layout_width="140dp"
+                android:layout_height="140dp"
+                android:layout_gravity="top|end"
+                android:layout_margin="8dp" />
+        </FrameLayout>
 
         <!-- 多点折线测距。**绑死在「实时测距」开关上** —— 关着就 GONE。
              ⚠️ 预览是 weight=1 ⟹ 这一行出现/消失时预览高度变一次。那是拨开关那一下，不是每帧跳。 -->
