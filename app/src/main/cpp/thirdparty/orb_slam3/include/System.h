@@ -134,9 +134,28 @@ public:
     void Reset();
     void ResetActiveMap();
 
-    // ⚠️ 我们加的。`ResetActiveMap` 原地清空当前图，`Map::mnId` 不变 ——
+    // add:`ResetActiveMap` 原地清空当前图，`Map::mnId` 不变 ——
     // 所以 KF 数掉到 0 是「重置过」唯一的外部信号。
     unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }
+
+    /**
+     * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
+     *
+     * `cap` = `out` 能装多少 float ⟹ 最多写 `cap/8` 个点。
+     * **超过就按 stride 抽稀**（覆盖全程、恒含最新点），**不是截断** ——
+     * 所以要「取全」就传一个 `≥ 8 × 总帧数` 的 `cap`。
+     *（和 `getPinned` 那个 `cap` 的语义**相反**：那个装不下就少给、靠扩容补全。）
+     *
+     * 数据来自 `mpTracker` 那份「相对参考关键帧」的列表，读时用关键帧当前的位姿重算
+     * ⟹ 回环/BA 改过地图之后仍然一致。和 `SaveTrajectoryEuRoC` 有两处故意不同，见 .cc。
+     */
+    int GetFrameTrajectory(float* out, int cap);
+
+    /** 上游那份轨迹表里有多少帧（含跟丢的）。给状态栏的计数用 —— 不抽稀。 */
+    int GetFrameTrajectorySize();
+
+    /** add：清空那份轨迹表。**一次运行 = 一份轨迹**，`start` 时调（否则会跨 run 累加）。 */
+    void ClearFrameTrajectory();
 
     // All threads will be requested to finish.
     // It waits until all threads have finished.

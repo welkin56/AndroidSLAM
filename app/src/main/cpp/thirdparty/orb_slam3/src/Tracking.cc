@@ -1791,6 +1791,15 @@ void Tracking::ResetFrameIMU()
 }
 
 
+void Tracking::ClearTrajectory()
+{
+    unique_lock<mutex> lockTraj(mMutexTraj);
+    mlRelativeFramePoses.clear();
+    mlpReferences.clear();
+    mlFrameTimes.clear();
+    mlbLost.clear();
+}
+
 void Tracking::Track()
 {
 
@@ -2299,6 +2308,10 @@ void Tracking::Track()
 
     if(mState==OK || mState==RECENTLY_LOST)
     {
+        // add：另一个线程（2D 地图，4Hz）会在跑的时候读这四张表。
+        //    临界区只有四个 push_back，很短。
+        unique_lock<mutex> lockTraj(mMutexTraj);
+
         // Store frame pose information to retrieve the complete camera trajectory afterwards.
         if(mCurrentFrame.isSet())
         {

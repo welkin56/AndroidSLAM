@@ -90,6 +90,14 @@ object SlamBridge {
     external fun nativeTrajSize(): Int
 
     /**
+     * 2D 地图要的轨迹：`out` 收 `3n` 个 float（世界米，`x y z`），返回点数。
+     *
+     * ⚠️ **stride 抽稀，不是截断** —— 要的是形状不是精度：覆盖全程、恒含最新点。
+     * **别学 `nativeGetPinned` 扩容取全**（那份契约要的是精度，正好相反）。
+     */
+    external fun nativeGetTrajectory(out: FloatArray): Int
+
+    /**
      * 把这一趟的位姿历史写成文件（TUM 格式，和 PC 的 `CameraTrajectory.txt` 同款）。
      * **一次运行一份** —— [nativeStart] 会把上一趟的清掉。
      */

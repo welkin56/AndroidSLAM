@@ -66,6 +66,8 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 9 | `DBoW2/CMakeLists.txt`、`g2o/CMakeLists.txt` | 删掉 `-march=native` | 那是"按本机 CPU 生成指令"，本机 x86、目标 arm64，直接报 `unknown target CPU 'native'`。它只是优化 |
 | 10 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(Map*, Matrix3d&, double&)` 里那句「顶点缺失」的报错串不再逐个 `->id()` | ⚠️ **这条和上面 9 条性质不同：它是上游的 bug，不是编译迁移。** |
 | 11 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(...)`（多参数那个重载）里检测到 `!mpImuPreintegrated` 之后**补了 `continue`** | 同上 —— **上游 bug，和第 10 条同源** |
+| 12 | `orb_slam3/include/Tracking.h` + `src/Tracking.cc` | 加一把 `mMutexTraj`，把往 `mlRelativeFramePoses` 那四张表 push 的地方罩住 | ⚠️ **不是上游的 bug，是我们多出来的用法**：上游只在 `Shutdown()` 之后读那四张表，所以不用锁；**我们要在跑的时候读** |
+| 13 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetFrameTrajectory()` / `GetFrameTrajectorySize()` —— 把上游那段 VBA 拼装从「写文件」改成「写进 buffer」 | 同上，配套 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 
@@ -120,6 +122,37 @@ pKFi->mpImuPreintegrated->SetNewBias(...);                        // ← 然后�
 **⚠️ 还有三处同源但没崩过、也没修的**（用户决定「下次崩了再说」）：
 `Optimizer.cc` 里三处 `new EdgeInertialGS(pKFi->mpImuPreintegrated)` ——
 **顶点非空 ≠ 预积分非空**，所以那三处的空检查护不住它。**崩了就来这儿看。**
+
+### 第 12 / 13 条说清楚
+
+**这两条和上面 11 条性质不同 —— 不是上游 bug，是我们多出来的用法。**
+
+上游已经有一套**正确**的相机轨迹：它不存绝对位姿，存的是「**每一帧相对它自己那个参考关键帧**」的
+位姿（`Tracking::mlRelativeFramePoses` + `mlpReferences`），读的时候**用关键帧当前的位姿重算** ⟹
+回环 / 全局 BA 改过地图之后**仍然一致**。
+
+**我们原来是自己每帧抄一份绝对位姿** ✗ —— BA 一改地图坐标系，抄下来的就留在旧系里，
+**轨迹跳一段**（真机上就是这么发现的），而且 `trajectory.txt` 也是同一份错的。
+
+**两处改动：**
+
+| | 改什么 | 为什么 |
+|---|---|---|
+| **12** | `Tracking` 加 `mMutexTraj`，罩住往那四张表 push 的地方 | 上游只在 `Shutdown()` **之后**读它们（`SaveTrajectoryEuRoC` 的注释就写着 "Call first Shutdown()"），那时没有线程在跑 ⟹ 它不用锁。**我们在跑的时候从主线程读**（2D 地图 4Hz）⟹ 必须自己加一把 |
+| **13** | `System` 新增 `GetFrameTrajectory()` / `GetFrameTrajectorySize()` | 把上游 `SaveTrajectoryEuRoC` 那段拼装从「写文件」改成「写进 buffer」。`mpTracker` 是 `System` 自己的成员，所以**不用碰 `Tracking` 的成员可见性** |
+
+**⚠️ 两处故意和上游不一样**（都在 .cc 里注释了）：
+
+- **不乘 `pKF->mImuCalib.mTbc`** —— 那会转到 **body/IMU** 系，而我们的实时位姿是**相机系**；
+- **不乘首帧偏移 `Twb`** —— 那会挪到 EuRoC 的**真值系**，而我们要的是**地图坐标系**。
+
+两条都是为了「轨迹和当前位置在同一个系里」，否则两者会错开。
+**副作用**：导出的 `trajectory.txt` 因此**和 PC 的输出不在同一个 frame** ⟹
+**别逐行 diff，只能比形状和尺度**。
+
+**另外加了两处防护**（上游没有）：生成树爬升加了 64 跳上界；`pMap` 不用
+`mpAtlas->GetCurrentMap()`（那个在坏图窗口里是 `while(IsBad()) usleep(3000)`，从主线程调会**冻死界面**），
+改用「最后一个有效参考帧属于哪张图」—— 语义一样、不会挂，**而且顺带让重置之后的老帧被自动滤掉**。
 
 ## 许可证
 
