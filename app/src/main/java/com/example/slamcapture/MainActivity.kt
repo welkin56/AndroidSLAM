@@ -10,6 +10,7 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
@@ -101,6 +102,9 @@ class MainActivity : AppCompatActivity() {
 
         /** 厚度滑块的刻度数。`SeekBar` 只有整数，所以在 `0..100` 上线性映射到米。 */
         private const val kRangeSeekMax = 100
+
+        /** 按住缩放键时，**每隔多久走一档**。大约一秒走十档。 */
+        private const val kZoomRepeatMs = 95L
 
         private val DARK_TEXT = Color.parseColor("#DE000000")
         private val RED = Color.parseColor("#C62828")
@@ -259,6 +263,10 @@ class MainActivity : AppCompatActivity() {
     /** 上一次见到的「地图重置次数」。涨了 ⟹ 世界系换过 ⟹ 老点全废。 */
     private var resetCountSeen = 0
 
+    /** 缩放键按住时的连发定时器。**挂在 [uiHandler] 上** —— `onDestroy` 那句
+     *  `removeCallbacksAndMessages(null)` 顺手就把它清了。 */
+    private var zoomRepeat: Runnable? = null
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -348,8 +356,8 @@ class MainActivity : AppCompatActivity() {
         })
 
         // 缩放只有加/减两档。**比例是视图状态，不落盘**（和抽屉里的设置分得开）。
-        btnMapZoomIn.setOnClickListener { mapView.zoomIn() }
-        btnMapZoomOut.setOnClickListener { mapView.zoomOut() }
+        wireZoomButton(btnMapZoomIn) { mapView.zoomIn() }
+        wireZoomButton(btnMapZoomOut) { mapView.zoomOut() }
 
         // 多点折线：加点 / 断开 / 撤销 / 重置。**折线整个存在 C++ 侧**（它要存 `MapPoint*`），
         // 这一侧只调它、然后把结果读回来画。
@@ -1011,6 +1019,41 @@ class MainActivity : AppCompatActivity() {
         val m = seekToRange(progress)
         mapView.setSliceRange(m)
         tvMapRange.text = "地图高度范围　%.1f m".format(m)
+    }
+
+    // ---------------- 缩放键 ----------------
+
+    /**
+     * 缩放键：**点一下走一档，按住不放连续走**。松手（或滑出去取消）就停。
+     *
+     * 档位是 ×1.5 递下去的、有十几档，一路点过去太费手。
+     */
+    private fun wireZoomButton(b: Button, zoom: () -> Unit) {
+        b.setOnClickListener { zoom() }
+        b.setOnLongClickListener {
+            stopZoomRepeat()
+            val r = object : Runnable {
+                override fun run() {
+                    zoom()
+                    uiHandler.postDelayed(this, kZoomRepeatMs)
+                }
+            }
+            zoomRepeat = r
+            uiHandler.post(r)   // 长按判定一成立就当场走一档，不用再等一拍
+            true                // 消费掉 ⟹ 长按之后不会再补一次点击
+        }
+        // ⚠️ 返回 **false**：别把事件吃掉，点击和长按照常走 View 自己那套。
+        b.setOnTouchListener { _, e ->
+            if (e.action == MotionEvent.ACTION_UP || e.action == MotionEvent.ACTION_CANCEL) {
+                stopZoomRepeat()
+            }
+            false
+        }
+    }
+
+    private fun stopZoomRepeat() {
+        zoomRepeat?.let { uiHandler.removeCallbacks(it) }
+        zoomRepeat = null
     }
 
     /**

@@ -34,6 +34,11 @@
 - 在 `r.kfCount == 0` 那个分支里加 `sys->ClearFrameTrajectory()`，紧挨着清 `mapSnap`。
 - 原来那句「轨迹不用清：……会被跨图判据自动滤掉」的注释是**错的**，一起改掉。
 
+**`MainActivity.kt` —— 缩放键支持按住连发**
+
+- `wireZoomButton(btn, zoom)` 替代原来的两个 `setOnClickListener`：点一下走一档，
+  **按住不放每 95 ms 走一档**，松手/滑出去就停。
+
 **点云上限 20000 → 5000**（用户：「20000 个点有点太多了」）
 
 - `slam_engine.cpp` 的 `kMapPointsMax`、`MainActivity.kt` 里那个一一对应的常量，
@@ -65,7 +70,23 @@
 ⚠️ 加锁：这个调用在 worker 里、`orbTrack` **返回之后**，此时 `Track()` 早放掉了
 `mMutexTraj` ⟹ 再拿一次不会自锁 ✓
 
-### 三、上限砍到 5000 —— 代价是**大场景更早开始抽稀**
+### 三、"按住连发"用 **`onLongClick` 起头 + `onTouch` 收尾**，不自己写手势
+
+`View` 那套（点击 / 长按）是现成的，自己判 `ACTION_DOWN` 再延时反而是重写一遍它 ✗，
+而且**会和点击打架**（手一抖就同时收到「按住那档」和「点击那档」）。
+
+所以：`onClick` 管一下 ✓、`onLongClick` **返回 true**（消费掉 ⟹ 长按之后不再补一次点击 ✓）
+只负责**起**定时器 ✓、`onTouch` 只看 `ACTION_UP` / `ACTION_CANCEL` 负责**停** ✓
+⚠️ `onTouch` 必须**返回 false**，否则事件被吃掉，点击和长按都不会发生 ✗
+
+两个细节：
+
+- 长按判定一成立就 **`post(r)` 立刻走一档**（不是等 95 ms）—— 否则按下去半秒没反应，
+  看着像坏了 ✗
+- 定时器挂在 `uiHandler` 上 ⟹ `onDestroy` 里那句 `removeCallbacksAndMessages(null)`
+  **顺手就把它清了** ✓ 不用在 onStop/onPause 里再写一遍 ✓
+
+### 四、上限砍到 5000 —— 代价是**大场景更早开始抽稀**
 
 `kMapPointsMax` 决定两件事：① 快照里最多几个点；② 全图超过它就按 `ceil(n/5000)` 抽。
 
@@ -77,7 +98,7 @@
 「室内规模根本不会超、所以没差」那个判断**不再成立** —— 一个房间跑几分钟就可能过 5000 ✗
 （这条本来就在「遗留」里挂着，现在它**提前**变成了现实。）
 
-### 四、`cloudScratch` 改成**按需长**，不写死 2 × 20000
+### 五、`cloudScratch` 改成**按需长**，不写死 2 × 20000
 
 它本来就该跟着快照的**实际点数**走 —— 上限是 C++ 那边的事。写死一个数字的话，
 今天这种「改上限」就要在三个文件里同步 ✗（而且漏掉一处**不会报错**，只是要么浪费内存、
@@ -99,22 +120,30 @@ BUILD SUCCESSFUL in 10s
 顺手确认了原生库**确实重编了**（10 秒快得可疑）：`libslam_jni.so` 的 mtime 比
 `slam_engine.cpp` 新 ✓，再跑一次 `assembleDebug` 除了 `configureCMakeDebug` 全是 UP-TO-DATE ✓
 
-**⚠️ 真机未验证。** 要看的：
+**2. 真机走查（用户反馈）**
+
+| # | 做什么 | 结果 |
+|---|---|---|
+| ① | 按 `+` 放大 | ⚠️ 能放大，但**「还可以再大一些」** ⟹ 档位表又往下补三档（见改动）|
+| ④ | ⭐ 快晃一下触发重置 | ✅ **修好了**（用户确认：轨迹当场清空）⟸ 决策二 |
+| ③（上一批的） | 重置次数变多 | ✅ **没复现**，用户判断是**偶发现象** ⟹ 关闭 |
+
+**3. ⚠️ 其余仍未验证：**
 
 | # | 做什么 | 期望 |
 |---|---|---|
-| ① | 一直按 `+` 到底 | 能放到**一屏约 0.84 m**（凑近能看清墙角那几个点）；再按没反应 |
 | ② | 一直按 `−` 到底 | 到 140 m 为止 |
-| ③ | 默认进来 | 还是约 14 m（`0.1 m/dp`）那一档 ⟸ 决策一 |
-| ④ | ⭐ 快晃一下触发重置 | **轨迹当场清空**、随后从新位置重新长；点云同时清 ⟸ 决策二 |
+| ③ | 默认进来 | 还是约 14 m（`0.1 m/dp`）那一档 ⟸ 决策一（加过两轮档位，**下标是算出来的**，不会漂）|
 | ⑤ | 重置后看状态栏 | 「轨迹 N 点」**从 0 重新开始** |
-| ⑥ | 回归 | 测距 overlay / 折线 / 方向三角 / 抽屉两条都不受影响 |
+| ⑥ | ⭐ **按住 `+` / `−` 不放** | 连续走档；**松手就停**；滑出按钮范围也停 ⟸ 决策三 |
+| ⑦ | 轻点一下 `+` | **只走一档**（长按没成立时不该多走）⟸ 决策三那个 `return true` |
+| ⑧ | 回归 | 测距 overlay / 折线 / 方向三角 / 抽屉两条都不受影响 |
 
 ## 遗留
 
-- **②的「按住连续缩放」和「到头把按钮灰掉」没做**（这次只动了档位表）。
-  用户原话是「或许可以设置一个上下限，按动连续放大缩小之类的」—— 上下限现在**有**了
-  （就是表的两头），但**按一下走一档**、到头是**静默无事发生** ✗，两样都还欠着。
+- **「按住连续缩放」做了 ✓**（见改动）；用户原话里那两样只欠最后一样：
+  **到头（最里 / 最外档）按钮还是静默无事发生** ✗ —— 按到底看不出已经到极限了。
+  要做就是 `MapView` 出 `canZoomIn()/canZoomOut()`，MainActivity 每次缩放后同步 `isEnabled` ✓
 - 昨天那份（`2026-10-14-map-pip-milestone-b-pointcloud.md`）的**其余遗留全部照旧挂着**。
   ⚠️ 其中「**切片是在绘制时滤的** ⟹ 地图超过上限就拿到抽稀过的 1/k」那条 ——
   **上限砍到 5000 之后它提前变成了现实**（房间里跑几分钟就可能过），不再是「室内不会超」。
@@ -124,8 +153,14 @@ BUILD SUCCESSFUL in 10s
 ## 回滚
 
 ```
-app/src/main/java/com/example/slamcapture/MapView.kt    ← 档位表 + ZOOM_DEFAULT
-app/src/main/cpp/slam_engine.cpp                        ← 重置分支里那一行 ClearFrameTrajectory
+app/src/main/java/com/example/slamcapture/MapView.kt        ← 档位表 + ZOOM_DEFAULT + cloudScratch
+app/src/main/java/com/example/slamcapture/MainActivity.kt   ← wireZoomButton 那一套 + 点云上限常量
+app/src/main/java/com/example/slamcapture/SlamBridge.kt     ← 注释里的数字
+app/src/main/cpp/slam_engine.{h,cpp}                        ← kMapPointsMax + 重置分支那一行
 ```
 
-只回滚第二处的话，重置后轨迹又会留着 —— 那是**已知的旧行为**，不是新的坑。
+⚠️ **点云上限那两处（C++ 的 `kMapPointsMax` 和 Kotlin 的 `kMapPointsMax`）必须一起改回**
+—— 只改一边的话：Kotlin 那边小了就是白白少画点 ✓、**大了就是数组越界写** ✗。
+
+只回滚 `slam_engine.cpp` 那一行 `ClearFrameTrajectory` 的话，重置后轨迹又会留着 ——
+那是**已知的旧行为**，不是新的坑。
