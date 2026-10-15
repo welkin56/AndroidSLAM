@@ -12,7 +12,9 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -27,6 +29,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * SLAM 主界面。**跑 SLAM 的那一屏。**
@@ -87,6 +90,17 @@ class MainActivity : AppCompatActivity() {
         private const val PREF = "slamapp"
         private const val PREF_RECORD = "record"
         private const val PREF_MEASURE = "measure"
+        private const val PREF_MAP = "map"
+        private const val PREF_MAP_RANGE = "mapRange"
+
+        /**
+         * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
+         * 那边超了会 stride 抽稀，所以这一侧是**固定缓冲、别扩容**（和 `trajBuf` 同款契约）。
+         */
+        private const val kMapPointsMax = 20000
+
+        /** 厚度滑块的刻度数。`SeekBar` 只有整数，所以在 `0..100` 上线性映射到米。 */
+        private const val kRangeSeekMax = 100
 
         private val DARK_TEXT = Color.parseColor("#DE000000")
         private val RED = Color.parseColor("#C62828")
@@ -226,6 +240,22 @@ class MainActivity : AppCompatActivity() {
      */
     private val trajBuf = FloatArray(3 * 512)
 
+    /**
+     * 给 [MapView] 的点云缓冲，复用。`3 × kMapPointsMax`。
+     *
+     * 那边写的是**快照**（SLAM 线程每秒重建一次），这一侧只是 memcpy —— 契约和 [trajBuf] 一样：
+     * **固定缓冲、别扩容**。
+     */
+    private val mapPtBuf = FloatArray(3 * kMapPointsMax)
+
+    /** 小地图那一整块。开关直接作用于它（连角上那两个缩放键一起藏）。 */
+    private lateinit var mapWrap: FrameLayout
+    private lateinit var swMap: SwitchCompat
+    private lateinit var sbMapRange: SeekBar
+    private lateinit var tvMapRange: TextView
+    private lateinit var btnMapZoomIn: Button
+    private lateinit var btnMapZoomOut: Button
+
     /** 上一次见到的「地图重置次数」。涨了 ⟹ 世界系换过 ⟹ 老点全废。 */
     private var resetCountSeen = 0
 
@@ -242,6 +272,12 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
         mapView = findViewById(R.id.mapView)
+        mapWrap = findViewById(R.id.mapWrap)
+        swMap = findViewById(R.id.swMap)
+        sbMapRange = findViewById(R.id.sbMapRange)
+        tvMapRange = findViewById(R.id.tvMapRange)
+        btnMapZoomIn = findViewById(R.id.btnMapZoomIn)
+        btnMapZoomOut = findViewById(R.id.btnMapZoomOut)
         drawer = findViewById(R.id.drawer)
         rowMeasure = findViewById(R.id.rowMeasure)
         btnAddPoint = findViewById(R.id.btnAddPoint)
@@ -286,6 +322,34 @@ class MainActivity : AppCompatActivity() {
             // 要清就按「重置」（或者等地图重置，见 pollMeasure）。
             render()
         }
+
+        // 小地图：开关 + 切片厚度。同样在挂监听**之前**恢复。
+        swMap.isChecked = pref.getBoolean(PREF_MAP, true)
+        sbMapRange.max = kRangeSeekMax
+        sbMapRange.progress = rangeToSeek(pref.getFloat(PREF_MAP_RANGE, MapView.SLICE_DEFAULT))
+        applyMapRange(sbMapRange.progress)
+
+        swMap.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_MAP, checked).apply()
+            applyMapVisible(checked)
+        }
+        // 先按当前开关同步一次：C++ 那边默认是开的，而用户可能记成了关。
+        applyMapVisible(swMap.isChecked)
+
+        sbMapRange.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            // ⚠️ 边拖边生效（`fromUser` 才落盘）—— 拖的时候要能当场看见切片变厚变薄。
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                applyMapRange(progress)
+                if (fromUser) pref.edit().putFloat(PREF_MAP_RANGE, seekToRange(progress)).apply()
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+
+        // 缩放只有加/减两档。**比例是视图状态，不落盘**（和抽屉里的设置分得开）。
+        btnMapZoomIn.setOnClickListener { mapView.zoomIn() }
+        btnMapZoomOut.setOnClickListener { mapView.zoomOut() }
 
         // 多点折线：加点 / 断开 / 撤销 / 重置。**折线整个存在 C++ 侧**（它要存 `MapPoint*`），
         // 这一侧只调它、然后把结果读回来画。
@@ -865,17 +929,28 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 2D 地图小窗 ----------------
 
-    /** 读一次轨迹塞给小窗。**纯读 + 换引用**，算和画都在 [MapView] 那边。 */
+    /**
+     * 读一次轨迹和点云塞给小窗。**纯读 + 换引用**，算和画都在 [MapView] 那边。
+     *
+     * 小地图关着时**整个不读** —— 这两条读的都是要拿锁的活：
+     * 轨迹走四条 `std::list` 抱 `mMutexTraj`（tracking 每帧都要拿），
+     * 点云是 SLAM 线程那份快照（每秒重建一次，重建时抱地图的锁）。
+     * 藏起来时白付不起，见 [applyMapVisible]。
+     */
     private fun refreshMap() {
+        if (mapWrap.visibility != View.VISIBLE) return
+
         val n = SlamBridge.nativeGetTrajectory(trajBuf)
+        val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
         // ⚠️ **不沉默**：空窗也要说清为什么空。**分开四态**（STAGE6 §2.7）——
         // 「加载中」和「没启动」混成一句的话，用户会去擦镜头。
+        // ⚠️ 判据是「**两样都没有**」：有点云可画时再拿提示盖上去，点云就白出来了。
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
             slamState == SLAM_FAILED -> "构造失败"
             !slamRunning -> "SLAM 未启动"
-            n == 0 && trkState != TRK_OK -> "跟踪未就绪"
-            n == 0 -> "等待定位…"
+            n == 0 && pn == 0 && trkState != TRK_OK -> "跟踪未就绪"
+            n == 0 && pn == 0 -> "等待定位…"
             else -> null
         }
         // 朝向：相机光轴投到 XY 地面。`poseBuf` 是 **Twc**（列主序），
@@ -897,7 +972,45 @@ class MainActivity : AppCompatActivity() {
             trajBuf, n,
             if (poseValid) poseBuf[12] else 0f,
             if (poseValid) poseBuf[13] else 0f,
-            poseValid, hint, dx, dy))
+            if (poseValid) poseBuf[14] else 0f,
+            poseValid, hint, dx, dy,
+            mapPtBuf, pn))
+    }
+
+    // ---------------- 小地图的开关和切片厚度 ----------------
+
+    /**
+     * 显示 / 隐藏小地图。
+     *
+     * **关掉时连 C++ 那边也停**：点云快照那次枚举要抱 `Map::mMutexMap`（几毫秒，
+     * 红黑树指针追逐），而 LocalMapping 每建一个点都要拿它。藏起来时白付不起。
+     * 重开时下一个帧间空隙就重建，不会空一下。
+     *
+     * 轨迹的**记录**停不了也不该停（那是 ORB-SLAM3 自己在 push，`trajectory.txt` 靠它），
+     * 但那个 4 Hz 的**读取**跟着一起停了 —— 见 [refreshMap]。
+     */
+    private fun applyMapVisible(on: Boolean) {
+        mapWrap.visibility = if (on) View.VISIBLE else View.GONE
+        // 别让人去调一个看不见的东西。
+        sbMapRange.isEnabled = on
+        sbMapRange.alpha = if (on) 1f else 0.4f
+        tvMapRange.alpha = if (on) 1f else 0.4f
+        SlamBridge.nativeSetMapCloudEnabled(on)
+        refreshMap()
+    }
+
+    /** 滑块刻度 → 切片厚度（**米，全宽**）。 */
+    private fun seekToRange(p: Int): Float =
+        MapView.SLICE_MIN + (MapView.SLICE_MAX - MapView.SLICE_MIN) * p / kRangeSeekMax
+
+    private fun rangeToSeek(m: Float): Int =
+        ((m - MapView.SLICE_MIN) / (MapView.SLICE_MAX - MapView.SLICE_MIN) * kRangeSeekMax)
+            .roundToInt().coerceIn(0, kRangeSeekMax)
+
+    private fun applyMapRange(progress: Int) {
+        val m = seekToRange(progress)
+        mapView.setSliceRange(m)
+        tvMapRange.text = "地图高度范围　%.1f m".format(m)
     }
 
     /**

@@ -889,6 +889,13 @@ int System::GetFrameTrajectory(float* out, int cap)
     return m;
 }
 
+std::vector<MapPoint*> System::GetAllMapPoints()
+{
+    if (mpAtlas == nullptr)
+        return std::vector<MapPoint*>();
+    return mpAtlas->GetAllMapPoints();
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 
