@@ -70,7 +70,7 @@ constexpr long long kMeasureStuckMs = 5000;
 constexpr int kTrajExportMax = 512;
 
 /** 点云快照的点数上限。室内规模装得下就**不抽稀**，超了才按这个台阶抽。 */
-constexpr int kMapPointsMax = 20000;
+constexpr int kMapPointsMax = 5000;
 
 /** 点云快照的重建间隔。地图点增得很慢，一秒一次足够。 */
 constexpr long long kMapSnapMs = 1000;
@@ -345,12 +345,12 @@ void worker(Engine& e) {
         if (r.kfCount == 0) {
             if (sawKfs) {
                 sawKfs = false;
-                // 轨迹不用清：上游那张表里，重置之前那些帧的参考关键帧在**旧图**上，
-                // 读的时候会被「跨图」那条判据自动滤掉。
+                //（一次运行 = 一份轨迹，和 `start()` 同一个语义）。
+                sys->ClearFrameTrajectory();
                 const int n = e.resetCount.fetch_add(1) + 1;
                 printf("[M5] 地图被重置（第 %d 次）\n", n);
                 fflush(stdout);
-                // 点云得清：它是「当前那张图」的快照，没有跨图判据（和轨迹不一样）。
+                // 点云同理：它是「当前那张图」的快照，没有跨图判据。
                 {
                     std::lock_guard<std::mutex> lk(e.mapSnapMutex);
                     e.mapSnap.clear();

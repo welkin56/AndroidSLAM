@@ -135,7 +135,7 @@ int getPinned(float* out, int cap);
  * 数据是 **SLAM 线程每秒重建一次的快照**，不是现读地图 —— 全图枚举要抱 `Map::mMutexMap`，
  * 而那个锁 LocalMapping 每建一个点都要拿。留给这一侧的只有 memcpy ✓
  *
- * **stride 抽稀，不是截断**（全量上限 20000，装得下就不抽）。和 [getTrajectory]
+ * **stride 抽稀，不是截断**（全量上限 5000，装得下就不抽）。和 [getTrajectory]
  * 同一个契约：**别学 `readPinned` 扩容取全**（那个要的是精度，正好相反）。
  */
 int getMapPoints(float* out, int cap);

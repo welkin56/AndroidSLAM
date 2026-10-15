@@ -50,7 +50,7 @@ class MapView @JvmOverloads constructor(
         /** 自己留一份 —— 调用方那个缓冲下一拍就复用了。 */
         val traj: FloatArray = traj.copyOf()
 
-        /** 同上，但**只拷用到的部分**（容量是 20000，实际常只有几千）。 */
+        /** 同上，但**只拷用到的部分**（容量由 C++ 那侧的上限决定，实际常只有几千）。 */
         val pts: FloatArray = if (ptsN > 0) pts.copyOf(ptsN * 3) else EMPTY
     }
 
@@ -60,13 +60,15 @@ class MapView @JvmOverloads constructor(
         /**
          * 缩放档位，**米 / dp**（相邻约 ×1.5）。乘 `density` 才是米 / 像素。
          *
-         * 140dp 的小窗在这张表上从「看到 2.8 m」一直到「看到 140 m」。
+         * 一头一尾就是放大 / 缩小的底线：140dp 的小窗从**约 0.25 m** 一直看到 **140 m**。
+         * 最里那几档是给「凑近看墙角 / 看轨迹拐弯」用的 —— 那里点云会很稀，那是稀疏地图的本相。
          */
-        private val ZOOM_M_PER_DP = floatArrayOf(
-            0.02f, 0.03f, 0.05f, 0.075f, 0.1f, 0.15f, 0.25f, 0.4f, 0.65f, 1.0f)
+        private val ZOOM_M_PER_DP = listOf(
+            0.0018f, 0.0027f, 0.004f, 0.006f, 0.009f, 0.013f, 0.02f, 0.03f,
+            0.05f, 0.075f, 0.1f, 0.15f, 0.25f, 0.4f, 0.65f, 1.0f)
 
-        /** 默认档：一屏约 14 m，室内正好。 */
-        private const val ZOOM_DEFAULT = 4
+        /** 默认档 = `0.1 m/dp`（一屏约 14 m，室内正好）。**从表里找**，免得改表时下标对不上。 */
+        private val ZOOM_DEFAULT = ZOOM_M_PER_DP.indexOf(0.1f)
 
         /** 切片厚度的范围（**全宽**，米）。抽屉里那个滑块。 */
         const val SLICE_MIN = 0.2f
@@ -108,8 +110,11 @@ class MapView @JvmOverloads constructor(
     private var zS = 0f
     private var zReady = false
 
-    /** 点云画布缓冲，复用。`2 × 上限`（每点两个屏幕坐标）。 */
-    private val cloudScratch = FloatArray(2 * 20000)
+    /**
+     * 点云画布缓冲（每点两个屏幕坐标），复用。**按需要长大** ——
+     * 上限在 C++ 那侧（`kMapPointsMax`），这儿不去写一个和它对着的魔法数字。
+     */
+    private var cloudScratch = FloatArray(0)
 
     // ---------------- 画笔 ----------------
 
@@ -219,12 +224,14 @@ class MapView @JvmOverloads constructor(
      */
     private fun drawCloud(canvas: Canvas, s: Snapshot) {
         if (s.ptsN <= 0) return
+        // 按这次的点数长，长过就不再缩 ⟹ 稳定之后零分配。装得下所有点，写的时候不用再判越界。
+        if (cloudScratch.size < s.ptsN * 2) cloudScratch = FloatArray(s.ptsN * 2)
+
         val lo = zS - sliceRange * 0.5f
         val hi = zS + sliceRange * 0.5f
 
         var cnt = 0
         for (i in 0 until s.ptsN) {
-            if (cnt * 2 + 2 > cloudScratch.size) break
             val z = s.pts[i * 3 + 2]
             if (z < lo || z > hi) continue
             worldToView(s.pts[i * 3], s.pts[i * 3 + 1], pt)

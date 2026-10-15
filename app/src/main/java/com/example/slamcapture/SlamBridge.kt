@@ -103,7 +103,7 @@ object SlamBridge {
      * 数据是 **SLAM 线程每秒重建一次的快照**，不是现读地图 —— 全图枚举要抱地图的锁，
      * 而那个锁 LocalMapping 每建一个点都要拿。这一侧只剩 memcpy。
      *
-     * 和 [nativeGetTrajectory] 一样是 **stride 抽稀**（全量上限 20000，装得下就不抽），
+     * 和 [nativeGetTrajectory] 一样是 **stride 抽稀**（全量上限 5000，装得下就不抽），
      * **同样别扩容取全**。
      */
     external fun nativeGetMapPoints(out: FloatArray): Int

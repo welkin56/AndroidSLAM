@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
          * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
          * 那边超了会 stride 抽稀，所以这一侧是**固定缓冲、别扩容**（和 `trajBuf` 同款契约）。
          */
-        private const val kMapPointsMax = 20000
+        private const val kMapPointsMax = 5000
 
         /** 厚度滑块的刻度数。`SeekBar` 只有整数，所以在 `0..100` 上线性映射到米。 */
         private const val kRangeSeekMax = 100
