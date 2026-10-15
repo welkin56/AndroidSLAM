@@ -69,6 +69,7 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 12 | `orb_slam3/include/Tracking.h` + `src/Tracking.cc` | 加一把 `mMutexTraj`，把往 `mlRelativeFramePoses` 那四张表 push 的地方罩住 | ⚠️ **不是上游的 bug，是我们多出来的用法**：上游只在 `Shutdown()` 之后读那四张表，所以不用锁；**我们要在跑的时候读** |
 | 13 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetFrameTrajectory()` / `GetFrameTrajectorySize()` —— 把上游那段 VBA 拼装从「写文件」改成「写进 buffer」 | 同上，配套 |
 | 14 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAllMapPoints()` —— 转发 `Atlas::GetAllMapPoints()`，直接返回 `std::vector<MapPoint*>`（**不做抽稀、不碰坐标**，那是显示策略） | ⚠️ **不是上游的 bug**：上游没有这个入口，只有逐帧的 `GetTrackedMapPoints()`。**且必须用 `Atlas::GetAllMapPoints()`** —— `Atlas::GetCurrentMap()` 在坏图窗口里 `while(IsBad()) usleep(3000)`，而且**锁是抱着睡的** |
+| 15 | `orb_slam3/src/Tracking.cc` | `GrabImageMonocular` 里，**一个特征点都没提出来的帧直接丢掉**（返回上一帧位姿，不调 `Track()`）| ⚠️ **上游 bug**：`Frame` 的图像 ctor 在「`mvKeys.empty()`」时**提前 return**，`mpMutexImu` 等成员从没赋过值 ⟹ 真机上 `PreintegrateIMU → setIntegrated()` 解引用未初始化的裸指针，**SIGSEGV 崩在 0x0**。详见 `docs/changes/2026-10-15-empty-frame-crash.md` |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

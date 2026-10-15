@@ -9,6 +9,16 @@ git 记的是「结果」，这里记的是「为什么」，以及**考虑过�
 
 ## 2026-10
 
+- [2026-10-15 真机崩溃：**0 个特征点的空帧**喂进了 `Track()`（上游 bug）](2026-10-15-empty-frame-crash.md)
+  —— 同一条栈崩了三次（`pthread_mutex_lock` fault addr 0x0）。
+  ⭐ 根因：`Frame` 的图像 ctor 在 `if(mvKeys.empty()) return;` **提前返回**，而
+  `mpMutexImu`（`Frame.h:323` 的**裸指针**）只在 ctor **末尾**才 `new` ⟹ 空帧那个指针是**栈垃圾** ✗
+  ⟹ `PreintegrateIMU → setIntegrated() → *mpMutexImu` 崩。
+  **改调用方**：`GrabImageMonocular` 里 `N == 0` 就丢掉（不喂 `Track()`）——
+  比补四条 ctor 强：那四个 ctor 里早退漏掉的**不止这一个成员** ✗
+  **否决**：给 `setIntegrated()` 加判空（静默跳过 ✗）。
+  ⚠️ 上游第 **15** 条补丁。⚠️ **真机未验证**；另猜测它可能也解释「重置次数变多」（未验证）。
+
 - [2026-10-15 上机遗留：缩放档位 / 重置后轨迹不清 / 点云上限 / 按住连发](2026-10-15-map-zoom-ladder-and-reset-clears-trajectory.md)
   —— 档位从 10 档补到 **16 档**，一头一尾是**一屏 0.25 m 到 140 m**；
   `ZOOM_DEFAULT` 改成从表里 `indexOf`（写死下标的话，改表时会悄悄指到别的档位 ✗）。

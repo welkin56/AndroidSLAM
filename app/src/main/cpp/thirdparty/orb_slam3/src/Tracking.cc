@@ -1608,6 +1608,14 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
     vdORBExtract_ms.push_back(mCurrentFrame.mTimeORB_Ext);
 #endif
 
+    // add：0 个特征点的帧，上游的 `Frame` ctor 会提前 return、一堆成员没赋上值
+    //（`mpMutexImu` 是裸指针 ⟹ `PreintegrateIMU` 崩在 0x0）。丢掉；返回**上一帧**的位姿，它自己的 pose 也是垃圾。
+    if(mCurrentFrame.N == 0)
+    {
+        Verbose::PrintMess("Empty frame (0 keypoints), skipped", Verbose::VERBOSITY_NORMAL);
+        return mLastFrame.GetPose();
+    }
+
     lastID = mCurrentFrame.mnId;
     Track();
 
