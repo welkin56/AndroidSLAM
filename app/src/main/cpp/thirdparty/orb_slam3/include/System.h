@@ -138,6 +138,14 @@ public:
     // 所以 KF 数掉到 0 是「重置过」唯一的外部信号。
     unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }
 
+    // add:当前图的**全部地图点**（`Atlas::GetAllMapPoints()` 的转发）。给 2D 地图的
+    // 点云快照用；`isBad()` 的过滤、抽稀、取坐标都在调用方做。
+    //
+    //  **只能从 tracking 线程调** —— 它直接读 `mpCurrentMap`，而唯一会读到失效指针的
+    //    窗口在 `Tracking::Reset()` 里（`clearAtlas()` 和 `CreateNewMap()` 之间），
+    //    那也正是跑在 tracking 线程上的。
+    std::vector<MapPoint*> GetAllMapPoints();
+
     /**
      * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
      *

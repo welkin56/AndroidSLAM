@@ -68,6 +68,7 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 11 | `orb_slam3/src/Optimizer.cc` | `InertialOptimization(...)`（多参数那个重载）里检测到 `!mpImuPreintegrated` 之后**补了 `continue`** | 同上 —— **上游 bug，和第 10 条同源** |
 | 12 | `orb_slam3/include/Tracking.h` + `src/Tracking.cc` | 加一把 `mMutexTraj`，把往 `mlRelativeFramePoses` 那四张表 push 的地方罩住 | ⚠️ **不是上游的 bug，是我们多出来的用法**：上游只在 `Shutdown()` 之后读那四张表，所以不用锁；**我们要在跑的时候读** |
 | 13 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetFrameTrajectory()` / `GetFrameTrajectorySize()` —— 把上游那段 VBA 拼装从「写文件」改成「写进 buffer」 | 同上，配套 |
+| 14 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAllMapPoints()` —— 转发 `Atlas::GetAllMapPoints()`，直接返回 `std::vector<MapPoint*>`（**不做抽稀、不碰坐标**，那是显示策略） | ⚠️ **不是上游的 bug**：上游没有这个入口，只有逐帧的 `GetTrackedMapPoints()`。**且必须用 `Atlas::GetAllMapPoints()`** —— `Atlas::GetCurrentMap()` 在坏图窗口里 `while(IsBad()) usleep(3000)`，而且**锁是抱着睡的** |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

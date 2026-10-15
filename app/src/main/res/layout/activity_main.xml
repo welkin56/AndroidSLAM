@@ -50,7 +50,8 @@
 
         <!-- 画面 + 右上角的 2D 地图小窗。
              ⚠️ 小窗**浮在预览上面**（画中画），所以预览得包进 FrameLayout。
-             小窗不接管触摸（View 默认 onTouchEvent 返回 false）⟹ 点它等于点预览。 -->
+             `mapWrap` 自己不接管触摸，`MapView` 也不 ⟹ 点小窗空白处等于点预览。
+             只有那两个缩放键消费自己的触摸 —— 所以它们是**真 Button**，不是画布上自绘的。 -->
         <FrameLayout
             android:id="@+id/previewWrap"
             android:layout_width="match_parent"
@@ -63,12 +64,53 @@
                 android:layout_height="match_parent"
                 android:background="#000000" />
 
-            <com.example.slamcapture.MapView
-                android:id="@+id/mapView"
+            <FrameLayout
+                android:id="@+id/mapWrap"
                 android:layout_width="140dp"
                 android:layout_height="140dp"
                 android:layout_gravity="top|end"
-                android:layout_margin="8dp" />
+                android:layout_margin="8dp">
+
+                <com.example.slamcapture.MapView
+                    android:id="@+id/mapView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="bottom|end"
+                    android:layout_margin="3dp"
+                    android:orientation="horizontal">
+
+                    <Button
+                        android:id="@+id/btnMapZoomOut"
+                        android:layout_width="34dp"
+                        android:layout_height="30dp"
+                        android:layout_marginEnd="3dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        android:text="−"
+                        android:textColor="@color/measure_button_text"
+                        android:textSize="16sp" />
+
+                    <Button
+                        android:id="@+id/btnMapZoomIn"
+                        android:layout_width="34dp"
+                        android:layout_height="30dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        android:text="+"
+                        android:textColor="@color/measure_button_text"
+                        android:textSize="16sp" />
+                </LinearLayout>
+            </FrameLayout>
         </FrameLayout>
 
         <!-- 多点折线测距。**绑死在「实时测距」开关上** —— 关着就 GONE。
@@ -190,6 +232,29 @@
             android:layout_height="wrap_content"
             android:text="实时测距"
             android:textColor="#DE000000" />
+
+        <!-- 小地图（右上角那个 2D 画中画）。关掉时 SLAM 线程连点云快照都不重建 ——
+             那次枚举抱着地图的锁，藏起来时白付不起。同样记在 SharedPreferences 里。 -->
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swMap"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="小地图"
+            android:textColor="#DE000000" />
+
+        <!-- 小地图上那层点云的**高度切片厚度**（全宽，米）。
+             它是设置（调一次就不动）⟹ 放抽屉；比例是随时要拧的视图 ⟹ 留在小窗角上。 -->
+        <TextView
+            android:id="@+id/tvMapRange"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="#DE000000" />
+
+        <SeekBar
+            android:id="@+id/sbMapRange"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
 
         <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->
         <Button

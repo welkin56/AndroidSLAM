@@ -69,6 +69,12 @@ constexpr long long kMeasureStuckMs = 5000;
 /** 导给 2D 地图的轨迹点数上限。画面上只有 140dp，再多也看不出来。 */
 constexpr int kTrajExportMax = 512;
 
+/** 点云快照的点数上限。室内规模装得下就**不抽稀**，超了才按这个台阶抽。 */
+constexpr int kMapPointsMax = 5000;
+
+/** 点云快照的重建间隔。地图点增得很慢，一秒一次足够。 */
+constexpr long long kMapSnapMs = 1000;
+
 // SLAM 线程的栈大小。**不能省**：`sizeof(Frame)` 是 146 KB，而
 // `Tracking::GrabImageMonocular` 里 `mCurrentFrame = Frame(...)` 是**栈上的临时对象**。
 // PC 上跑 `mono_inertial_euroc` 用的是主线程（8 MB），Android 的 `std::thread` 只给 1 MB。
@@ -117,6 +123,16 @@ struct Engine {
     /** 拉上游那份轨迹的中转缓冲（8 个 float/点，上游的格式）。只在主线程碰。 */
     std::mutex trajMutex;
     std::vector<float> trajFull;
+
+    /** 地图点云快照（3 个 float/点，世界米）。SLAM 线程重建、主线程读。 */
+    std::mutex mapSnapMutex;
+    std::vector<float> mapSnap;
+    /** 重建时的暂存。和 `mapSnap` 换一下就把上一份回收成下一次的缓冲（零分配）。**只在 SLAM 线程碰。** */
+    std::vector<float> mapBuild;
+    /** 上次重建的时刻。**主线程要能在重开/重启时归零 ⟹ atomic。** */
+    std::atomic<long long> mapSnapAtMs{0};
+    /** 抽屉里那个「小地图」开关。关掉时 SLAM 线程整个不重建。 */
+    std::atomic<bool> mapCloudOn{true};
 
     /** 抽屉里那个「实时测距」开关。只影响算不算，不影响 SLAM。 */
     std::atomic<bool> measuring{false};
@@ -207,6 +223,47 @@ void savePose(Engine& e, const TrackResult& r) {
     e.poseValid = true;
 }
 
+/**
+ * 重建点云快照（**SLAM 线程**）：枚举全图 → 抽稀 → 取坐标。
+ */
+void rebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
+    std::vector<ORB_SLAM3::MapPoint*> pts = sys->GetAllMapPoints();
+
+    // 用持久缓冲建、建完和 `mapSnap` 对换 ⟹ 上一份回收成下一次的缓冲，稳定后零分配。
+    std::vector<float>& out = e.mapBuild;
+    out.clear();
+    const size_t n = pts.size();
+    if (n > 0) {
+        const size_t stride = std::max<size_t>(1, (n + kMapPointsMax - 1) / kMapPointsMax);
+        out.reserve(std::min<size_t>(n / stride + 1, kMapPointsMax) * 3);
+        // 只碰**抽中的**那些 ⟹ 单点访问量（两次加锁 + 一次取坐标）与地图大小无关。
+        for (size_t i = 0; i < n; i += stride) {
+            ORB_SLAM3::MapPoint* p = pts[i];
+            if (p == nullptr || p->isBad()) continue;
+            const Eigen::Vector3f w = p->GetWorldPos();
+            out.push_back(w.x());
+            out.push_back(w.y());
+            out.push_back(w.z());
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(e.mapSnapMutex);
+    e.mapSnap.swap(out);
+}
+
+/** 到点了才重建（**SLAM 线程**）。**有帧等着就推迟** —— 别让一次枚举停在 LocalMapping 前面。 */
+void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
+    if (!e.running.load() || !e.mapCloudOn.load()) return;
+    const long long now = nowMs();
+    if (now - e.mapSnapAtMs.load() < kMapSnapMs) return;
+    {
+        std::lock_guard<std::mutex> lk(e.qMutex);
+        if (!e.frames.empty()) return;
+    }
+    e.mapSnapAtMs.store(now);
+    rebuildMapSnap(e, sys);
+}
+
 // 常驻循环：先构造，然后一直取帧、跟踪、存位姿。M4 那版是「构造完就退出」。
 void worker(Engine& e) {
     construct(e);
@@ -220,13 +277,21 @@ void worker(Engine& e) {
 
     for (;;) {
         Frame f;
+        bool idle = false;
         {
             std::unique_lock<std::mutex> lk(e.qMutex);
             e.qCv.wait_for(lk, std::chrono::milliseconds(kWaitMs),
                            [&] { return !e.frames.empty(); });
-            if (e.frames.empty()) continue;   // 超时：回头看看还有没有别的事
-            f = std::move(e.frames.front());
-            e.frames.pop_front();
+            if (e.frames.empty()) {
+                idle = true;   // 超时：队列空着（⚠️ 别在锁内调重建 —— 它要拿 qMutex）
+            } else {
+                f = std::move(e.frames.front());
+                e.frames.pop_front();
+            }
+        }
+        if (idle) {
+            maybeRebuildMapSnap(e, sys);
+            continue;
         }
 
         // 停止期间不吃帧。队列由 stop() 清空，所以这里直接丢掉也不会吃到旧帧。
@@ -280,11 +345,17 @@ void worker(Engine& e) {
         if (r.kfCount == 0) {
             if (sawKfs) {
                 sawKfs = false;
-                // 轨迹不用清：上游那张表里，重置之前那些帧的参考关键帧在**旧图**上，
-                // 读的时候会被「跨图」那条判据自动滤掉。
+                //（一次运行 = 一份轨迹，和 `start()` 同一个语义）。
+                sys->ClearFrameTrajectory();
                 const int n = e.resetCount.fetch_add(1) + 1;
                 printf("[M5] 地图被重置（第 %d 次）\n", n);
                 fflush(stdout);
+                // 点云同理：它是「当前那张图」的快照，没有跨图判据。
+                {
+                    std::lock_guard<std::mutex> lk(e.mapSnapMutex);
+                    e.mapSnap.clear();
+                }
+                e.mapSnapAtMs.store(0);   // 下一个空隙立刻重建
             }
         } else {
             sawKfs = true;
@@ -292,6 +363,11 @@ void worker(Engine& e) {
 
         // `r.valid` 只在跟踪状态是 OK 时为 true（见 orb_track.cpp）。
         if (r.valid) savePose(e, r);
+
+        // 刚处理完一帧、队列大概又空了 —— 同一个帧间空隙。
+        // ⚠️ 必须在这儿也调一次：30fps 下 `wait_for` 的谓词每次都立刻为真，
+        //    上面那个超时分支**根本不执行**。
+        maybeRebuildMapSnap(e, sys);
     }
 }
 
@@ -374,6 +450,12 @@ void start() {
     Engine& e = engine();
     // 一次运行 = 一份轨迹。上游那张表从不清理，不清的话会跨 run 累加。
     if (ORB_SLAM3::System* sys = e.sys.load()) sys->ClearFrameTrajectory();
+    {
+        // 点云同理：上一趟的快照不能留到这一趟。
+        std::lock_guard<std::mutex> lk(e.mapSnapMutex);
+        e.mapSnap.clear();
+    }
+    e.mapSnapAtMs.store(0);   // 这一趟的第一个空隙就重建
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         e.poseValid = false;
@@ -737,6 +819,24 @@ int getTrajectory(float* out, int cap) {
         out[3 * i + 2] = e.trajFull[8 * i + 3];
     }
     return n;
+}
+
+int getMapPoints(float* out, int cap) {
+    if (out == nullptr || cap < 3) return 0;
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.mapSnapMutex);
+    const int n = std::min(static_cast<int>(e.mapSnap.size() / 3), cap / 3);
+    if (n <= 0) return 0;
+    std::memcpy(out, e.mapSnap.data(), sizeof(float) * 3 * static_cast<size_t>(n));
+    return n;
+}
+
+void setMapCloudEnabled(bool on) {
+    Engine& e = engine();
+    if (e.mapCloudOn.exchange(on) == on) return;   // 没变过，什么也不用做
+    if (on) e.mapSnapAtMs.store(0);                // 重开：下一个空隙立刻重建，不等满 1 s
+    printf("[MAP] 点云快照%s\n", on ? "启用" : "停用");
+    fflush(stdout);
 }
 
 void dumpTrajectory(const std::string& path) {

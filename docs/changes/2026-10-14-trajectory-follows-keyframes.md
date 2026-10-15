@@ -194,3 +194,18 @@ thirdparty/orb_slam3/{include/Tracking.h, src/Tracking.cc}
 thirdparty/orb_slam3/{include/System.h, src/System.cc}
 app/src/main/cpp/slam_engine.cpp
 ```
+
+---
+
+📌 **更正（2026-10-14，里程碑 B 上机后）—— 决策五那条「不用自己清轨迹」是错的。**
+
+原文写：「重置之后老帧的参考帧在旧图上 ⟹ **自动被滤掉** ⟹ 我们不用自己清轨迹 ✓」，
+并据此删掉了 reset 分支里的 `traj.clear()`。
+
+**那个「自动」只在「重置会换一张 Map 对象」这条路上成立** —— 也就是
+`Tracking::Reset()`（`clearAtlas()` + `CreateNewMap()`）。而真机上轨迹**没清** ⟹
+走的是 `Tracking::ResetActiveMap()` → `mpAtlas->clearMap()`：**原地清空同一张 Map**，
+老帧的参考帧 `GetMap()` 还等于当前图 ⟹ **跨图判据根本看不见它** ✗
+
+**修法**：`r.kfCount == 0` 那个分支里**显式**调 `sys->ClearFrameTrajectory()`
+（两条路都盖住）。详见 `2026-10-14-map-pip-milestone-b-pointcloud.md` 的「遗留·甲」。

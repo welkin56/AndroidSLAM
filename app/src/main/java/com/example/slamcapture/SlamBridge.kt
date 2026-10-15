@@ -98,6 +98,23 @@ object SlamBridge {
     external fun nativeGetTrajectory(out: FloatArray): Int
 
     /**
+     * 2D 地图要的点云：`out` 收 `3n` 个 float（世界米，`x y z`），返回点数。
+     *
+     * 数据是 **SLAM 线程每秒重建一次的快照**，不是现读地图 —— 全图枚举要抱地图的锁，
+     * 而那个锁 LocalMapping 每建一个点都要拿。这一侧只剩 memcpy。
+     *
+     * 和 [nativeGetTrajectory] 一样是 **stride 抽稀**（全量上限 5000，装得下就不抽），
+     * **同样别扩容取全**。
+     */
+    external fun nativeGetMapPoints(out: FloatArray): Int
+
+    /**
+     * 抽屉里那个「小地图」开关。关掉时 SLAM 线程连快照都不重建（那次枚举抱着地图的锁）；
+     * 重开时下一个帧间空隙立刻重建。
+     */
+    external fun nativeSetMapCloudEnabled(on: Boolean)
+
+    /**
      * 把这一趟的位姿历史写成文件（TUM 格式，和 PC 的 `CameraTrajectory.txt` 同款）。
      * **一次运行一份** —— [nativeStart] 会把上一趟的清掉。
      */

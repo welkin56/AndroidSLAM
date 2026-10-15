@@ -194,6 +194,33 @@ Java_com_example_slamcapture_SlamBridge_nativeGetTrajectory(JNIEnv* env, jobject
     }
 }
 
+// 2D 地图的点云：`out` 收 `3n` 个 float（世界米 xyz），返回点数。
+// 和 `nativeGetTrajectory` 一样是**抽稀**契约 —— 固定缓冲，别扩容取全。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetMapPoints(JNIEnv* env, jobject /*thiz*/,
+                                                           jfloatArray out) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;   // OOM
+        const int n = slam::getMapPoints(p, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, p, 0);   // 写回
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 抽屉里那个「小地图」开关。关掉时 SLAM 线程连点云快照都不重建 ——
+// 那次枚举抱着 `Map::mMutexMap`，藏起来时白付不起。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeSetMapCloudEnabled(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                                 jboolean on) {
+    try {
+        slam::setMapCloudEnabled(on == JNI_TRUE);
+    } catch (...) {
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
                                                              jstring path) {

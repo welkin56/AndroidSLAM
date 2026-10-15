@@ -127,6 +127,25 @@ void closePinnedChain();
  */
 int getPinned(float* out, int cap);
 
+// ---------------- 2D 地图的点云 ----------------
+
+/**
+ * 读一次地图点云快照（**主线程调**）。`out` 收 `3n` 个 float（世界米 `x y z`），返回点数。
+ *
+ * 数据是 **SLAM 线程每秒重建一次的快照**，不是现读地图 —— 全图枚举要抱 `Map::mMutexMap`，
+ * 而那个锁 LocalMapping 每建一个点都要拿。留给这一侧的只有 memcpy ✓
+ *
+ * **stride 抽稀，不是截断**（全量上限 5000，装得下就不抽）。和 [getTrajectory]
+ * 同一个契约：**别学 `readPinned` 扩容取全**（那个要的是精度，正好相反）。
+ */
+int getMapPoints(float* out, int cap);
+
+/**
+ * 开不开点云快照（**主线程调**，抽屉里那个开关）。关掉时 SLAM 线程整个不重建 ——
+ * 重建那几毫秒**抱着 `mMutexMap`**，藏起来时白付不起。重开时下一个空隙立刻重建 ✓
+ */
+void setMapCloudEnabled(bool on);
+
 // ---------------- 轨迹 ----------------
 
 /**
