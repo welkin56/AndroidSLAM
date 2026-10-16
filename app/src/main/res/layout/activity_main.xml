@@ -256,15 +256,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
-        <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->
-        <Button
-            android:id="@+id/btnSaveMap"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:enabled="false"
-            android:text="保存地图（M8）"
-            android:textColor="#DE000000" />
     </LinearLayout>
 
 </androidx.drawerlayout.widget.DrawerLayout>

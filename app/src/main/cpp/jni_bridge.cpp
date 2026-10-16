@@ -221,6 +221,55 @@ Java_com_example_slamcapture_SlamBridge_nativeSetMapCloudEnabled(JNIEnv* /*env*/
     }
 }
 
+// 存图：**只发请求**。真正的序列化在 SLAM 线程上做（几秒，会把主线程卡死）。
+// `path` 不含 `.osa` 后缀，上游自己加。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRequestSaveMap(JNIEnv* env, jobject /*thiz*/,
+                                                             jstring path) {
+    try {
+        slam::requestSaveMap(toStdString(env, path));
+    } catch (...) {
+    }
+}
+
+// 保存状态：0 空闲 / 1 排队 / 2 保存中 / 3 完成 / 4 失败。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeSaveState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::saveState();
+    } catch (...) {
+        return 0;
+    }
+}
+
+// atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeAtlasStats(JNIEnv* env, jobject /*thiz*/,
+                                                         jintArray out) {
+    try {
+        if (env->GetArrayLength(out) < 3) return;
+        jint* p = env->GetIntArrayElements(out, nullptr);
+        if (p == nullptr) return;
+        int v[3] = {0, 0, 0};
+        slam::atlasStats(v);
+        p[0] = v[0];
+        p[1] = v[1];
+        p[2] = v[2];
+        env->ReleaseIntArrayElements(out, p, 0);
+    } catch (...) {
+    }
+}
+
+// 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。给界面说清是哪一种。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeFailureCode(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::failureCode();
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
                                                              jstring path) {

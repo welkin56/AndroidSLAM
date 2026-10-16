@@ -147,6 +147,17 @@ public:
     std::vector<MapPoint*> GetAllMapPoints();
 
     /**
+     * add:把当前 atlas **另存到** `<path>.osa`（`path` **不含**扩展名）。
+     *
+     * 不跟 `LoadAtlas` 一样走 yaml：yaml 是构造时读一次就定死的，而文件名要现取。
+     * 只在 SLAM 停止之后调 —— 它序列化整张 atlas。
+     */
+    void SaveAtlasTo(const std::string& path);
+
+    /** add：atlas 里现在有几张图 / 一共多少关键帧 / 多少地图点。给界面显示用。 */
+    void GetAtlasStats(int* maps, int* kfs, int* mps);
+
+    /**
      * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
      *
      * `cap` = `out` 能装多少 float ⟹ 最多写 `cap/8` 个点。

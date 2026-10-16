@@ -22,6 +22,7 @@
 #include "Converter.h"
 #include <thread>
 #include <iomanip>
+#include <stdexcept>
 #include "md5.h"
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/string.hpp>
@@ -158,7 +159,8 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
         if(!isRead)
         {
             cout << "Error to load the file, please try with other session file or vocabulary file" << endl;
-            exit(-1);
+            // 上游是 exit(-1)：在安卓上就是 App 直接没了、不给任何提示。抛出去让调用方接。
+            throw std::runtime_error("LoadAtlas failed: " + mStrLoadAtlasFromFile + ".osa");
         }
         //mpKeyFrameDatabase = new KeyFrameDatabase(*mpVocabulary);
 
@@ -896,6 +898,45 @@ std::vector<MapPoint*> System::GetAllMapPoints()
     return mpAtlas->GetAllMapPoints();
 }
 
+void System::SaveAtlasTo(const std::string& path)
+{
+    // 文件名现取：塞进那个成员再走上游那条路（SaveAtlas 只认成员，不带路径参数）。
+    mStrSaveAtlasToFile = path;
+
+    // 先停 LocalMapping：它正在建点的话，序列化会读到半张图。停不动就别死等，直接存。
+    if (mpLocalMapper != nullptr)
+    {
+        mpLocalMapper->RequestStop();
+        for (int i = 0; i < 200 && !mpLocalMapper->Stop(); ++i)
+            usleep(1000);
+    }
+
+    SaveAtlas(FileType::BINARY_FILE);
+
+    if (mpLocalMapper != nullptr)
+        mpLocalMapper->Release();
+}
+
+void System::GetAtlasStats(int* maps, int* kfs, int* mps)
+{
+    *maps = 0;
+    *kfs = 0;
+    *mps = 0;
+    if (mpAtlas == nullptr)
+        return;
+
+    // `GetAllMaps()` 拿 `mMutexAtlas`、`KeyFramesInMap()`/`MapPointsInMap()` 拿 `mMutexMap`
+    // ⟹ 从任意线程调都安全（不碰 `mpCurrentMap`，所以也不会撞上 `GetCurrentMap()` 那个睡眠）。
+    for (Map* pMap : mpAtlas->GetAllMaps())
+    {
+        if (pMap == nullptr)
+            continue;
+        (*maps)++;
+        *kfs += static_cast<int>(pMap->KeyFramesInMap());
+        *mps += static_cast<int>(pMap->MapPointsInMap());
+    }
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 
@@ -1528,9 +1569,8 @@ void System::SaveAtlas(int type){
         // Save the current session
         mpAtlas->PreSave();
 
-        string pathSaveFileName = "./";
-        pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);
-        pathSaveFileName = pathSaveFileName.append(".osa");
+        // 上游这里硬拼了 "./" 前缀，会把绝对路径变成相对的（安卓的 CWD 是 `/`，不可写）。
+        string pathSaveFileName = mStrSaveAtlasToFile + ".osa";
 
         string strVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
         std::size_t found = mStrVocabularyFilePath.find_last_of("/\\");
@@ -1567,9 +1607,8 @@ bool System::LoadAtlas(int type)
     string strFileVoc, strVocChecksum;
     bool isRead = false;
 
-    string pathLoadFileName = "./";
-    pathLoadFileName = pathLoadFileName.append(mStrLoadAtlasFromFile);
-    pathLoadFileName = pathLoadFileName.append(".osa");
+    // 同 SaveAtlas：那个 "./" 前缀会把绝对路径变成相对的。
+    string pathLoadFileName = mStrLoadAtlasFromFile + ".osa";
 
     if(type == TEXT_FILE) // File text
     {
