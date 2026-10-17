@@ -435,3 +435,40 @@ app/src/main/res/layout/activity_main.xml                    ← 只是注释
 
 ⚠️ 只回滚 Kotlin 不回滚 C++ 的话，`SlamBridge.kt` 里那五个 `external fun`
 找不到实现，**类加载时 `UnsatisfiedLinkError`** —— 两层一起回。
+
+---
+
+## 追加（2026-10-17）：主干上把按钮删掉
+
+### 动机
+
+代码存档了，但 `dev` 上还留着一个**永远灰着的「重定位」按钮**（`btnReloc`，
+`isEnabled=false`、`onClick` 空函数）。它表达的是一个已经不打算做的功能 ——
+界面上不该留这种「看起来像坏了」的东西。
+
+### 改动
+
+- `res/layout/activity_main.xml` —— 删掉 `btnReloc`；`btnSlam` 从
+  `layout_weight=1` 改成 `match_parent`（不然会留半行空白）。
+- `MainActivity.kt` —— 删掉字段、`findViewById`、空的 `setOnClickListener`、
+  `render()` 里那句 `isEnabled = false`。共 8 行。
+- `docs/tutorial/APP_DESIGN.md` §2 的按钮表去掉「底部右」一行，加一句归档说明；
+  §2.4 保留为设计记录（那是「为什么不要重定位」的来路）。
+
+### 验证
+
+未验证（只编译层面的删除，没装机——这次连 APK 都没重新打）。
+
+### 遗留
+
+- `SlamBridge.kt` 里没有和重定位相关的声明（那些都在分支上），所以这次是纯 UI 删除，
+  **不会**有 `UnsatisfiedLinkError`。
+- `APP_DESIGN.md` §2.4 / §3 / §4 仍然按「有重定位按钮」在写。整篇改口径要等
+  「地图生命周期」那批做完一起动，现在只在 §2 打了归档标记。
+
+### 回滚
+
+```
+git revert <这次提交>
+```
+只有三个文件，没有 C++ / JNI 参与。

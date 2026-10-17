@@ -128,7 +128,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var btnSlam: Button
-    private lateinit var btnReloc: Button
     private lateinit var swRecord: SwitchCompat
     private lateinit var swMeasure: SwitchCompat
     private lateinit var tvStatus: TextView
@@ -287,7 +286,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         btnSlam = findViewById(R.id.btnSlam)
-        btnReloc = findViewById(R.id.btnReloc)
         swRecord = findViewById(R.id.swRecord)
         swMeasure = findViewById(R.id.swMeasure)
         tvStatus = findViewById(R.id.tvStatus)
@@ -387,9 +385,6 @@ class MainActivity : AppCompatActivity() {
 
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
-
-        // 「重定位」现在点不动（恒灰）。判据是「有没有旧图」（§2.4），还没做。
-        btnReloc.setOnClickListener { }
 
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
@@ -891,9 +886,6 @@ class MainActivity : AppCompatActivity() {
         btnSlam.backgroundTintList =
             if (slamRunning) ColorStateList.valueOf(RED) else null
         btnSlam.setTextColor(if (slamRunning) Color.WHITE else DARK_TEXT)
-
-        // 「重定位」的灰 / 亮只看有没有旧图（§2.4）。还没有 referenceMap，所以恒灰。
-        btnReloc.isEnabled = false
 
         // 两个开关都**一直可点** —— 它们表达的是「这一段要不要录 / 要不要量」，
         // 所以启动之前就得能设。
