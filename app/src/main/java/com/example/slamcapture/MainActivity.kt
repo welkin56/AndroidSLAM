@@ -194,6 +194,23 @@ class MainActivity : AppCompatActivity() {
     /** 正在存图。**ticker 靠它才继续跑** —— 存图发生在刚停止之后，那时它本来要停了。 */
     private var saving = false
 
+    /**
+     * 正在把 atlas 恢复成「上一次保存」的样子。
+     *
+     * 恢复期间**不读 atlas / 轨迹** —— C++ 那头正在重建它们，`Atlas::PostLoad()` 没有锁。
+     * ticker 也靠它继续跑：要轮询到「完成」才能把按钮放开。
+     */
+    private var restoring = false
+
+    /** 上一次看到的恢复状态。只在它变化时改 [restoreMsg]（否则每帧都重写同一句）。 */
+    private var restoreStateSeen = 0
+
+    /** 恢复那行字。 */
+    private var restoreMsg: String? = null
+
+    /** 最近一次请求是「入口页换源」而不是「这一趟没保存」。只影响提示语。 */
+    private var atlasSwitching = false
+
     /** 这一次「启动 SLAM → 结束」的子目录 `<会话>/run-N/`。**它才是坐标系单元**。 */
     private var curRunDir: File? = null
 
@@ -395,7 +412,23 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 这一句还是**第一次碰 `SlamBridge`** —— `.so` 在此刻加载，`JNI_OnLoad`
         // 顺带装上日志重定向（ORB-SLAM3 的 cout/cerr 全靠它）。别把它排到后面去。
         slamState = SlamBridge.nativeState()
-        if (slamState == SLAM_LOADING) uiQueueTicker()
+
+        // `System` 是进程级的：已经造好的话，入口页这次的选择必须**手动生效** ——
+        // `nativeInit` 不会再跑一遍。不换的话「新建地图」只是又开一张当前图，
+        // 旧 atlas 原样留着（回环检测照样能匹配到它）；「换一张图」同理。
+        var atlasSwitch = false
+        if (slamState == SLAM_READY || slamState == SLAM_LOADING) {
+            val want = mapFile?.removeSuffix(".osa") ?: ""
+            val have = SlamBridge.nativeLoadedMap()
+            if (want != have) {
+                Log.i(TAG, "atlas 换源：$have → $want")
+                atlasSwitching = true
+                SlamBridge.nativeRequestLoadAtlas(want)
+                atlasSwitch = true
+            }
+        }
+
+        if (slamState == SLAM_LOADING || atlasSwitch) uiQueueTicker()
 
         render()
     }
@@ -685,7 +718,7 @@ class MainActivity : AppCompatActivity() {
             // **最后一轮刷新被自己吃掉了。**
             render()
 
-            if (slamState == SLAM_LOADING || slamRunning || saving) {
+            if (slamState == SLAM_LOADING || slamRunning || saving || restoring) {
                 uiHandler.postDelayed(this, TICK_MS)
             }
         }
@@ -872,15 +905,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render() {
+        // ---- atlas 恢复 ----
+        // 只在这一侧轮询：C++ 那边在 SLAM 线程上重建 atlas，主线程问不得。
+        val rs = SlamBridge.nativeRestoreState()
+        restoring = rs == 1 || rs == 2
+        if (rs != restoreStateSeen) {
+            restoreStateSeen = rs
+            restoreMsg = when (rs) {
+                1, 2 -> "正在载入地图…"
+                3 -> if (atlasSwitching) "地图已切换" else "已丢弃这一趟：地图退回上一次保存"
+                4 -> "载入地图失败（看 logcat 的 slam）—— 内存里现在是一张空图"
+                else -> restoreMsg
+            }
+        }
+
         // ---- 按钮 ----
         // 三个标签对应三个阶段。**加载中和构造失败都不可点** —— 前者没法取消，后者重试也没用
-        // （C++ 那边的 `init` 只生效一次）。
-        btnSlam.isEnabled = slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY
+        // （C++ 那边的 `init` 只生效一次）。恢复期间也不可点：atlas 正在换。
+        btnSlam.isEnabled =
+            (slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY) && !restoring
         btnSlam.text = when {
-            slamRunning -> "结束"
+            // 加载中 / 构造失败优先：换源请求这会儿还没轮到（失败的话永远不会轮到）。
             slamState == SLAM_LOADING -> "加载中…"
-            slamState == SLAM_READY -> "启动 SLAM"
             slamState == SLAM_FAILED -> "构造失败"
+            restoring -> "载入地图…"
+            slamRunning -> "结束"
+            slamState == SLAM_READY -> "启动 SLAM"
             else -> "准备 SLAM"
         }
         btnSlam.backgroundTintList =
@@ -964,18 +1014,22 @@ class MainActivity : AppCompatActivity() {
             }
             // 地图账。载图之后这是界面上唯一看得出「图进来了」的地方 ——
             // 载进来的图不是当前图，小窗、轨迹、测距都看不到它。
-            if (slamState == SLAM_READY) {
+            // ⚠️ 恢复期间不读：`Atlas::PostLoad()` 在重建整个 atlas，它没拿锁。
+            if (slamState == SLAM_READY && !restoring) {
                 SlamBridge.nativeAtlasStats(atlasBuf)
                 if (isNotEmpty()) append("\n")
                 append("地图 ${atlasBuf[0]} 张 / 关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}")
             }
+            // 词袋加载期间那条「正在载入地图…」只是排队，别和加载进度叠在一起。
+            if (slamState != SLAM_LOADING) restoreMsg?.let { append("\n$it") }
             saveMsg?.let { append("\n$it") }
             lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
         tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
-        refreshMap()
+        // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
+        if (!restoring) refreshMap()
     }
 
     // ---------------- 2D 地图小窗 ----------------
@@ -1287,21 +1341,39 @@ class MainActivity : AppCompatActivity() {
                 }
             )
             .setView(copyRec)
+        // 用户到底选没选「存」。三个肯定按钮都要置 true ——
+        // 只有「不保存」和直接关掉（返回键 / 点外面）才该丢图。
+        var willSave = false
         if (existing != null) {
             b.setPositiveButton("覆盖") { _, _ ->
+                willSave = true
                 startMapSave(existing.absolutePath.removeSuffix(".osa"))
             }
-                .setNeutralButton("另存为") { _, _ -> saveMapAs(copyRec.isChecked) }
+                .setNeutralButton("另存为") { _, _ ->
+                    willSave = true
+                    saveMapAs(copyRec.isChecked)
+                }
                 .setNegativeButton("不保存", null)
         } else {
             b.setPositiveButton("保存") { _, _ ->
+                willSave = true
                 startMapSave(File(dir, stamp()).absolutePath)
             }
                 .setNegativeButton("不保存", null)
         }
         val dlg = b.create()
         // 挂在「弹窗消失」上：两个轴互不影响，问完接着问轨迹。
-        dlg.setOnDismissListener { askKeepRun(runDir) }
+        dlg.setOnDismissListener {
+            if (!willSave) {
+                // 这一趟不要了：把 atlas 退回上一次保存的样子。
+                // 不退回的话，这趟建的图会一直留在内存里，下一趟的回环检测还能匹配到它。
+                Log.i(TAG, "这一趟不存图 → 请求恢复 atlas")
+                atlasSwitching = false
+                SlamBridge.nativeRequestRestoreMap()
+                uiQueueTicker()   // 恢复的进度和结果要靠 ticker 刷
+            }
+            askKeepRun(runDir)
+        }
         dlg.show()
     }
 

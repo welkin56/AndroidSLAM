@@ -155,6 +155,19 @@ void requestRestoreMap();
 int restoreState();
 
 /**
+ * 把 atlas **换成** `path` 指向的那张（**主线程调**）。空串 = 清成一张空图。
+ *
+ * 入口页每次重新选（新建地图 / 换一张图）时调：`System` 只能构造一次，不换它会变成
+ * 「又开一张当前图，旧 atlas 原样留着」。成功之后这个路径成为新的「恢复」基准。
+ *
+ * 和 [requestRestoreMap] 共用一条队列和同一个 [restoreState]。
+ */
+void requestLoadAtlas(const std::string& path);
+
+/** atlas 现在装的是哪一份（不含 `.osa`）。空串 = 新建 / 空图。**主线程调**。 */
+std::string loadedMapPath();
+
+/**
  * atlas 里现在有几张图、一共多少关键帧、多少地图点（**主线程调**）。`out` 要 ≥ 3。
  *
  * 载图之后**这是界面上唯一看得出「图进来了」的地方** —— 载进来的图不是当前图，

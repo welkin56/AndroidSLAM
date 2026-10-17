@@ -3856,6 +3856,12 @@ void Tracking::Reset(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
 
+    // IMU 预积分也属于上一张图：`CreateInitialMapMonocular` 会把它直接挂到
+    // 新图的第一对 KF 上。不清的话，那段预积分带着旧会话的运动。
+    if(mpImuPreintegratedFromLastKF)
+        delete mpImuPreintegratedFromLastKF;
+    mpImuPreintegratedFromLastKF = new IMU::Preintegrated(IMU::Bias(), *mpImuCalib);
+
     if(mpViewer)
         mpViewer->Release();
 

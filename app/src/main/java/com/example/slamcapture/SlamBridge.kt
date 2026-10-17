@@ -107,6 +107,17 @@ object SlamBridge {
     external fun nativeRestoreState(): Int
 
     /**
+     * 把 atlas 换成 [path] 指向的那张（**不含扩展名**；空串 = 空图）。
+     *
+     * 入口页每次重新选都要调：`System` 只能构造一次，不换的话「新建地图」只是
+     * 又开一张当前图，旧 atlas 原样留着。**只发请求**，进度同样看 [nativeRestoreState]。
+     */
+    external fun nativeRequestLoadAtlas(path: String)
+
+    /** atlas 现在装的是哪一份（不含扩展名）。空串 = 新建 / 空图。 */
+    external fun nativeLoadedMap(): String
+
+    /**
      * atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
      *
      * 载图之后这是界面上**唯一**看得出「图进来了」的地方 —— 载进来的图不是当前图，

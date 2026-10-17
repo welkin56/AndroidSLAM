@@ -262,6 +262,27 @@ Java_com_example_slamcapture_SlamBridge_nativeRestoreState(JNIEnv* /*env*/, jobj
     }
 }
 
+// 换源：把 atlas 换成 `path` 那张（不含 `.osa`；空串 = 空图）。**只发请求**。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRequestLoadAtlas(JNIEnv* env, jobject /*thiz*/,
+                                                               jstring path) {
+    try {
+        slam::requestLoadAtlas(toStdString(env, path));
+    } catch (...) {
+    }
+}
+
+// atlas 现在装的是哪一份（不含 `.osa`）。空串 = 新建 / 空图。
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeLoadedMap(JNIEnv* env, jobject /*thiz*/) {
+    try {
+        const std::string p = slam::loadedMapPath();
+        return env->NewStringUTF(p.c_str());
+    } catch (...) {
+        return env->NewStringUTF("");
+    }
+}
+
 // atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeAtlasStats(JNIEnv* env, jobject /*thiz*/,
