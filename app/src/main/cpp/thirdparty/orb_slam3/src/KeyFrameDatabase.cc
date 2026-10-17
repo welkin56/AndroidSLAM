@@ -730,7 +730,8 @@ void KeyFrameDatabase::DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &v
 }
 
 
-vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map* pMap)
+vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map* pMap,
+                                                                   Map* pExcludeMap)
 {
     list<KeyFrame*> lKFsSharingWords;
 
@@ -745,6 +746,18 @@ vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map
             for(list<KeyFrame*>::iterator lit=lKFs.begin(), lend= lKFs.end(); lit!=lend; lit++)
             {
                 KeyFrame* pKFi=*lit;
+
+                // 坏图不参与：SetMapBad 只把图移出 mspMaps，它的 KF 还留在倒排表里。
+                // 放进来会被匹配到，而那种图已经不该再被用。
+                Map* pMapKF = pKFi->GetMap();
+                if(pMapKF == nullptr || pMapKF->IsBad())
+                    continue;
+
+                // 被点名的图一律不收。用来排除「当前图」：新图和旧图拍的是同一个地方，
+                // 不排除的话这里会一直命中自己。
+                if(pExcludeMap != nullptr && pMapKF == pExcludeMap)
+                    continue;
+
                 if(pKFi->mnRelocQuery!=F->mnId)
                 {
                     pKFi->mnRelocWords=0;
@@ -831,7 +844,8 @@ vector<KeyFrame*> KeyFrameDatabase::DetectRelocalizationCandidates(Frame *F, Map
         if(si>minScoreToRetain)
         {
             KeyFrame* pKFi = it->second;
-            if (pKFi->GetMap() != pMap)
+            // pMap == nullptr 表示不限图（在所有图里找），上游原本永远传当前图。
+            if (pMap && pKFi->GetMap() != pMap)
                 continue;
             if(!spAlreadyAddedKF.count(pKFi))
             {

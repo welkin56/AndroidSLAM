@@ -76,7 +76,11 @@ public:
     void DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nNumCandidates);
 
     // Relocalization
-    std::vector<KeyFrame*> DetectRelocalizationCandidates(Frame* F, Map* pMap);
+    //
+    // add:`pMap == nullptr` = 不限图（所有图一起比）。`pExcludeMap` 里的关键帧一律不收 ——
+    // 用来把「当前图」排除掉：新图和旧图拍的是同一个地方，不排除的话重定位总命中自己。
+    std::vector<KeyFrame*> DetectRelocalizationCandidates(Frame* F, Map* pMap,
+                                                          Map* pExcludeMap = nullptr);
 
     void PreSave();
     void PostLoad(map<long unsigned int, KeyFrame*> mpKFid);

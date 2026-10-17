@@ -6,7 +6,7 @@
   原因：这一页你盯着的是「现在能不能用」（词袋加载完没有、跟踪丢没丢），画面是辅助；
   录制页盯着的是画面（构图、对上焦没有）。
 
-  ⚠️ 这一步是空壳：画面是黑的（相机接线是 M5），「重定位」恒灰。
+  ⚠️ 「重定位」在 SLAM 跑起来之后才亮 —— 它要一帧当前画面，而且这是个跨若干帧的过程。
 -->
 <androidx.drawerlayout.widget.DrawerLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -165,8 +165,8 @@
                 android:textColor="@color/measure_button_text" />
         </LinearLayout>
 
-        <!-- 两个按钮放最下面，好按。「重定位」灰着是**有理由的灰** —— 还没有旧图（§2.2），
-             不是"还没实现"。 -->
+        <!-- 两个按钮放最下面，好按。「重定位」在跑的时候才亮：它要一帧当前画面，
+             而且一次结果不可信，要连续几次落到同一片区域才算认出来。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

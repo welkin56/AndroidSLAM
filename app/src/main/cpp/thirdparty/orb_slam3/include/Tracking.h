@@ -40,6 +40,7 @@
 #include "GeometricCamera.h"
 
 #include <mutex>
+#include <atomic>
 #include <unordered_set>
 
 namespace ORB_SLAM3
@@ -173,6 +174,42 @@ public:
     void Reset(bool bLocMap = false);
     void ResetActiveMap(bool bLocMap = false);
 
+    // ---- 用户按「重定位」----
+    //
+    // 在 atlas 的所有图里找当前帧（不是只找当前图）。连续几次都落到同一片区域才算认出来。
+    // 状态：0 空闲 / 1 采集中 / 2 没候选 / 3 有候选但没匹配上 / 4 认出来了
+    //       5 前后不一致 / 6 结果已失效（地图被重置，坐标系换了）
+
+    /** 主线程发请求。只置一个标志，干活在 ProcessRelocRequest。 */
+    void RequestRelocalization();
+
+    /** 丢掉请求并回到空闲。主线程调。 */
+    void CancelRelocalization();
+
+    /** SLAM 线程在帧边界调，每帧一次。返回当前状态码。 */
+    int ProcessRelocRequest();
+
+    /**
+     * 主线程调。out 要 >= 3：
+     * `[命中图的关键帧数, 它在 atlas 里按 id 排第几（1 起）, 是不是当前图自己]`。
+     */
+    int RelocState(int* out3);
+
+    /**
+     * 主线程调。认出来了才返回非空：给出命中的那张图，以及 `T_N<-X`
+     * （目标图坐标 -> 当前图坐标），列主序。
+     */
+    Map* GetRelocMapAndTransform(float out16[16]);
+
+    /**
+     * 把重定位结果作废。
+     *
+     * **地图被重置时必须调**：`ResetActiveMap()` 清空当前图之后，初始化会用新的第一对
+     * 关键帧**重新锚定原点** —— `Map::mnId` 不变，但坐标系换了。于是「另一张图 × 那个
+     * 变换」算出来的位置整体偏移。回环合并用的是现场算的 Sim3，所以它不会错。
+     */
+    void InvalidateRelocalization(int newState);
+
     float mMeanTrack;
     bool mbInitWith3KFs;
     double t0; // time-stamp of first read frame
@@ -221,6 +258,39 @@ protected:
     bool PredictStateIMU();
 
     bool Relocalization();
+
+    /**
+     * 重定位的内核。F 是被重定位的那一帧（可以就是 mCurrentFrame，也可以是副本）。
+     * pRefMap == nullptr 表示不限图，在所有图里找；pExcludeMap 里的图一律不收。
+     * bCommit = false 时不写 mnLastRelocFrameId —— 那是「位姿刚跳变过」的开关，
+     * 只问一句的探针不该碰它。
+     * pReason: 1 没候选 / 2 有候选但没匹配上。
+     */
+    bool RelocalizeInternal(Frame& F, Map* pRefMap, Map* pExcludeMap,
+                            KeyFrame** ppMatchedKF, int* pReason, bool bCommit);
+
+    // ---- 重定位的采集状态 ----
+    //
+    // 请求标志和状态码跨线程（主线程发、SLAM 线程算），其余变量只有 SLAM 线程碰。
+
+    std::atomic<bool> mbRelocRequested;
+    std::atomic<int> mnRelocState;
+    int mnRelocTick;        // 帧计数，每 3 帧探一次
+    int mnRelocProbes;      // 探了几次
+    int mnRelocHits;        // 连续命中了几次
+    int mnRelocMiss;        // 连续几次探针没结果
+    int mnRelocLastReason;  // 最后一次失败的原因（1 没候选 / 2 没匹配上）
+    ORB_SLAM3::Map* mpRelocMap;      // 命中的图
+    KeyFrame* mpRelocFirstKF;        // 第一次命中的 KF，共视判据的锚
+    Sophus::SE3f mRelocLastPoseX;    // 上一次命中位姿（目标图坐标系）
+
+    // 下面这几个要给主线程读，单独一把锁。
+    std::mutex mMutexRelocOut;
+    Map* mpRelocOutMap;              // 确认时固定下来，主线程拿它去枚举点云；命中当前图时为 nullptr
+    int mnRelocMapKFs;
+    int mnRelocMapRank;
+    int mnRelocOutSame;              // 认出来的是不是当前图自己
+    Sophus::SE3f mRelocT_NX;         // 目标图坐标 -> 当前图坐标
 
     void UpdateLocalMap();
     void UpdateLocalPoints();

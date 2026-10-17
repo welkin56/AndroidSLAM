@@ -157,6 +157,34 @@ public:
     /** add：atlas 里现在有几张图 / 一共多少关键帧 / 多少地图点。给界面显示用。 */
     void GetAtlasStats(int* maps, int* kfs, int* mps);
 
+    // ---- add：用户按「重定位」----
+    //
+    // 在 atlas 的所有图里找当前帧（不是只找当前图），连续几次落到同一片区域才算认出来。
+    // 状态：0 空闲 / 1 采集中 / 2 没候选 / 3 有候选但没匹配上 / 4 认出来了 / 5 前后不一致
+
+    /** 主线程发请求。 */
+    void RequestRelocalization();
+
+    /** 丢掉请求，回空闲。主线程调。 */
+    void CancelRelocalization();
+
+    /** SLAM 线程在帧边界调，每帧一次。返回状态码。 */
+    int ProcessRelocRequest();
+
+    /**
+     * 主线程调。`out3` 要 ≥ 3：
+     * `[命中图的关键帧数, 它在 atlas 里排第几, 是不是当前图自己]`。返回状态码。
+     */
+    int RelocState(int* out3);
+
+    /**
+     * add:认出来的那张图的点云，已经用 `T_N<-X` 变换到**当前图坐标系**。
+     * `out` 收 `3n` 个 float，返回点数。**只能在 SLAM 线程调**（要枚举那张图的点）。
+     *
+     * 用于把旧图叠在 2D 小窗上 —— 两张图坐标系不同，不变换就画不到一起。
+     */
+    int GetRelocMapPoints(float* out, int cap);
+
     /**
      * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
      *

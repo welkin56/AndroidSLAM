@@ -82,6 +82,15 @@ class MainActivity : AppCompatActivity() {
         private const val TRK_RECENTLY_LOST = 3
         private const val TRK_LOST = 4
 
+        // SlamBridge.nativeRelocState() 的取值，和 C++ 侧 Tracking 里那套一一对应。
+        private const val RELOC_IDLE = 0
+        private const val RELOC_COLLECTING = 1
+        private const val RELOC_NO_CANDIDATE = 2
+        private const val RELOC_NO_MATCH = 3
+        private const val RELOC_OK = 4
+        private const val RELOC_INCONSISTENT = 5
+        private const val RELOC_INVALID = 6
+
         private const val TICK_MS = 250L
         private const val REQ_CAMERA = 1
 
@@ -195,6 +204,12 @@ class MainActivity : AppCompatActivity() {
     /** 正在存图。**ticker 靠它才继续跑** —— 存图发生在刚停止之后，那时它本来要停了。 */
     private var saving = false
 
+    /** 重定位状态（C++ 那侧的 0..5）。按钮标签和状态栏都看它。 */
+    private var relocState = RELOC_IDLE
+
+    /** 重定位那行字。 */
+    private var relocMsg: String? = null
+
     /** 这一次「启动 SLAM → 结束」的子目录 `<会话>/run-N/`。**它才是坐标系单元**。 */
     private var curRunDir: File? = null
 
@@ -264,6 +279,15 @@ class MainActivity : AppCompatActivity() {
      * **固定缓冲、别扩容**。
      */
     private val mapPtBuf = FloatArray(3 * kMapPointsMax)
+
+    /**
+     * 认出来的那张旧图的点云（**已变换到当前图坐标系**）。契约和 [mapPtBuf] 一样：
+     * 固定缓冲、别扩容。
+     */
+    private val relocPtBuf = FloatArray(3 * kMapPointsMax)
+
+    /** 重定位的读数：`[命中图的关键帧数, 在 atlas 里排第几, 是不是当前图]`。复用同一个数组。 */
+    private val relocBuf = IntArray(3)
 
     /** 小地图那一整块。开关直接作用于它（连角上那两个缩放键一起藏）。 */
     private lateinit var mapWrap: FrameLayout
@@ -388,8 +412,12 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
 
-        // 「重定位」现在点不动（恒灰）。判据是「有没有旧图」（§2.4），还没做。
-        btnReloc.setOnClickListener { }
+        // 「重定位」：在 atlas 的所有图里找当前帧。按下之后要跨若干帧比对才算数，
+        // 结果由 ticker 从 `nativeRelocState()` 读回来。
+        btnReloc.setOnClickListener {
+            SlamBridge.nativeRequestReloc()
+            uiQueueTicker()
+        }
 
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
@@ -892,8 +920,11 @@ class MainActivity : AppCompatActivity() {
             if (slamRunning) ColorStateList.valueOf(RED) else null
         btnSlam.setTextColor(if (slamRunning) Color.WHITE else DARK_TEXT)
 
-        // 「重定位」的灰 / 亮只看有没有旧图（§2.4）。还没有 referenceMap，所以恒灰。
-        btnReloc.isEnabled = false
+        // 「重定位」在跑才能按 —— 它要一帧当前画面。和「载没载图」无关：没载图时它认的是
+        // 自己刚建的那张，「停止 → 再启动接回来」也用这个。
+        relocState = SlamBridge.nativeRelocState()
+        btnReloc.isEnabled = slamRunning
+        btnReloc.text = if (relocState == RELOC_COLLECTING) "重定位中…" else "重定位"
 
         // 两个开关都**一直可点** —— 它们表达的是「这一段要不要录 / 要不要量」，
         // 所以启动之前就得能设。
@@ -911,18 +942,29 @@ class MainActivity : AppCompatActivity() {
         btnResetPoints.isEnabled = pinnedN > 0
 
         // ---- 状态栏 ----
-        val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
+        //
+        // 两个「地图」不是一回事：`mapFile` 是**这次**在入口页选的（Activity 级），
+        // 而 System 只构造一次（进程级），吃的是**构造那一刻**那张。构造之后在入口页
+        // 改主意**不会生效** —— 所以两处都说清楚，别让人以为已经换了。
+        val chosenLabel = mapFile?.let { File(it).name } ?: "新建地图"
+        val actualPath = SlamBridge.nativeLoadedMap()
+        val actualLabel = if (actualPath.isEmpty()) "新建地图" else File(actualPath).name
+        val actualRaw: String? = actualPath.ifEmpty { null }
+        val mapMismatch = slamState != SLAM_IDLE && mapFile != actualRaw
+
         // `System` 造好之后有两种情形，先算出来 —— 塞进 `when` 的 else 分支里会写出
         // 「一个 when 里两个 else」那种读起来像错的东西。
         val afterReady = if (slamRunning) {
             trackingLine()
         } else {
-            "SLAM：已就绪（没在吃帧）\n\n点「启动 SLAM」开始 —— 相机和 IMU 这一刻才打开。"
+            "SLAM：已就绪（吃的是「$actualLabel」，没在吃帧）\n\n" +
+                "点「启动 SLAM」开始 —— 相机和 IMU 这一刻才打开。"
         }
         val head = when (slamState) {
             SLAM_IDLE ->
-                "SLAM：未准备（$mapLabel）\n\n点「准备 SLAM」构造 System，约 38 秒。"
-            SLAM_LOADING -> "SLAM：词袋加载中…（已 ${slamElapsedMs / 1000}s，本机约 38 秒）"
+                "SLAM：未准备（$chosenLabel）\n\n点「准备 SLAM」构造 System，约 38 秒。"
+            SLAM_LOADING ->
+                "SLAM：词袋加载中…（吃的是「$actualLabel」，已 ${slamElapsedMs / 1000}s）"
             SLAM_FAILED ->
                 if (SlamBridge.nativeFailureCode() == 1)
                     "SLAM：载图失败 —— 这张图读不了，回入口页换一张或新建"
@@ -944,7 +986,33 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 重定位那行。采集要跨若干帧，所以「采集中」必须让人看见 —— 否则像卡住了。
+        relocMsg = when (relocState) {
+            // ⚠️ 这里以前写的是「站定别动」—— 反了。IMU 初始化要求前 10 秒持续平移
+            // （`LocalMapping.cc:131-145`），站着不动会反复重置当前图，采集结果根本活不到确认。
+            RELOC_COLLECTING -> "重定位：正在确认…（照常走，别停）"
+            RELOC_NO_CANDIDATE -> "重定位：没有匹配的地方 —— 走到建过图的地方再试"
+            RELOC_NO_MATCH -> "重定位：有线索但对不上 —— 换个角度、走近一点再试"
+            RELOC_INCONSISTENT -> "重定位：一会儿像这儿一会儿像那儿 —— 换个位置再按"
+            RELOC_INVALID -> "重定位：结果已失效（地图变了：重置或合并）—— 要用请再按一次"
+            RELOC_OK -> {
+                SlamBridge.nativeRelocMapInfo(relocBuf)
+                // 「当前图」和「另一张图」要分开说：只有后者才有东西可叠，
+                // 前者两张本来就同一个坐标系，叠上去只会和现有那层重合。
+                if (relocBuf[2] != 0)
+                    "重定位：认出来了 —— 就是当前图（${relocBuf[0]} 个关键帧）"
+                else
+                    "重定位：认出了另一张图（第 ${relocBuf[1]} 张，${relocBuf[0]} 个关键帧）"
+            }
+            else -> null
+        }
+
         val body = buildString {
+            // 入口页改了主意但 System 已经构造过 —— 沉默地不生效是最坏的一种。
+            if (mapMismatch) {
+                append("⚠️ 入口页选的是「$chosenLabel」，但吃的是「$actualLabel」\n")
+                append("构造只发生一次，换地图要重启 App")
+            }
             if (slamRunning && poseValid) {
                 append(
                     "位置 m: %.3f, %.3f, %.3f".format(poseBuf[12], poseBuf[13], poseBuf[14])
@@ -977,6 +1045,7 @@ class MainActivity : AppCompatActivity() {
                 if (isNotEmpty()) append("\n")
                 append("地图 ${atlasBuf[0]} 张 / 关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}")
             }
+            relocMsg?.let { append("\n$it") }
             saveMsg?.let { append("\n$it") }
             lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
@@ -1001,15 +1070,17 @@ class MainActivity : AppCompatActivity() {
 
         val n = SlamBridge.nativeGetTrajectory(trajBuf)
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
+        // 认出来的旧图。没认出来时 C++ 那边是空快照，不用读。
+        val rn = if (relocState == RELOC_OK) SlamBridge.nativeGetRelocPoints(relocPtBuf) else 0
         // ⚠️ **不沉默**：空窗也要说清为什么空。**分开四态**（STAGE6 §2.7）——
         // 「加载中」和「没启动」混成一句的话，用户会去擦镜头。
-        // ⚠️ 判据是「**两样都没有**」：有点云可画时再拿提示盖上去，点云就白出来了。
+        // ⚠️ 判据是「**三样都没有**」：有东西可画时再拿提示盖上去，那些点就白出来了。
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
             slamState == SLAM_FAILED -> "构造失败"
             !slamRunning -> "SLAM 未启动"
-            n == 0 && pn == 0 && trkState != TRK_OK -> "跟踪未就绪"
-            n == 0 && pn == 0 -> "等待定位…"
+            n == 0 && pn == 0 && rn == 0 && trkState != TRK_OK -> "跟踪未就绪"
+            n == 0 && pn == 0 && rn == 0 -> "等待定位…"
             else -> null
         }
         // 朝向：相机光轴投到 XY 地面。`poseBuf` 是 **Twc**（列主序），
@@ -1033,7 +1104,8 @@ class MainActivity : AppCompatActivity() {
             if (poseValid) poseBuf[13] else 0f,
             if (poseValid) poseBuf[14] else 0f,
             poseValid, hint, dx, dy,
-            mapPtBuf, pn))
+            mapPtBuf, pn,
+            relocPtBuf, rn))
     }
 
     // ---------------- 小地图的开关和切片厚度 ----------------

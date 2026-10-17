@@ -270,6 +270,76 @@ Java_com_example_slamcapture_SlamBridge_nativeFailureCode(JNIEnv* /*env*/, jobje
     }
 }
 
+// 构造 System 时实际吃的是哪张旧图（空串 = 从零建）。
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeLoadedMap(JNIEnv* env, jobject /*thiz*/) {
+    try {
+        return env->NewStringUTF(slam::loadedMapPath().c_str());
+    } catch (...) {
+        return env->NewStringUTF("");
+    }
+}
+
+// 用户按「重定位」。只发请求就返回，真正干活在 SLAM 线程上跨若干帧做。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRequestReloc(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::requestRelocalize();
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCancelReloc(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::cancelRelocalize();
+    } catch (...) {
+    }
+}
+
+// 0 空闲 / 1 采集中 / 2 没候选 / 3 有候选但没匹配上 / 4 认出来了 / 5 前后不一致。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRelocState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::relocState();
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 认出来的那张图：`out` 要 ≥ 3，收 `[关键帧数, 排第几, 是不是当前图自己]`。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRelocMapInfo(JNIEnv* env, jobject /*thiz*/,
+                                                           jintArray out) {
+    try {
+        if (env->GetArrayLength(out) < 3) return;
+        jint* p = env->GetIntArrayElements(out, nullptr);
+        if (p == nullptr) return;
+        int v[3] = {0, 0, 0};
+        slam::relocMapInfo(v);
+        p[0] = v[0];
+        p[1] = v[1];
+        p[2] = v[2];
+        env->ReleaseIntArrayElements(out, p, 0);
+    } catch (...) {
+    }
+}
+
+// 旧图的点云（已变换到当前图坐标系）。`out` 收 `3n` 个 float，返回点数。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetRelocPoints(JNIEnv* env, jobject /*thiz*/,
+                                                             jfloatArray out) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(out, nullptr);
+        if (p == nullptr) return 0;
+        const int n = slam::getRelocPoints(p, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, p, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeDumpTrajectory(JNIEnv* env, jobject /*thiz*/,
                                                              jstring path) {

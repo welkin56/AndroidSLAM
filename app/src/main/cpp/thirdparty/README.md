@@ -74,6 +74,9 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 17 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `SaveAtlasTo(path)` —— 公开包装，让文件名能**现取** | 上游的 `SaveAtlas` 是 private，而且路径只能来自**构造时读的 yaml** ⟹ 而 §9 要「另存、不覆盖」= 每次一个新名字，构造时根本还不知道 |
 | 18 | `orb_slam3/src/System.cc` | 载图失败从 **`exit(-1)` 改成抛异常** | ⚠️ `exit(-1)` 在安卓上表现为「**App 干净地退回桌面、logcat 里只有一行**」⟹ 用户看到的是「点了启动，App 没了」而没有任何提示。抛出去，`slam_engine.cpp` 的 `construct()` 接得住 |
 | 19 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAtlasStats()` —— atlas 里有几张图 / 共多少关键帧 / 多少地图点 | 同 14，给界面显示用。**没有它，「图载进来了没有」在界面上完全看不出来**（载完之后当前图是新建的空图）|
+| 20 | `orb_slam3/include/Tracking.h` + `src/Tracking.cc` | `Relocalization()` 拆成 `RelocalizeInternal(Frame&, Map* pRefMap, KeyFrame**, int*, bool bCommit)` + 一行薄壳；新增 `RequestRelocalization()` / `CancelRelocalization()` / `ProcessRelocRequest()` / `RelocState()` / `GetRelocMapAndTransform()` | ⚠️ 三件事上游都没有：① **候选范围要能不限图**（`pRefMap==nullptr`）—— 上游永远传当前图；② **探针不能有副作用** —— `Relocalization` 成功时会写 `mnLastRelocFrameId`，那是「位姿刚跳过」的行为开关（2 帧不用运动模型、30 帧内限制插 KF），只问一句的探针不该碰 ⟹ `bCommit`；③ **一次结果不可信** —— 连续 6 次都落到同一片区域（命中的 KF 共视 + 相邻位姿不跳）才算认出来 |
+| 21 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `RequestRelocalization()` / `CancelRelocalization()` / `ProcessRelocRequest()` / `RelocState()` / `GetRelocMapPoints()` | 薄垫片。最后一个把**命中的那张图**的点云用两图变换搬到当前图坐标系 —— 两张图坐标系不同，不变换叠不到一起 |
+| 22 | `orb_slam3/src/KeyFrameDatabase.cc` | `DetectRelocalizationCandidates()`：收尾的图过滤改成 `if (pMap && …)`（`nullptr` = 不限图）；收候选时**跳过坏图的 KF** | ⚠️ `Atlas::SetMapBad()` 只把图移出 `mspMaps`，**它的 KF 还留在倒排表里** ⟹ 能匹配到一张已经作废的图。`DetectNBestCandidates` 自己就有这个防护（`!pKFi->GetMap()->IsBad()`），照抄 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

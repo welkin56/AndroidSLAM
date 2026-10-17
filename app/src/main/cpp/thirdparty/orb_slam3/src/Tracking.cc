@@ -45,7 +45,12 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mState(NO_IMAGES_YET), mSensor(sensor), mTrackedFr(0), mbStep(false),
     mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB),
     mbReadyToInitializate(false), mpSystem(pSys), mpViewer(NULL), bStepByStep(false),
-    mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas), mnLastRelocFrameId(0), time_recently_lost(5.0),
+    mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas),
+    mbRelocRequested(false), mnRelocState(0), mnRelocTick(0), mnRelocProbes(0), mnRelocHits(0),
+    mnRelocMiss(0), mnRelocLastReason(0),
+    mpRelocMap(nullptr), mpRelocFirstKF(nullptr),
+    mpRelocOutMap(nullptr), mnRelocMapKFs(0), mnRelocMapRank(0), mnRelocOutSame(0),
+    mnLastRelocFrameId(0), time_recently_lost(5.0),
     mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
 {
     // Load camera parameters from settings file
@@ -3629,16 +3634,29 @@ void Tracking::UpdateLocalKeyFrames()
 
 bool Tracking::Relocalization()
 {
+    return RelocalizeInternal(mCurrentFrame, mpAtlas->GetCurrentMap(), nullptr,
+                              nullptr, nullptr, true);
+}
+
+bool Tracking::RelocalizeInternal(Frame& F, Map* pRefMap, Map* pExcludeMap,
+                                  KeyFrame** ppMatchedKF, int* pReason, bool bCommit)
+{
+    if(pReason) *pReason = 0;
+    if(ppMatchedKF) *ppMatchedKF = nullptr;
+
     Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
     // Compute Bag of Words Vector
-    mCurrentFrame.ComputeBoW();
+    F.ComputeBoW();
 
     // Relocalization is performed when tracking is lost
     // Track Lost: Query KeyFrame Database for keyframe candidates for relocalisation
-    vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame, mpAtlas->GetCurrentMap());
+    // pRefMap == nullptr 表示不限图（在所有图里找）。
+    vector<KeyFrame*> vpCandidateKFs =
+        mpKeyFrameDB->DetectRelocalizationCandidates(&F, pRefMap, pExcludeMap);
 
     if(vpCandidateKFs.empty()) {
         Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
+        if(pReason) *pReason = 1;
         return false;
     }
 
@@ -3666,7 +3684,7 @@ bool Tracking::Relocalization()
             vbDiscarded[i] = true;
         else
         {
-            int nmatches = matcher.SearchByBoW(pKF,mCurrentFrame,vvpMapPointMatches[i]);
+            int nmatches = matcher.SearchByBoW(pKF,F,vvpMapPointMatches[i]);
             if(nmatches<15)
             {
                 vbDiscarded[i] = true;
@@ -3674,7 +3692,7 @@ bool Tracking::Relocalization()
             }
             else
             {
-                MLPnPsolver* pSolver = new MLPnPsolver(mCurrentFrame,vvpMapPointMatches[i]);
+                MLPnPsolver* pSolver = new MLPnPsolver(F,vvpMapPointMatches[i]);
                 pSolver->SetRansacParameters(0.99,10,300,6,0.5,5.991);  //This solver needs at least 6 points
                 vpMLPnPsolvers[i] = pSolver;
                 nCandidates++;
@@ -3685,6 +3703,7 @@ bool Tracking::Relocalization()
     // Alternatively perform some iterations of P4P RANSAC
     // Until we found a camera pose supported by enough inliers
     bool bMatch = false;
+    KeyFrame* pMatchedKF = nullptr;
     ORBmatcher matcher2(0.9,true);
 
     while(nCandidates>0 && !bMatch)
@@ -3714,7 +3733,7 @@ bool Tracking::Relocalization()
             if(bTcw)
             {
                 Sophus::SE3f Tcw(eigTcw);
-                mCurrentFrame.SetPose(Tcw);
+                F.SetPose(Tcw);
                 // Tcw.copyTo(mCurrentFrame.mTcw);
 
                 set<MapPoint*> sFound;
@@ -3725,49 +3744,49 @@ bool Tracking::Relocalization()
                 {
                     if(vbInliers[j])
                     {
-                        mCurrentFrame.mvpMapPoints[j]=vvpMapPointMatches[i][j];
+                        F.mvpMapPoints[j]=vvpMapPointMatches[i][j];
                         sFound.insert(vvpMapPointMatches[i][j]);
                     }
                     else
-                        mCurrentFrame.mvpMapPoints[j]=NULL;
+                        F.mvpMapPoints[j]=NULL;
                 }
 
-                int nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                int nGood = Optimizer::PoseOptimization(&F);
 
                 if(nGood<10)
                     continue;
 
-                for(int io =0; io<mCurrentFrame.N; io++)
-                    if(mCurrentFrame.mvbOutlier[io])
-                        mCurrentFrame.mvpMapPoints[io]=static_cast<MapPoint*>(NULL);
+                for(int io =0; io<F.N; io++)
+                    if(F.mvbOutlier[io])
+                        F.mvpMapPoints[io]=static_cast<MapPoint*>(NULL);
 
                 // If few inliers, search by projection in a coarse window and optimize again
                 if(nGood<50)
                 {
-                    int nadditional =matcher2.SearchByProjection(mCurrentFrame,vpCandidateKFs[i],sFound,10,100);
+                    int nadditional =matcher2.SearchByProjection(F,vpCandidateKFs[i],sFound,10,100);
 
                     if(nadditional+nGood>=50)
                     {
-                        nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                        nGood = Optimizer::PoseOptimization(&F);
 
                         // If many inliers but still not enough, search by projection again in a narrower window
                         // the camera has been already optimized with many points
                         if(nGood>30 && nGood<50)
                         {
                             sFound.clear();
-                            for(int ip =0; ip<mCurrentFrame.N; ip++)
-                                if(mCurrentFrame.mvpMapPoints[ip])
-                                    sFound.insert(mCurrentFrame.mvpMapPoints[ip]);
-                            nadditional =matcher2.SearchByProjection(mCurrentFrame,vpCandidateKFs[i],sFound,3,64);
+                            for(int ip =0; ip<F.N; ip++)
+                                if(F.mvpMapPoints[ip])
+                                    sFound.insert(F.mvpMapPoints[ip]);
+                            nadditional =matcher2.SearchByProjection(F,vpCandidateKFs[i],sFound,3,64);
 
                             // Final optimization
                             if(nGood+nadditional>=50)
                             {
-                                nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                                nGood = Optimizer::PoseOptimization(&F);
 
-                                for(int io =0; io<mCurrentFrame.N; io++)
-                                    if(mCurrentFrame.mvbOutlier[io])
-                                        mCurrentFrame.mvpMapPoints[io]=NULL;
+                                for(int io =0; io<F.N; io++)
+                                    if(F.mvbOutlier[io])
+                                        F.mvpMapPoints[io]=NULL;
                             }
                         }
                     }
@@ -3778,6 +3797,7 @@ bool Tracking::Relocalization()
                 if(nGood>=50)
                 {
                     bMatch = true;
+                    pMatchedKF = vpCandidateKFs[i];
                     break;
                 }
             }
@@ -3786,20 +3806,271 @@ bool Tracking::Relocalization()
 
     if(!bMatch)
     {
+        if(pReason) *pReason = 2;
         return false;
     }
     else
     {
-        mnLastRelocFrameId = mCurrentFrame.mnId;
+        if(ppMatchedKF) *ppMatchedKF = pMatchedKF;
+        // 只有真的把位姿接回去时才留「刚跳变过」的记号。探针只问一句，不该留。
+        if(bCommit) mnLastRelocFrameId = F.mnId;
         cout << "Relocalized!!" << endl;
         return true;
     }
 
 }
 
+// 连续几次探针都落在同一片区域才算认出来。6 次 × 每 3 帧一探 ≈ 半秒。
+static const int kRelocHitsToConfirm = 6;
+// 一次采集最多探这么多次；还凑不齐就判「前后不一致」。
+static const int kRelocMaxProbes = 20;
+// 连续这么多帧都探不出东西才下结论。单帧没候选在真机上很正常（模糊、转快了、
+// 正对着白墙），一次就放弃会把「差一点就成」的采集掐死。
+static const int kRelocMaxMisses = 3;
+// 每几帧探一次。一次完整重定位要跑 BoW 匹配 + 几个候选的 RANSAC，每帧做会挤掉跟踪。
+static const int kRelocFrameStride = 3;
+// 相邻两次命中的位姿允许多大差异。探针间隔约 0.1 秒，正常走路 1.4 m/s ≈ 0.14 m，
+// 所以门槛要留出走动余量 —— 别按「站着不动」去收紧，那会让正常走路也过不了。
+// 它的作用不是防抖，是挡住「两次定到相隔很远的两处」。
+static const float kRelocMaxStepM = 0.35f;
+static const float kRelocMaxStepRad = 0.15f;     // ~8.6°
+
+void Tracking::RequestRelocalization()
+{
+    // 只置请求：工作变量归 SLAM 线程所有，它看到请求后自己清。
+    mbRelocRequested.store(true);
+}
+
+void Tracking::CancelRelocalization()
+{
+    mbRelocRequested.store(false);
+    mnRelocState.store(0);
+}
+
+int Tracking::ProcessRelocRequest()
+{
+    // 结果还挂着、但那张图已经被搬空了 —— 回环合并会把另一张图的关键帧和地图点
+    // 全部搬进当前图，被搬走那张变成空的。这时之前那个变换就不成立了，
+    // 而且小窗上那层是**快照**，不主动作废就会一直画着。
+    if(mnRelocState.load() == 4)
+    {
+        Map* pTarget = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mMutexRelocOut);
+            pTarget = mpRelocOutMap;   // 命中「当前图」时是 nullptr，没什么可作废的
+        }
+        if(pTarget != nullptr && pTarget->KeyFramesInMap() == 0)
+            InvalidateRelocalization(6);
+    }
+
+    if(mbRelocRequested.exchange(false))
+    {
+        mnRelocTick = 0;
+        mnRelocProbes = 0;
+        mnRelocHits = 0;
+        mnRelocMiss = 0;
+        mnRelocLastReason = 0;
+        mpRelocMap = nullptr;
+        mpRelocFirstKF = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mMutexRelocOut);
+            mpRelocOutMap = nullptr;
+            mnRelocMapKFs = 0;
+            mnRelocMapRank = 0;
+        }
+        mnRelocState.store(1);
+    }
+
+    if(mnRelocState.load() != 1)
+        return mnRelocState.load();
+
+    if((mnRelocTick++ % kRelocFrameStride) != 0)
+        return 1;
+
+    // 当前帧在当前图里的位姿。必须在探针之前抓住 —— 内核会把它的位姿改成目标图的。
+    //
+    // ⚠️ 只有跟踪 OK 时它才是真的。跟丢的时候这一帧没有有效位姿，用它算出来的两图变换
+    // 是错的，叠出来会像「重定位定歪了」—— 那比不叠更误导。所以这种情况只报认出来了，
+    // 不给变换（`GetRelocMapAndTransform` 会返回空）。
+    const bool bPoseOk = (mState == OK);
+    const Sophus::SE3f TcwN = mCurrentFrame.GetPose();
+
+    // 候选里排除当前图。它和旧图拍的是同一个地方，不排除就永远命中自己
+    // （真机日志里每一次都是「认出来了：就是当前图」，绿层一次都没出过）。
+    // 只有 atlas 里**没有别的非空图**时才不排除 —— 那种情况只出现在回环把图合完之后，
+    // 那时「认自己」也是唯一的选择。
+    Map* pCurMap = mpAtlas->GetCurrentMap();
+    Map* pExclude = nullptr;
+    for(Map* pM : mpAtlas->GetAllMaps())
+    {
+        if(pM != nullptr && pM != pCurMap && pM->KeyFramesInMap() > 0)
+        {
+            pExclude = pCurMap;
+            break;
+        }
+    }
+
+    Frame probe(mCurrentFrame);
+    KeyFrame* pMatchedKF = nullptr;
+    int reason = 0;
+    const bool ok = RelocalizeInternal(probe, nullptr, pExclude, &pMatchedKF, &reason, false);
+
+    ++mnRelocProbes;
+
+    if(!ok)
+    {
+        // 单帧探不出东西在真机上很常见（运动模糊、转太快、正对白墙）。连续几次都这样
+        // 才下结论 —— 一次就放弃会把「差一点就成」的采集掐死。
+        ++mnRelocMiss;
+        mnRelocLastReason = reason;
+        cout << "[RELOC] 探针 #" << mnRelocProbes << " 没结果：reason=" << reason
+             << "（1 没候选 / 2 有候选但没匹配上），连续 " << mnRelocMiss << " 次" << endl;
+
+        if(mnRelocMiss < kRelocMaxMisses && mnRelocProbes < kRelocMaxProbes)
+            return 1;
+
+        mnRelocState.store(mnRelocLastReason == 1 ? 2 : 3);
+        return mnRelocState.load();
+    }
+    mnRelocMiss = 0;
+
+    Map* pMap = pMatchedKF->GetMap();
+    const Sophus::SE3f TcwX = probe.GetPose();
+
+    // 这三样只给日志用 —— 光看最终状态码，看不出是哪一条判据没过。
+    bool bNear = false;
+    float dPos = 0.f;
+    float dRot = 0.f;
+
+    bool bSameCluster = (mnRelocHits > 0) && (pMap == mpRelocMap);
+    if(bSameCluster)
+    {
+        // 命中的 KF 必须还在第一次那片的共视邻域里
+        bNear = (pMatchedKF == mpRelocFirstKF);
+        if(!bNear)
+        {
+            vector<KeyFrame*> vpCov = mpRelocFirstKF->GetVectorCovisibleKeyFrames();
+            bNear = (std::find(vpCov.begin(), vpCov.end(), pMatchedKF) != vpCov.end());
+        }
+
+        // 位姿不能跳。站着不动时两条都近乎为 0；定到别的地方时会跳。
+        const Sophus::SE3f dT = mRelocLastPoseX * TcwX.inverse();
+        dPos = dT.translation().norm();
+        dRot = dT.so3().log().norm();
+        bSameCluster = bNear && (dPos < kRelocMaxStepM) && (dRot < kRelocMaxStepRad);
+    }
+
+    cout << "[RELOC] 探针 #" << mnRelocProbes << "：图 " << pMap->GetId()
+         << "（当前 " << mpAtlas->GetCurrentMap()->GetId() << "）"
+         << " 已连续 " << mnRelocHits
+         << " 共视 " << (bNear ? "是" : "否")
+         << " dpos " << dPos << "m drot " << dRot << "rad"
+         << " poseOK " << bPoseOk << endl;
+
+    if(!bSameCluster)
+    {
+        // 换了地方就重数，把这一帧当新的锚。
+        mpRelocMap = pMap;
+        mpRelocFirstKF = pMatchedKF;
+        mRelocLastPoseX = TcwX;
+        mnRelocHits = 1;
+    }
+    else
+    {
+        mRelocLastPoseX = TcwX;
+        ++mnRelocHits;
+    }
+
+    if(mnRelocHits >= kRelocHitsToConfirm)
+    {
+        // T_N<-X = T_wc_N · T_cw_X：目标图的点乘它就到当前图坐标系。
+        const Sophus::SE3f TNX = TcwN.inverse() * TcwX;
+        const int nKFs = (int)pMap->KeyFramesInMap();
+        const bool bOther = (pMap != mpAtlas->GetCurrentMap());
+
+        // GetAllMaps 已经按 id 排好，找它的名次就行。
+        vector<Map*> vpMaps = mpAtlas->GetAllMaps();
+        int nRank = 0;
+        for(size_t i = 0; i < vpMaps.size(); ++i)
+            if(vpMaps[i] == pMap) { nRank = (int)i + 1; break; }
+
+        {
+            std::lock_guard<std::mutex> lk(mMutexRelocOut);
+            mRelocT_NX = TNX;
+            // 命中当前图时两张是同一个系，叠上去和现有那层完全重合 —— 不叠，
+            // 否则看着像「突然多了一层」。只有另一张图才需要变换着叠。
+            mpRelocOutMap = (bPoseOk && bOther) ? pMap : nullptr;
+            mnRelocOutSame = bOther ? 0 : 1;
+            mnRelocMapKFs = nKFs;
+            mnRelocMapRank = nRank;
+            mnRelocState.store(4);
+        }
+
+        cout << "[RELOC] 认出来了：" << (bOther ? "另一张图" : "就是当前图")
+             << "（第 " << nRank << " 张，id " << pMap->GetId() << "），"
+             << nKFs << " 个关键帧";
+        if(!bPoseOk)
+            cout << "；跟踪没 OK，这一帧没有可信位姿，不给叠图";
+        else if(!bOther)
+            cout << "；同一个坐标系，不用叠";
+        cout << endl;
+        return 4;
+    }
+
+    if(mnRelocProbes >= kRelocMaxProbes)
+    {
+        mnRelocState.store(5);
+        cout << "[RELOC] 前后不一致，放弃" << endl;
+        return 5;
+    }
+
+    return 1;
+}
+
+int Tracking::RelocState(int* out3)
+{
+    std::lock_guard<std::mutex> lk(mMutexRelocOut);
+    if(out3)
+    {
+        out3[0] = mnRelocMapKFs;
+        out3[1] = mnRelocMapRank;
+        out3[2] = mnRelocOutSame;
+    }
+    return mnRelocState.load();
+}
+
+Map* Tracking::GetRelocMapAndTransform(float out16[16])
+{
+    std::lock_guard<std::mutex> lk(mMutexRelocOut);
+    if(mnRelocState.load() != 4 || mpRelocOutMap == nullptr)
+        return nullptr;
+
+    const Eigen::Matrix4f M = mRelocT_NX.matrix();
+    for(int r = 0; r < 4; ++r)
+        for(int c = 0; c < 4; ++c)
+            out16[c * 4 + r] = M(r, c);
+
+    return mpRelocOutMap;
+}
+
+void Tracking::InvalidateRelocalization(int newState)
+{
+    {
+        std::lock_guard<std::mutex> lk(mMutexRelocOut);
+        // 那张图不再给出：`GetRelocMapAndTransform` 只认状态 4，这里换成别的就不会再被拿。
+        mpRelocOutMap = nullptr;
+        mnRelocState.store(newState);
+    }
+    cout << "[RELOC] 结果作废（地图变了：重置或合并），新状态 " << newState << endl;
+}
+
 void Tracking::Reset(bool bLocMap)
 {
     Verbose::PrintMess("System Reseting", Verbose::VERBOSITY_NORMAL);
+
+    // 坐标系要重新锚定了，之前算的两图变换跟着作废。
+    if(mnRelocState.load() != 0)
+        InvalidateRelocalization(6);
 
     if(mpViewer)
     {
@@ -3861,6 +4132,10 @@ void Tracking::Reset(bool bLocMap)
 void Tracking::ResetActiveMap(bool bLocMap)
 {
     Verbose::PrintMess("Active map Reseting", Verbose::VERBOSITY_NORMAL);
+
+    // 当前图要被清空、重新锚定原点 ⟹ 之前算的「另一张图 → 当前图」那个变换作废。
+    if(mnRelocState.load() != 0)
+        InvalidateRelocalization(6);
     if(mpViewer)
     {
         mpViewer->RequestStop();

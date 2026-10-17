@@ -937,6 +937,76 @@ void System::GetAtlasStats(int* maps, int* kfs, int* mps)
     }
 }
 
+void System::RequestRelocalization()
+{
+    if (mpTracker != nullptr)
+        mpTracker->RequestRelocalization();
+}
+
+void System::CancelRelocalization()
+{
+    if (mpTracker != nullptr)
+        mpTracker->CancelRelocalization();
+}
+
+int System::ProcessRelocRequest()
+{
+    if (mpTracker == nullptr)
+        return 0;
+    return mpTracker->ProcessRelocRequest();
+}
+
+int System::RelocState(int* out3)
+{
+    if (mpTracker == nullptr)
+    {
+        if (out3) { out3[0] = 0; out3[1] = 0; out3[2] = 0; }
+        return 0;
+    }
+    return mpTracker->RelocState(out3);
+}
+
+int System::GetRelocMapPoints(float* out, int cap)
+{
+    if (out == nullptr || mpTracker == nullptr || cap < 3)
+        return 0;
+
+    float T[16];
+    Map* pMap = mpTracker->GetRelocMapAndTransform(T);
+    if (pMap == nullptr)
+        return 0;
+
+    // T 是列主序的 `T_N<-X`：把目标图的点乘它就落到当前图坐标系。
+    Eigen::Matrix4f M;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            M(r, c) = T[c * 4 + r];
+    const Eigen::Matrix3f R = M.block<3, 3>(0, 0);
+    const Eigen::Vector3f t = M.block<3, 1>(0, 3);
+
+    vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
+    const size_t n = vpMPs.size();
+    if (n == 0)
+        return 0;
+
+    // 和 `System::GetFrameTrajectory` 一样：抽稀，不是截断。
+    const int maxPts = cap / 3;
+    const size_t stride = std::max<size_t>(1, (n + maxPts - 1) / maxPts);
+
+    int cnt = 0;
+    for (size_t i = 0; i < n && cnt + 3 <= cap; i += stride)
+    {
+        MapPoint* p = vpMPs[i];
+        if (p == nullptr || p->isBad())
+            continue;
+        const Eigen::Vector3f q = R * p->GetWorldPos() + t;
+        out[cnt++] = q.x();
+        out[cnt++] = q.y();
+        out[cnt++] = q.z();
+    }
+    return cnt / 3;
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 

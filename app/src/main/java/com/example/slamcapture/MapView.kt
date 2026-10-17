@@ -46,12 +46,19 @@ class MapView @JvmOverloads constructor(
                    val curX: Float, val curY: Float, val curZ: Float, val hasCur: Boolean,
                    val hint: String?,
                    val dirX: Float = 0f, val dirY: Float = 0f,
-                   pts: FloatArray = EMPTY, val ptsN: Int = 0) {
+                   pts: FloatArray = EMPTY, val ptsN: Int = 0,
+                   reloc: FloatArray = EMPTY, val relocN: Int = 0) {
         /** 自己留一份 —— 调用方那个缓冲下一拍就复用了。 */
         val traj: FloatArray = traj.copyOf()
 
         /** 同上，但**只拷用到的部分**（容量由 C++ 那侧的上限决定，实际常只有几千）。 */
         val pts: FloatArray = if (ptsN > 0) pts.copyOf(ptsN * 3) else EMPTY
+
+        /**
+         * 认出来的那张旧图的点云，**已经变换到当前图坐标系**（换算是 C++ 做的）。
+         * 两张图坐标系不同，不换算就叠不到一起。
+         */
+        val reloc: FloatArray = if (relocN > 0) reloc.copyOf(relocN * 3) else EMPTY
     }
 
     companion object {
@@ -116,6 +123,9 @@ class MapView @JvmOverloads constructor(
      */
     private var cloudScratch = FloatArray(0)
 
+    /** 旧图那一层的缓冲。和 [cloudScratch] 同样按需要长大、稳定后零分配。 */
+    private var relocScratch = FloatArray(0)
+
     // ---------------- 画笔 ----------------
 
     /**
@@ -127,6 +137,28 @@ class MapView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
         strokeWidth = 1.8f * density
         color = 0xB0CFD8DC.toInt()
+    }
+
+    /**
+     * 认出来的那张旧图的点云。**用绿**：灰是当前图、白是轨迹、琥珀是当前位置，
+     * 还得留一个能一眼分开的色。
+     */
+    private val relocPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeWidth = 1.8f * density
+        color = 0x9081C784.toInt()
+    }
+    private val relocDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0x9081C784.toInt()
+    }
+
+    /** 图例文字。比提示文字小一号，靠左贴边。 */
+    private val legendPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 9f * resources.displayMetrics.scaledDensity
+        color = Color.WHITE
+        textAlign = Paint.Align.LEFT
     }
 
     /** 轨迹线。**不用青色** —— 那是测量那边标记/折线的颜色，同屏会混。 */
@@ -217,30 +249,44 @@ class MapView @JvmOverloads constructor(
     }
 
     /**
-     * 点云：**只画当前高度附近这一带**，于是画面上剩下的就是墙和家具的横切轮廓。
+     * 画一层点云：**只画当前高度附近这一带**，于是画面上剩下的就是墙和家具的横切轮廓。
      *
-     * 一遍过 —— 同层且在窗口内的点直接转屏幕坐标写进 scratch，最后一次 `drawPoints`。
-     * 切片是单色的，所以**不需要按颜色分桶**。
+     * 一遍过 —— 同层且在窗口内的点直接转屏幕坐标写进 `scratch`，最后一次 `drawPoints`。
+     * 一层单色，所以**不需要按颜色分桶**。返回（可能长大过的）scratch。
      */
-    private fun drawCloud(canvas: Canvas, s: Snapshot) {
-        if (s.ptsN <= 0) return
+    private fun drawLayer(canvas: Canvas, pts: FloatArray, n: Int,
+                          scratch: FloatArray, paint: Paint): FloatArray {
+        if (n <= 0) return scratch
         // 按这次的点数长，长过就不再缩 ⟹ 稳定之后零分配。装得下所有点，写的时候不用再判越界。
-        if (cloudScratch.size < s.ptsN * 2) cloudScratch = FloatArray(s.ptsN * 2)
+        var buf = scratch
+        if (buf.size < n * 2) buf = FloatArray(n * 2)
 
         val lo = zS - sliceRange * 0.5f
         val hi = zS + sliceRange * 0.5f
 
         var cnt = 0
-        for (i in 0 until s.ptsN) {
-            val z = s.pts[i * 3 + 2]
+        for (i in 0 until n) {
+            val z = pts[i * 3 + 2]
             if (z < lo || z > hi) continue
-            worldToView(s.pts[i * 3], s.pts[i * 3 + 1], pt)
+            worldToView(pts[i * 3], pts[i * 3 + 1], pt)
             if (pt.x < 0f || pt.x >= width || pt.y < 0f || pt.y >= height) continue
-            cloudScratch[cnt * 2] = pt.x
-            cloudScratch[cnt * 2 + 1] = pt.y
+            buf[cnt * 2] = pt.x
+            buf[cnt * 2 + 1] = pt.y
             cnt++
         }
-        if (cnt > 0) canvas.drawPoints(cloudScratch, 0, cnt * 2, cloudPaint)
+        if (cnt > 0) canvas.drawPoints(buf, 0, cnt * 2, paint)
+        return buf
+    }
+
+    /**
+     * 图例：一个绿点 + 「旧图」。**必须有** —— 叠了一层却没标，
+     * 那块绿会被当成当前图的点，于是「旧图叠得对不对」就看不出来了。
+     */
+    private fun drawLegend(canvas: Canvas) {
+        val x = 5f * density
+        val y = 11f * density
+        canvas.drawCircle(x + 2.5f * density, y - 3f * density, 2.5f * density, relocDotPaint)
+        canvas.drawText("旧图", x + 8f * density, y, legendPaint)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -264,7 +310,10 @@ class MapView @JvmOverloads constructor(
             updateSliceCenter(s.curZ)
         }
 
-        drawCloud(canvas, s)
+        // 旧图先画，当前图盖在上面 —— 叠了一层也不挡视线。
+        relocScratch = drawLayer(canvas, s.reloc, s.relocN, relocScratch, relocPaint)
+        cloudScratch = drawLayer(canvas, s.pts, s.ptsN, cloudScratch, cloudPaint)
+        if (s.relocN > 0) drawLegend(canvas)
 
         // ⚠️ `Path` 是**累积**的 —— 不 reset 的话每一帧都往里再加一条折线，
         //    画面上会越描越粗、而且旧轨迹永远擦不掉。

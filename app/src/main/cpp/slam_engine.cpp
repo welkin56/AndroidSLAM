@@ -156,6 +156,14 @@ struct Engine {
     /** 选没选旧图。只用来在构造失败时说清是哪一种。 */
     bool loadWanted = false;
 
+    /**
+     * 构造那一刻吃的旧图（空 = 从零建）。
+     *
+     * ⚠️ 它和「入口页这次选了什么」是两回事：`init` 只生效一次，System 也只构造一次，
+     * 所以之后再选别的地图**不会生效**。界面得说清这一点，否则用户会以为换了。
+     */
+    std::string loadPath;
+
     /** 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。 */
     std::atomic<int> failCode{0};
 
@@ -169,6 +177,23 @@ struct Engine {
     bool saveRequest = false;
     std::string savePath;   // 不含 .osa
     int saveState = 0;      // 0 空闲 / 1 排队 / 2 保存中 / 3 完成 / 4 失败
+
+    /**
+     * 「重定位」的请求。主线程发，worker 在帧边界处理 —— 它碰当前帧和地图。
+     *
+     * 一次探针的结果不可信，要连续几次落到同一片区域才算认出来，所以这是个**持续
+     * 若干帧的过程**，不是一次调用。
+     */
+    std::atomic<bool> relocWanted{false};
+    /** 0 空闲 / 1 采集中 / 2 没候选 / 3 有候选但没匹配上 / 4 认出来了 / 5 前后不一致。 */
+    std::atomic<int> relocCode{0};
+    /** 认出来的那张图的点云，已变换到当前图坐标系。0 = 等下一次重建。 */
+    std::atomic<long long> relocSnapAtMs{0};
+    /** 快照 + 那张图的账（`[关键帧数, 排第几]`）。建一次就够 —— 它不是当前图，不会再变。 */
+    std::mutex relocSnapMutex;
+    std::vector<float> relocSnap;
+    std::vector<float> relocBuild;
+    int relocInfo[3] = {0, 0, 0};
 
     /**
      * 折线上的一个点。**存 `MapPoint*` 而不是只存坐标** —— 坐标会变，身份不会。
@@ -287,6 +312,37 @@ void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
     rebuildMapSnap(e, sys);
 }
 
+/**
+ * 认出来之后建一次旧图的点云快照（**SLAM 线程**）。
+ *
+ * 只建一次：那张图不是当前图，没人再改它。有帧等着就推迟，理由和 `maybeRebuildMapSnap` 一样。
+ */
+void maybeRebuildRelocSnap(Engine& e, ORB_SLAM3::System* sys) {
+    if (e.relocCode.load() != 4) return;
+    if (e.relocSnapAtMs.load() != 0) return;
+    {
+        std::lock_guard<std::mutex> lk(e.qMutex);
+        if (!e.frames.empty()) return;
+    }
+
+    std::vector<float>& out = e.relocBuild;
+    out.resize(kMapPointsMax * 3);
+    const int n = sys->GetRelocMapPoints(out.data(), static_cast<int>(out.size()));
+    out.resize(static_cast<size_t>(n) * 3);
+
+    int info[3] = {0, 0, 0};
+    sys->RelocState(info);
+
+    {
+        std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+        e.relocSnap.swap(out);
+        e.relocInfo[0] = info[0];
+        e.relocInfo[1] = info[1];
+        e.relocInfo[2] = info[2];
+    }
+    e.relocSnapAtMs.store(nowMs());
+}
+
 /** 会话结束之后的一次性存图。**只在没有帧的时候调** —— 那时那张图才是静的。 */
 void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
     std::string path;
@@ -342,6 +398,7 @@ void worker(Engine& e) {
         }
         if (idle) {
             maybeRebuildMapSnap(e, sys);
+            maybeRebuildRelocSnap(e, sys);
             maybeSaveMap(e, sys);
             continue;
         }
@@ -391,6 +448,11 @@ void worker(Engine& e) {
             publishMeasure(m);
         }
 
+        // 重定位。请求由主线程发，处理放这儿 —— 它碰当前帧和地图，而且一次结果不可信，
+        // 要跨若干帧连续比对（判据在 Tracking 里）。
+        if (e.relocWanted.exchange(false)) sys->RequestRelocalization();
+        e.relocCode.store(sys->ProcessRelocRequest());
+
         // ⚠️ 重置检测**每帧都要做** —— 重置恰恰发生在不 OK 的时候。
         // 重置会清空当前图（KF 数掉到 0），而坐标系已经重新锚定，
         // 前一段轨迹拼不上来了 —— 清掉，只留最后一段。
@@ -408,6 +470,13 @@ void worker(Engine& e) {
                     e.mapSnap.clear();
                 }
                 e.mapSnapAtMs.store(0);   // 下一个空隙立刻重建
+                // 重定位算出的旧图位置也作废了 —— 重置会重新锚定当前图的原点。
+                // 状态码那边 Tracking 已经自己置成 6，这里把快照一起丢掉。
+                {
+                    std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+                    e.relocSnap.clear();
+                    e.relocInfo[0] = e.relocInfo[1] = e.relocInfo[2] = 0;
+                }
             }
         } else {
             sawKfs = true;
@@ -420,6 +489,7 @@ void worker(Engine& e) {
         // ⚠️ 必须在这儿也调一次：30fps 下 `wait_for` 的谓词每次都立刻为真，
         //    上面那个超时分支**根本不执行**。
         maybeRebuildMapSnap(e, sys);
+        maybeRebuildRelocSnap(e, sys);
     }
 }
 
@@ -442,6 +512,7 @@ void init(const std::string& vocabPath, const std::string& settingsPath,
     // 载图**不在这儿做**：`System` 是从 yaml 的 `System.LoadAtlasFromFile` 读的（构造那一刻），
     // 所以真正生效的是 Kotlin 写进那份 yaml 副本的那一行。这里只记一笔，用来区分失败原因。
     e.loadWanted = !loadFromFile.empty();
+    e.loadPath = loadFromFile;
     if (e.loadWanted) printf("[M5] 这次带旧图：%s\n", loadFromFile.c_str());
 
     e.vocab = vocabPath;
@@ -517,17 +588,67 @@ void start() {
         e.measureRing.clear();
     }
     e.resetCount.store(0);
+    // 上一趟的重定位结论不带到这一趟。
+    e.relocWanted.store(false);
+    e.relocCode.store(0);
+    e.relocSnapAtMs.store(0);
+    {
+        std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+        e.relocSnap.clear();
+        e.relocInfo[0] = e.relocInfo[1] = e.relocInfo[2] = 0;
+    }
+    if (ORB_SLAM3::System* sys = e.sys.load()) sys->CancelRelocalization();
     e.running.store(true);
 }
 
 void stop() {
     Engine& e = engine();
     e.running.store(false);
+    e.relocWanted.store(false);
+    if (ORB_SLAM3::System* sys = e.sys.load()) sys->CancelRelocalization();
     // **清空两个队列**：不然下次启动会把停止前积压的旧帧当成新帧喂进去，
     // 而那些帧的时间戳已经落后一大截，跟踪会当场乱掉。
     std::lock_guard<std::mutex> lk(e.qMutex);
     e.frames.clear();
     e.imus.clear();
+}
+
+void requestRelocalize() {
+    Engine& e = engine();
+    e.relocWanted.store(true);
+    e.relocCode.store(1);   // 界面立刻显示「采集中」，别等下一帧
+    e.relocSnapAtMs.store(0);
+    {
+        std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+        e.relocSnap.clear();
+        e.relocInfo[0] = e.relocInfo[1] = e.relocInfo[2] = 0;
+    }
+}
+
+void cancelRelocalize() {
+    Engine& e = engine();
+    e.relocWanted.store(false);
+    e.relocCode.store(0);
+    if (ORB_SLAM3::System* sys = e.sys.load()) sys->CancelRelocalization();
+}
+
+int relocState() { return engine().relocCode.load(); }
+
+void relocMapInfo(int out3[3]) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+    out3[0] = e.relocInfo[0];
+    out3[1] = e.relocInfo[1];
+    out3[2] = e.relocInfo[2];
+}
+
+int getRelocPoints(float* out, int cap) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.relocSnapMutex);
+    const int n = static_cast<int>(e.relocSnap.size() / 3);
+    const int m = std::min(n, cap / 3);
+    if (m > 0) std::memcpy(out, e.relocSnap.data(), sizeof(float) * 3 * static_cast<size_t>(m));
+    return m;
 }
 
 bool pose(float out16[16]) {
@@ -906,6 +1027,8 @@ void atlasStats(int out3[3]) {
 }
 
 int failureCode() { return engine().failCode.load(); }
+
+std::string loadedMapPath() { return engine().loadPath; }
 
 void setMapCloudEnabled(bool on) {
     Engine& e = engine();

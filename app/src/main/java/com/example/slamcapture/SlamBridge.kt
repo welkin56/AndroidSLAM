@@ -106,6 +106,45 @@ object SlamBridge {
     /** 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。 */
     external fun nativeFailureCode(): Int
 
+    /**
+     * 构造 `System` 时**实际**吃的是哪张旧图（空串 = 从零建，绝对路径、不含 `.osa`）。
+     *
+     * 和入口页**这次**选的**可能不一样** —— 构造只发生一次，之后改主意不会生效。
+     */
+    external fun nativeLoadedMap(): String
+
+    // —— 重定位 ——
+    //
+    // 在 atlas 的所有图里找当前帧，不只是当前图。一次结果不可信，要连续几次落到同一片
+    // 区域才算认出来，所以要跨若干帧 —— 按下之后进度看 [nativeRelocState]。
+
+    /** 按「重定位」。只发请求就返回。 */
+    external fun nativeRequestReloc()
+
+    /** 丢掉没做完的请求，回空闲。停止 / 重启时用。 */
+    external fun nativeCancelReloc()
+
+    /**
+     * 0 空闲 / 1 采集中 / 2 没候选 / 3 有候选但没匹配上 / 4 认出来了 / 5 前后不一致
+     * / 6 结果已失效（地图被重置，坐标系换了）。
+     */
+    external fun nativeRelocState(): Int
+
+    /**
+     * 认出来的那张图。`out` 要 ≥ 3，收 `[关键帧数, 在 atlas 里排第几, 是不是当前图自己]`。
+     *
+     * 「是当前图」和「是另一张图」要分开：只有后者才有东西可叠 —— 前者两张本来就在
+     * 同一个坐标系里。
+     */
+    external fun nativeRelocMapInfo(out: IntArray)
+
+    /**
+     * 认出来的那张图的点云，**已经变换到当前图坐标系**。`out` 收 `3n` 个 float，返回点数。
+     *
+     * 两张图坐标系不同，不变换就画不到一起。没认出来时返回 0。
+     */
+    external fun nativeGetRelocPoints(out: FloatArray): Int
+
     /** 把这一趟的位姿历史写成文件（TUM 格式）。**一次运行一份** —— [nativeStart] 会清掉上一趟。 */
     external fun nativeDumpTrajectory(path: String)
 
