@@ -70,6 +70,12 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 13 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetFrameTrajectory()` / `GetFrameTrajectorySize()` —— 把上游那段 VBA 拼装从「写文件」改成「写进 buffer」 | 同上，配套 |
 | 14 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAllMapPoints()` —— 转发 `Atlas::GetAllMapPoints()`，直接返回 `std::vector<MapPoint*>`（**不做抽稀、不碰坐标**，那是显示策略） | ⚠️ **不是上游的 bug**：上游没有这个入口，只有逐帧的 `GetTrackedMapPoints()`。**且必须用 `Atlas::GetAllMapPoints()`** —— `Atlas::GetCurrentMap()` 在坏图窗口里 `while(IsBad()) usleep(3000)`，而且**锁是抱着睡的** |
 | 15 | `orb_slam3/src/Tracking.cc` | `GrabImageMonocular` 里，**一个特征点都没提出来的帧直接丢掉**（返回上一帧位姿，不调 `Track()`）| ⚠️ **上游 bug**：`Frame` 的图像 ctor 在「`mvKeys.empty()`」时**提前 return**，`mpMutexImu` 等成员从没赋过值 ⟹ 真机上 `PreintegrateIMU → setIntegrated()` 解引用未初始化的裸指针，**SIGSEGV 崩在 0x0**。详见 `docs/changes/2026-10-15-empty-frame-crash.md` |
+| 16 | `orb_slam3/src/System.cc` | `SaveAtlas()` / `LoadAtlas()` **不再硬拼 `"./"` 前缀** | ⚠️ **不是上游的 bug，是安卓这条路上的硬伤**：我们给的是**绝对路径**，而 `"./" + "/data/…"` 会被解析成**相对当前目录**（安卓的 CWD 是 `/`，不可写）⟹ 存不进去、也载不进来。去掉前缀对**相对路径的行为完全一样**（`./x` ≡ `x`）|
+| 17 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `SaveAtlasTo(path)` —— 公开包装，让文件名能**现取** | 上游的 `SaveAtlas` 是 private，而且路径只能来自**构造时读的 yaml** ⟹ 而 §9 要「另存、不覆盖」= 每次一个新名字，构造时根本还不知道 |
+| 18 | `orb_slam3/src/System.cc` | 载图失败从 **`exit(-1)` 改成抛异常** | ⚠️ `exit(-1)` 在安卓上表现为「**App 干净地退回桌面、logcat 里只有一行**」⟹ 用户看到的是「点了启动，App 没了」而没有任何提示。抛出去，`slam_engine.cpp` 的 `construct()` 接得住 |
+| 19 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAtlasStats()` —— atlas 里有几张图 / 共多少关键帧 / 多少地图点 | 同 14，给界面显示用。**没有它，「图载进来了没有」在界面上完全看不出来**（载完之后当前图是新建的空图）|
+| 20 | `orb_slam3/include/Atlas.h` + `src/Atlas.cc`、`include/System.h` + `src/System.cc` | **新增** `Atlas::AdoptFrom()` / `System::LoadAtlasInto()` / `System::ReloadAtlasFrom()` —— 在**进程内**把 atlas 换回某份 `.osa` 的状态 | ⚠️ 构造之后想换图，上游只有「换进程」一条路：`LoadAtlas()` 里 `ia >> mpAtlas` **换的是指针**，而 `Tracking` / `LocalMapping` / `LoopClosing` 都攥着旧指针。改成「读进现有对象、只搬内容」，对象身份不变，线程不用改指向 |
+| 21 | `orb_slam3/src/Tracking.cc`（`Reset`）、`src/LoopClosing.cc`（`ResetIfRequested`） | `Reset` 清那四张轨迹表时拿上 `mMutexTraj`；`ResetIfRequested` 顺手清掉半途的回环 / 合并候选计数 | 上游 `Reset` 只在 `Shutdown` 之后调、`ResetIfRequested` 只在 `System::Reset()` 里用 ⟹ 它没考虑「主线程正在读轨迹」和「上一个 KF 的候选缓存」。我们这两条都碰上了 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

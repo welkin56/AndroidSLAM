@@ -22,6 +22,7 @@
 #include "Converter.h"
 #include <thread>
 #include <iomanip>
+#include <stdexcept>
 #include "md5.h"
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/string.hpp>
@@ -158,7 +159,8 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
         if(!isRead)
         {
             cout << "Error to load the file, please try with other session file or vocabulary file" << endl;
-            exit(-1);
+            // 上游是 exit(-1)：在安卓上就是 App 直接没了、不给任何提示。抛出去让调用方接。
+            throw std::runtime_error("LoadAtlas failed: " + mStrLoadAtlasFromFile + ".osa");
         }
         //mpKeyFrameDatabase = new KeyFrameDatabase(*mpVocabulary);
 
@@ -896,6 +898,70 @@ std::vector<MapPoint*> System::GetAllMapPoints()
     return mpAtlas->GetAllMapPoints();
 }
 
+void System::SaveAtlasTo(const std::string& path)
+{
+    // 文件名现取：塞进那个成员再走上游那条路（SaveAtlas 只认成员，不带路径参数）。
+    mStrSaveAtlasToFile = path;
+
+    // 先停 LocalMapping：它正在建点的话，序列化会读到半张图。停不动就别死等，直接存。
+    if (mpLocalMapper != nullptr)
+    {
+        mpLocalMapper->RequestStop();
+        for (int i = 0; i < 200 && !mpLocalMapper->Stop(); ++i)
+            usleep(1000);
+    }
+
+    SaveAtlas(FileType::BINARY_FILE);
+
+    if (mpLocalMapper != nullptr)
+        mpLocalMapper->Release();
+}
+
+bool System::ReloadAtlasFrom(const std::string& path)
+{
+    if(mpTracker == nullptr || mpAtlas == nullptr)
+        return false;
+
+    // 清当前图、轨迹和倒排表；KeyFrame / Frame 的 ID 计数器归零
+    //（紧接着的 LoadAtlasInto 会把它们恢复成文件里的值）。
+    // ⚠️ 这一步会阻塞等 LocalMapping / LoopClosing 应答，所以只能从 SLAM 线程调。
+    mpTracker->Reset();
+
+    if(path.empty())
+        return true;   // 上面那次 Reset 已经留了一张空图
+
+    if(!LoadAtlasInto(path, FileType::BINARY_FILE))
+    {
+        cout << "ReloadAtlasFrom: 载入失败，保留一张空图" << endl;
+        return false;
+    }
+
+    // Reset 建的那张空图不在新读进来的 mspMaps 里了 ⟹ 换一张干净的当前图。
+    mpAtlas->CreateNewMap();
+    mpAtlas->SetInertialSensor();
+    return true;
+}
+
+void System::GetAtlasStats(int* maps, int* kfs, int* mps)
+{
+    *maps = 0;
+    *kfs = 0;
+    *mps = 0;
+    if (mpAtlas == nullptr)
+        return;
+
+    // `GetAllMaps()` 拿 `mMutexAtlas`、`KeyFramesInMap()`/`MapPointsInMap()` 拿 `mMutexMap`
+    // ⟹ 从任意线程调都安全（不碰 `mpCurrentMap`，所以也不会撞上 `GetCurrentMap()` 那个睡眠）。
+    for (Map* pMap : mpAtlas->GetAllMaps())
+    {
+        if (pMap == nullptr)
+            continue;
+        (*maps)++;
+        *kfs += static_cast<int>(pMap->KeyFramesInMap());
+        *mps += static_cast<int>(pMap->MapPointsInMap());
+    }
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 
@@ -1528,9 +1594,8 @@ void System::SaveAtlas(int type){
         // Save the current session
         mpAtlas->PreSave();
 
-        string pathSaveFileName = "./";
-        pathSaveFileName = pathSaveFileName.append(mStrSaveAtlasToFile);
-        pathSaveFileName = pathSaveFileName.append(".osa");
+        // 上游这里硬拼了 "./" 前缀，会把绝对路径变成相对的（安卓的 CWD 是 `/`，不可写）。
+        string pathSaveFileName = mStrSaveAtlasToFile + ".osa";
 
         string strVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
         std::size_t found = mStrVocabularyFilePath.find_last_of("/\\");
@@ -1567,9 +1632,8 @@ bool System::LoadAtlas(int type)
     string strFileVoc, strVocChecksum;
     bool isRead = false;
 
-    string pathLoadFileName = "./";
-    pathLoadFileName = pathLoadFileName.append(mStrLoadAtlasFromFile);
-    pathLoadFileName = pathLoadFileName.append(".osa");
+    // 同 SaveAtlas：那个 "./" 前缀会把绝对路径变成相对的。
+    string pathLoadFileName = mStrLoadAtlasFromFile + ".osa";
 
     if(type == TEXT_FILE) // File text
     {
@@ -1623,6 +1687,82 @@ bool System::LoadAtlas(int type)
         return true;
     }
     return false;
+}
+
+bool System::LoadAtlasInto(const std::string& path, int type)
+{
+    string strFileVoc, strVocChecksum;
+    bool isRead = false;
+    Atlas* pLoaded = nullptr;
+
+    string pathLoadFileName = path + ".osa";
+
+    try
+    {
+        if(type == TEXT_FILE)
+        {
+            cout << "Starting to read the save text file " << endl;
+            std::ifstream ifs(pathLoadFileName, std::ios::binary);
+            if(!ifs.good())
+            {
+                cout << "Load file not found" << endl;
+                return false;
+            }
+            boost::archive::text_iarchive ia(ifs);
+            ia >> strFileVoc;
+            ia >> strVocChecksum;
+            ia >> pLoaded;
+            isRead = true;
+        }
+        else if(type == BINARY_FILE)
+        {
+            cout << "Starting to read the save binary file" << endl;
+            std::ifstream ifs(pathLoadFileName, std::ios::binary);
+            if(!ifs.good())
+            {
+                cout << "Load file not found" << endl;
+                return false;
+            }
+            boost::archive::binary_iarchive ia(ifs);
+            ia >> strFileVoc;
+            ia >> strVocChecksum;
+            ia >> pLoaded;
+            isRead = true;
+        }
+    }
+    catch(const std::exception& e)
+    {
+        cout << "LoadAtlasInto: 反序列化失败 " << e.what() << endl;
+        delete pLoaded;
+        return false;
+    }
+
+    if(!isRead || pLoaded == nullptr)
+    {
+        delete pLoaded;
+        return false;
+    }
+
+    //Check if the vocabulary is the same
+    string strInputVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath, TEXT_FILE);
+    if(strInputVocabularyChecksum.compare(strVocChecksum) != 0)
+    {
+        cout << "The vocabulary load isn't the same which the load session was created " << endl;
+        cout << "-Vocabulary name: " << strFileVoc << endl;
+        delete pLoaded;
+        return false;
+    }
+
+    // 关键差别：不 `mpAtlas = pLoaded`（那会让各线程手里的指针失效），
+    // 而是把内容搬进现有的 Atlas。
+    mpAtlas->AdoptFrom(pLoaded);
+    delete pLoaded;   // 内容已搬走，只剩空壳（`mspMaps` 还是空的）
+
+    mpAtlas->SetKeyFrameDababase(mpKeyFrameDatabase);
+    mpAtlas->SetORBVocabulary(mpVocabulary);
+    mpAtlas->PostLoad();
+
+    return true;
 }
 
 string System::CalculateCheckSum(string filename, int type)

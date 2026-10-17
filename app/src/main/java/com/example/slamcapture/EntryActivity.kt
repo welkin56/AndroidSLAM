@@ -23,9 +23,7 @@ import java.util.Locale
  *
  * 启动主界面时**不 finish()** —— Back 要能回到这儿改主意。
  *
- * ⚠️ **保存还没做（M8）**，所以磁盘上不会有 `.osa`，列表恒为空。
- * 这一页现在的作用是把「选择」这条通道立起来：它一路传到
- * [SlamBridge.nativeInit] 的第三个参数（`null` = 新建地图）。
+ * 选中的东西一路传到 [SlamBridge.nativeInit] 的第三个参数（`null` = 新建地图）。
  */
 class EntryActivity : AppCompatActivity() {
 
@@ -94,15 +92,27 @@ class EntryActivity : AppCompatActivity() {
      * ⚠️ 这里**只能显示文件层面的东西**（名字、时间）。「这张图有多少关键帧」显示不了 ——
      * 那要新增 JNI 查询接口，而 STAGE5 §6 的接口表里没有。
      */
-    private fun listMaps(): List<File> =
-        (mapsDir().listFiles { f -> f.isFile && f.name.endsWith(EXT) } ?: emptyArray())
+    /**
+     * 扫 `maps/<图目录>/<名字>.osa`。
+     *
+     * 一张地图一个目录：里面还住着这张图的 `run-N/`（轨迹）。一个目录里可能有多份
+     * `.osa` —— 每次「另存」都新写一份，不覆盖。
+     */
+    private fun listMaps(): List<File> {
+        val dirs = mapsDir().listFiles { f -> f.isDirectory } ?: return emptyList()
+        return dirs
+            .flatMap { d -> (d.listFiles { f -> f.isFile && f.name.endsWith(EXT) } ?: emptyArray()).toList() }
             .sortedByDescending { it.lastModified() }
+    }
 
     private fun mapsDir(): File = File(getExternalFilesDir(null) ?: filesDir, MAPS_DIR)
 
     private fun describe(f: File): String {
         val when_ = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(f.lastModified()))
-        return "${f.name.removeSuffix(EXT)}\n$when_"
+        val dir = f.parentFile?.name ?: ""
+        val base = f.name.removeSuffix(EXT)
+        // 一个目录里有多份 .osa 时才把文件名也显出来，不然和目录名重复。
+        return if (base == dir) "$dir\n$when_" else "$dir / $base\n$when_"
     }
 
     /**

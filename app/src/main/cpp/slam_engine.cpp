@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -152,6 +153,47 @@ struct Engine {
     /** 「地图被重置」的次数。`start()` 归零。 */
     std::atomic<int> resetCount{0};
 
+    /** 选没选旧图。只用来在构造失败时说清是哪一种。 */
+    bool loadWanted = false;
+
+    /** 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。 */
+    std::atomic<int> failCode{0};
+
+    /**
+     * 「保存地图」的请求。主线程发，**worker 在停止之后、空转时**做。
+     *
+     * 不在主线程做是因为序列化整张 atlas 要几秒（会把界面卡死），
+     * 排给 worker 还顺带拿到一条：存档期间不会有帧在动那张图。
+     */
+    std::mutex saveMutex;
+    bool saveRequest = false;
+    std::string savePath;   // 不含 .osa
+    int saveState = 0;      // 0 空闲 / 1 排队 / 2 保存中 / 3 完成 / 4 失败
+
+    /**
+     * 「换成哪份 atlas」的请求。和存图同一条：主线程发，worker 空闲时做。
+     *
+     * 两种语义：
+     * - `restoreHasTarget == false`（默认）—— **恢复**：回到 `savedPath`，没有就 `loadPath`，
+     *   都没有就空图。这是「这一趟没保存」走的路。
+     * - `restoreHasTarget == true` —— **换源**：入口页这次选的那张（空串 = 新建 / 空图）。
+     *
+     * ⚠️ `loadPath` / `savedPath` / `restoreTarget` 都归这把锁管。
+     */
+    std::mutex restoreMutex;
+    bool restoreRequest = false;
+    bool restoreHasTarget = false;
+    std::string restoreTarget;
+    int restoreState = 0;   // 0 空闲 / 1 排队 / 2 恢复中 / 3 完成 / 4 失败
+    /** 构造时载入的 `.osa`（不含扩展名）。空 = 新建地图。 */
+    std::string loadPath;
+    /** 最近一次**成功**存图的路径（不含 .osa）。 */
+    std::string savedPath;
+
+    /** 这一趟开跑时的 atlas 账（图数 / 关键帧数）。没变化就不用恢复。 */
+    std::atomic<int> baseMaps{0};
+    std::atomic<int> baseKfs{0};
+
     /**
      * 折线上的一个点。**存 `MapPoint*` 而不是只存坐标** —— 坐标会变，身份不会。
      * 理由见 `slam_engine.h` 那一整段。
@@ -190,15 +232,27 @@ void construct(Engine& e) {
         // Pangolin 虽然剥了，但传 true 照样会 new 一个 Viewer 对象 + 起一条 std::thread。
         s = new ORB_SLAM3::System(e.vocab, e.settings, ORB_SLAM3::System::IMU_MONOCULAR,
                                   /*bUseViewer=*/false);
+    } catch (const std::exception& ex) {
+        // 载图失败会落到这儿（上游原来是 exit(-1)，补丁 18 改成抛了）。
+        printf("[M5] System 构造抛异常：%s\n", ex.what());
+        s = nullptr;
     } catch (...) {
         s = nullptr;
     }
 
-    // 注意：ORB-SLAM3 报错用的是 exit(-1)（System.cc 7 处 + Settings.cc 9 处），
+    // 注意：ORB-SLAM3 报错用的还是 exit(-1)（System.cc 7 处 + Settings.cc 9 处），
     // 那条路根本走不到这里 —— 进程直接没了，logcat 里只留 M2 接出来的那行 cerr。
     if (s == nullptr) {
-        printf("[M5] System 构造抛异常了\n");
+        printf("[M5] System 构造失败\n");
+        e.failCode.store(e.loadWanted ? 1 : 2);
         e.state.store(State::kFailed);
+        {
+            // 构造失败 ⟹ worker 不会进循环，排着的恢复/换源永远不会被执行。
+            // 不清掉的话界面会一直停在「载入地图…」。
+            std::lock_guard<std::mutex> lk(e.restoreMutex);
+            e.restoreRequest = false;
+            e.restoreState = 0;
+        }
         return;
     }
 
@@ -264,6 +318,135 @@ void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
     rebuildMapSnap(e, sys);
 }
 
+/** 会话结束之后的一次性存图。**只在没有帧的时候调** —— 那时那张图才是静的。 */
+void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lk(e.saveMutex);
+        if (!e.saveRequest) return;
+        e.saveRequest = false;
+        e.saveState = 2;   // 保存中
+        path = e.savePath;
+    }
+
+    printf("[MAP] 开始存图 → %s.osa\n", path.c_str());
+    fflush(stdout);
+    bool ok = true;
+    try {
+        sys->SaveAtlasTo(path);
+    } catch (...) {
+        ok = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(e.saveMutex);
+        e.saveState = ok ? 3 : 4;
+    }
+    if (ok) {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        e.savedPath = path;   // 「上一次保存」= 这一份
+    }
+    printf("[MAP] 存图%s\n", ok ? "完成" : "失败");
+    fflush(stdout);
+}
+
+/**
+ * 把 atlas 退回「上一次保存」的样子（**SLAM 线程、空闲时**）。
+ *
+ * 这一趟没存图 ⟹ 它建出来的图不该留在 atlas 里：回环检测是从倒排表里找候选的，
+ * 留着就等于下一趟还能把已经丢掉的数据合并回来。
+ *
+ * 返回 true 表示真的做过一次恢复 —— 调用方要把「见过 KF」那个本地状态清掉。
+ */
+bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
+    std::string path;
+    bool explicitTarget = false;
+    {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        if (!e.restoreRequest) return false;
+        e.restoreRequest = false;
+        explicitTarget = e.restoreHasTarget;
+        path = explicitTarget ? e.restoreTarget
+                              : (e.savedPath.empty() ? e.loadPath : e.savedPath);
+    }
+
+    // 还在吃帧就先别动 —— Reset 会把当前图整个清掉，这一帧的位姿就接不上了。
+    // 请求留着，等停下来那一轮再做。
+    if (e.running.load()) {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        e.restoreRequest = true;
+        return false;
+    }
+
+    // 存图优先：序列化期间 LocalMapping 是被停住的，这时候去 Reset 会等死。
+    {
+        std::lock_guard<std::mutex> lk(e.saveMutex);
+        if (e.saveRequest || e.saveState == 2) {
+            std::lock_guard<std::mutex> lk2(e.restoreMutex);
+            e.restoreRequest = true;   // 下一轮再来
+            return false;
+        }
+    }
+
+    // 这一趟什么都没建出来 ⟹ 恢复是原地打转（还会白漏一份旧对象）。
+    // 换源（入口页重新选了一张）不适用：那是用户明确要的结果，没数据也得换。
+    if (!explicitTarget) {
+        int st[3] = {0, 0, 0};
+        sys->GetAtlasStats(&st[0], &st[1], &st[2]);
+        if (st[0] == e.baseMaps.load() && st[1] == e.baseKfs.load()) {
+            std::lock_guard<std::mutex> lk(e.restoreMutex);
+            e.restoreState = 3;
+            printf("[MAP] 恢复 atlas：这一趟没有新数据，跳过\n");
+            fflush(stdout);
+            return true;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        e.restoreState = 2;   // 恢复中
+    }
+    printf("[MAP] %s → %s\n", explicitTarget ? "换源" : "恢复 atlas",
+           path.empty() ? "(空图)" : (path + ".osa").c_str());
+    fflush(stdout);
+
+    const bool ok = sys->ReloadAtlasFrom(path);
+
+    {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        if (!ok) {
+            // 失败时 `Tracking::Reset()` 已经执行过了 ⟹ 内存里就是一张空图。
+            // 来源也清掉，免得 `loadedMapPath()` 还报着那张其实没装进来的图。
+            e.loadPath.clear();
+            e.savedPath.clear();
+        } else if (explicitTarget) {
+            // 换源成功 ⟹ 以后的「恢复」以新源为准，旧源不再参与。
+            e.loadPath = path;
+            e.savedPath.clear();
+        }
+    }
+
+    // 坐标系整个换了 ⟹ 位姿和点云快照都不再成立。
+    {
+        std::lock_guard<std::mutex> lk(e.poseMutex);
+        e.poseValid = false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(e.mapSnapMutex);
+        e.mapSnap.clear();
+    }
+    e.mapSnapAtMs.store(0);   // 下一个空隙立刻重建
+
+    {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        // 这期间又来了一个请求就不改状态 —— 下一轮接着做，界面还停在「恢复中」。
+        if (!e.restoreRequest) e.restoreState = ok ? 3 : 4;
+    }
+    printf("[MAP] %s%s\n", explicitTarget ? "换源" : "恢复 atlas", ok ? "完成" : "失败");
+    fflush(stdout);
+    return true;
+}
+
 // 常驻循环：先构造，然后一直取帧、跟踪、存位姿。M4 那版是「构造完就退出」。
 void worker(Engine& e) {
     construct(e);
@@ -291,6 +474,9 @@ void worker(Engine& e) {
         }
         if (idle) {
             maybeRebuildMapSnap(e, sys);
+            maybeSaveMap(e, sys);
+            // 恢复会清空当前图 ⟹ 「见过 KF」要一起清，不然下一帧会被记成一次重置。
+            if (maybeRestoreMap(e, sys)) sawKfs = false;
             continue;
         }
 
@@ -387,12 +573,22 @@ void init(const std::string& vocabPath, const std::string& settingsPath,
         return;  // 已经调过（或正在加载）。构造一次要三十几秒，不能重来。
     }
 
-    if (!loadFromFile.empty()) {
-        // ⚠️ M5 还不支持载入旧图。而且这里有个结构性的麻烦：`System` 的构造函数**没有**
-        // 「从哪个文件载」这个参数 —— 它读的是 yaml 里的 `System.LoadAtlasFromFile`
-        // （System.cc:76-98）。所以要真支持，M8 得另想办法。
-        printf("[M5] 收到了 loadFromFile 但还不支持载入旧图，忽略：%s\n", loadFromFile.c_str());
+    // 载图**不在这儿做**：`System` 是从 yaml 的 `System.LoadAtlasFromFile` 读的（构造那一刻），
+    // 所以真正生效的是 Kotlin 写进那份 yaml 副本的那一行。这里只记一笔，用来区分失败原因。
+    e.loadWanted = !loadFromFile.empty();
+    {
+        // ⚠️ Kotlin 传的是完整文件名（含 `.osa`），而恢复 / 换源这条路和上游
+        // `LoadAtlas` 一样**自己拼 `.osa`** ⟹ 这里必须去掉，否则会拼成 `.osa.osa`。
+        std::string lp = loadFromFile;
+        const std::string kOsaExt = ".osa";
+        if (lp.size() > kOsaExt.size() &&
+            lp.compare(lp.size() - kOsaExt.size(), kOsaExt.size(), kOsaExt) == 0) {
+            lp.resize(lp.size() - kOsaExt.size());
+        }
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        e.loadPath = lp;   // 「没存过」时恢复回这里
     }
+    if (e.loadWanted) printf("[M5] 这次带旧图：%s\n", loadFromFile.c_str());
 
     e.vocab = vocabPath;
     e.settings = settingsPath;
@@ -449,7 +645,14 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
 void start() {
     Engine& e = engine();
     // 一次运行 = 一份轨迹。上游那张表从不清理，不清的话会跨 run 累加。
-    if (ORB_SLAM3::System* sys = e.sys.load()) sys->ClearFrameTrajectory();
+    if (ORB_SLAM3::System* sys = e.sys.load()) {
+        sys->ClearFrameTrajectory();
+        // 记下开跑时的 atlas 账：「不保存就恢复」靠它判断这一趟到底建出东西没有。
+        int st[3] = {0, 0, 0};
+        sys->GetAtlasStats(&st[0], &st[1], &st[2]);
+        e.baseMaps.store(st[0]);
+        e.baseKfs.store(st[1]);
+    }
     {
         // 点云同理：上一趟的快照不能留到这一趟。
         std::lock_guard<std::mutex> lk(e.mapSnapMutex);
@@ -830,6 +1033,64 @@ int getMapPoints(float* out, int cap) {
     std::memcpy(out, e.mapSnap.data(), sizeof(float) * 3 * static_cast<size_t>(n));
     return n;
 }
+
+void requestSaveMap(const std::string& path) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.saveMutex);
+    // 排着队或者正在存 ⟹ 丢掉这次。界面上那条路万一重复触发，也不该存两遍。
+    if (e.saveState == 1 || e.saveState == 2) return;
+    e.savePath = path;
+    e.saveRequest = true;
+    e.saveState = 1;             // 排队
+}
+
+int saveState() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.saveMutex);
+    return e.saveState;
+}
+
+void requestRestoreMap() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.restoreMutex);
+    // 排着队或者正在恢复 ⟹ 丢掉这次（重复触发不该恢复两遍）。
+    if (e.restoreState == 1 || e.restoreState == 2) return;
+    e.restoreHasTarget = false;   // 语义是「回到上一次保存」
+    e.restoreRequest = true;
+    e.restoreState = 1;   // 排队
+}
+
+void requestLoadAtlas(const std::string& path) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.restoreMutex);
+    // 这条**不丢**：入口页的选择以最后一次为准。正在恢复就排队，做完接着换。
+    e.restoreTarget = path;
+    e.restoreHasTarget = true;
+    e.restoreRequest = true;
+    e.restoreState = 1;   // 排队
+}
+
+std::string loadedMapPath() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.restoreMutex);
+    return e.savedPath.empty() ? e.loadPath : e.savedPath;
+}
+
+int restoreState() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.restoreMutex);
+    return e.restoreState;
+}
+
+void atlasStats(int out3[3]) {
+    out3[0] = 0;
+    out3[1] = 0;
+    out3[2] = 0;
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys != nullptr) sys->GetAtlasStats(&out3[0], &out3[1], &out3[2]);
+}
+
+int failureCode() { return engine().failCode.load(); }
 
 void setMapCloudEnabled(bool on) {
     Engine& e = engine();

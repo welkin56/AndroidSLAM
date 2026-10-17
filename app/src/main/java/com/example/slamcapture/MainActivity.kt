@@ -13,6 +13,7 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -127,7 +128,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var btnSlam: Button
-    private lateinit var btnReloc: Button
     private lateinit var swRecord: SwitchCompat
     private lateinit var swMeasure: SwitchCompat
     private lateinit var tvStatus: TextView
@@ -181,6 +181,35 @@ class MainActivity : AppCompatActivity() {
      * 否则「结束再启动」会把同一次新建地图裂成好几个文件夹（2026-09-29 用户报的）。
      */
     private var sessionDir: File? = null
+
+    /** atlas 的账：`[图数, 关键帧数, 地图点数]`。复用同一个数组。 */
+    private val atlasBuf = IntArray(3)
+
+    /** 最近一次存图给的文件名（不含 `.osa`），成功后显示给用户。 */
+    private var savedName: String? = null
+
+    /** 存图状态那行字。`render()` 里按 C++ 的 `nativeSaveState()` 更新。 */
+    private var saveMsg: String? = null
+
+    /** 正在存图。**ticker 靠它才继续跑** —— 存图发生在刚停止之后，那时它本来要停了。 */
+    private var saving = false
+
+    /**
+     * 正在把 atlas 恢复成「上一次保存」的样子。
+     *
+     * 恢复期间**不读 atlas / 轨迹** —— C++ 那头正在重建它们，`Atlas::PostLoad()` 没有锁。
+     * ticker 也靠它继续跑：要轮询到「完成」才能把按钮放开。
+     */
+    private var restoring = false
+
+    /** 上一次看到的恢复状态。只在它变化时改 [restoreMsg]（否则每帧都重写同一句）。 */
+    private var restoreStateSeen = 0
+
+    /** 恢复那行字。 */
+    private var restoreMsg: String? = null
+
+    /** 最近一次请求是「入口页换源」而不是「这一趟没保存」。只影响提示语。 */
+    private var atlasSwitching = false
 
     /** 这一次「启动 SLAM → 结束」的子目录 `<会话>/run-N/`。**它才是坐标系单元**。 */
     private var curRunDir: File? = null
@@ -274,7 +303,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         btnSlam = findViewById(R.id.btnSlam)
-        btnReloc = findViewById(R.id.btnReloc)
         swRecord = findViewById(R.id.swRecord)
         swMeasure = findViewById(R.id.swMeasure)
         tvStatus = findViewById(R.id.tvStatus)
@@ -375,9 +403,6 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
 
-        // 「重定位」现在点不动（恒灰）。判据是「有没有旧图」（§2.4），还没做。
-        btnReloc.setOnClickListener { }
-
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
 
@@ -387,7 +412,23 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 这一句还是**第一次碰 `SlamBridge`** —— `.so` 在此刻加载，`JNI_OnLoad`
         // 顺带装上日志重定向（ORB-SLAM3 的 cout/cerr 全靠它）。别把它排到后面去。
         slamState = SlamBridge.nativeState()
-        if (slamState == SLAM_LOADING) uiQueueTicker()
+
+        // `System` 是进程级的：已经造好的话，入口页这次的选择必须**手动生效** ——
+        // `nativeInit` 不会再跑一遍。不换的话「新建地图」只是又开一张当前图，
+        // 旧 atlas 原样留着（回环检测照样能匹配到它）；「换一张图」同理。
+        var atlasSwitch = false
+        if (slamState == SLAM_READY || slamState == SLAM_LOADING) {
+            val want = mapFile?.removeSuffix(".osa") ?: ""
+            val have = SlamBridge.nativeLoadedMap()
+            if (want != have) {
+                Log.i(TAG, "atlas 换源：$have → $want")
+                atlasSwitching = true
+                SlamBridge.nativeRequestLoadAtlas(want)
+                atlasSwitch = true
+            }
+        }
+
+        if (slamState == SLAM_LOADING || atlasSwitch) uiQueueTicker()
 
         render()
     }
@@ -489,10 +530,22 @@ class MainActivity : AppCompatActivity() {
         SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
 
-        // 会话目录**只建一次**；本次「启动→结束」在它下面开一个 run-N/。
-        val session = sessionDir ?: newSessionDir().also {
-            sessionDir = it
-            writeSessionMeta(it)
+        // 会话目录只建一次；本次「启动→结束」在它下面开一个 run-N/。
+        //
+        // 载入了旧图的话，会话目录就是那张图所在的目录（不新建）：这样一趟趟的 run-N/
+        // 会攒在同一张图下面，「同一张图的轨迹」不用另外存一份。
+        val session = sessionDir ?: run {
+            val loaded = mapFile?.let { File(it).parentFile }
+            if (loaded != null) {
+                loaded.mkdirs()
+                sessionDir = loaded   // 不写 session.json —— 那是这张图第一次建的时候写的
+                loaded
+            } else {
+                newSessionDir().also {
+                    sessionDir = it
+                    writeSessionMeta(it)
+                }
+            }
         }
         curRunDir = nextRunDir(session)
         if (swRecord.isChecked) startRecording()
@@ -524,7 +577,8 @@ class MainActivity : AppCompatActivity() {
         curRunDir = null
         if (dir != null) {
             exportTrajectory(dir)
-            if (reason == "用户结束") askKeepRun(dir) else keepRun(dir)
+            // 先问地图、再问轨迹（askMapSave 问完会接着问轨迹）。一次只弹一个。
+            if (reason == "用户结束") askMapSave(dir) else keepRun(dir)
         }
 
         cam.stop()
@@ -664,7 +718,7 @@ class MainActivity : AppCompatActivity() {
             // **最后一轮刷新被自己吃掉了。**
             render()
 
-            if (slamState == SLAM_LOADING || slamRunning) {
+            if (slamState == SLAM_LOADING || slamRunning || saving || restoring) {
                 uiHandler.postDelayed(this, TICK_MS)
             }
         }
@@ -851,23 +905,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render() {
+        // ---- atlas 恢复 ----
+        // 只在这一侧轮询：C++ 那边在 SLAM 线程上重建 atlas，主线程问不得。
+        val rs = SlamBridge.nativeRestoreState()
+        restoring = rs == 1 || rs == 2
+        if (rs != restoreStateSeen) {
+            restoreStateSeen = rs
+            restoreMsg = when (rs) {
+                1, 2 -> "正在载入地图…"
+                3 -> if (atlasSwitching) "地图已切换" else "已丢弃这一趟：地图退回上一次保存"
+                4 -> "载入地图失败（看 logcat 的 slam）—— 内存里现在是一张空图"
+                else -> restoreMsg
+            }
+        }
+
         // ---- 按钮 ----
         // 三个标签对应三个阶段。**加载中和构造失败都不可点** —— 前者没法取消，后者重试也没用
-        // （C++ 那边的 `init` 只生效一次）。
-        btnSlam.isEnabled = slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY
+        // （C++ 那边的 `init` 只生效一次）。恢复期间也不可点：atlas 正在换。
+        btnSlam.isEnabled =
+            (slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY) && !restoring
         btnSlam.text = when {
-            slamRunning -> "结束"
+            // 加载中 / 构造失败优先：换源请求这会儿还没轮到（失败的话永远不会轮到）。
             slamState == SLAM_LOADING -> "加载中…"
-            slamState == SLAM_READY -> "启动 SLAM"
             slamState == SLAM_FAILED -> "构造失败"
+            restoring -> "载入地图…"
+            slamRunning -> "结束"
+            slamState == SLAM_READY -> "启动 SLAM"
             else -> "准备 SLAM"
         }
         btnSlam.backgroundTintList =
             if (slamRunning) ColorStateList.valueOf(RED) else null
         btnSlam.setTextColor(if (slamRunning) Color.WHITE else DARK_TEXT)
-
-        // 「重定位」的灰 / 亮只看有没有旧图（§2.4）。还没有 referenceMap，所以恒灰。
-        btnReloc.isEnabled = false
 
         // 两个开关都**一直可点** —— 它们表达的是「这一段要不要录 / 要不要量」，
         // 所以启动之前就得能设。
@@ -897,8 +965,25 @@ class MainActivity : AppCompatActivity() {
             SLAM_IDLE ->
                 "SLAM：未准备（$mapLabel）\n\n点「准备 SLAM」构造 System，约 38 秒。"
             SLAM_LOADING -> "SLAM：词袋加载中…（已 ${slamElapsedMs / 1000}s，本机约 38 秒）"
-            SLAM_FAILED -> "SLAM：构造失败 —— 看 logcat（tag slam）"
+            SLAM_FAILED ->
+                if (SlamBridge.nativeFailureCode() == 1)
+                    "SLAM：载图失败 —— 这张图读不了，回入口页换一张或新建"
+                else
+                    "SLAM：构造失败 —— 看 logcat（tag slam）"
             else -> afterReady
+        }
+
+        // 存图状态转成人话。文件名不用问 C++ —— 就是这一侧传过去的。
+        when (SlamBridge.nativeSaveState()) {
+            1, 2 -> saveMsg = "正在保存地图…"
+            3 -> {
+                saveMsg = "地图已保存 → ${savedName ?: "?"}.osa"
+                saving = false
+            }
+            4 -> {
+                saveMsg = "地图保存失败（看 logcat 的 slam）"
+                saving = false
+            }
         }
 
         val body = buildString {
@@ -927,12 +1012,24 @@ class MainActivity : AppCompatActivity() {
             if (recording && w != null) {
                 append("\n录制中：相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条")
             }
+            // 地图账。载图之后这是界面上唯一看得出「图进来了」的地方 ——
+            // 载进来的图不是当前图，小窗、轨迹、测距都看不到它。
+            // ⚠️ 恢复期间不读：`Atlas::PostLoad()` 在重建整个 atlas，它没拿锁。
+            if (slamState == SLAM_READY && !restoring) {
+                SlamBridge.nativeAtlasStats(atlasBuf)
+                if (isNotEmpty()) append("\n")
+                append("地图 ${atlasBuf[0]} 张 / 关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}")
+            }
+            // 词袋加载期间那条「正在载入地图…」只是排队，别和加载进度叠在一起。
+            if (slamState != SLAM_LOADING) restoreMsg?.let { append("\n$it") }
+            saveMsg?.let { append("\n$it") }
             lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
         tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
-        refreshMap()
+        // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
+        if (!restoring) refreshMap()
     }
 
     // ---------------- 2D 地图小窗 ----------------
@@ -1113,6 +1210,9 @@ class MainActivity : AppCompatActivity() {
             assets.open(SETTINGS_NAME).use { input ->
                 dst.outputStream().use { output -> input.copyTo(output) }
             }
+            // 选了旧图就把路径补进去。`System` 构造时读的就是这个键，所以载图只在
+            // 那一刻生效一次。值不带 `.osa`，上游自己加后缀。
+            mapFile?.let { dst.appendText("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }
         } catch (e: IOException) {
             Log.e(TAG, "释放 $SETTINGS_NAME 失败", e)
             tvStatus.text = "打不开 assets/$SETTINGS_NAME：$e"
@@ -1144,10 +1244,20 @@ class MainActivity : AppCompatActivity() {
     private fun newSessionDir(): File {
         // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
         // **绝不能**用 File(null, ...)——那会落到进程的 CWD，在 Android 上就是 "/"。
-        val base = getExternalFilesDir(null) ?: filesDir
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        return File(File(base, "maps"), stamp).apply { mkdirs() }
+        val maps = File(getExternalFilesDir(null) ?: filesDir, "maps")
+        // 时间戳只到秒，同一秒里连开两次会撞名 —— 而撞了就会有两个 .osa 落进同一目录。
+        val s = stamp()
+        var d = File(maps, s)
+        var n = 2
+        while (d.exists()) {
+            d = File(maps, "$s-$n")
+            n++
+        }
+        return d.apply { mkdirs() }
     }
+
+    /** 目录名和地图文件名的统一时间戳格式。 */
+    private fun stamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
 
     /** `<会话>/run-N/`，N 取第一个没被占的号。**这才是坐标系单元** —— 轨迹在它下面。 */
     private fun nextRunDir(session: File): File {
@@ -1181,9 +1291,8 @@ class MainActivity : AppCompatActivity() {
             append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
             if (segs > 0) append("，会话 $segs 段")
             append("\n")
-            if (resets > 0) append("⚠️ 地图被重置 $resets 次 —— 轨迹只保留了最后一段\n")
+            if (resets > 0) append("地图被重置 $resets 次 —— 轨迹只保留了最后一段\n")
             append("\n${dir.absolutePath}")
-            append("\n\n（地图的「另存为新图 / 保存为原图」是 M8，现在只存轨迹和会话。）")
         }
         AlertDialog.Builder(this)
             .setTitle("保存这一趟？")
@@ -1192,6 +1301,136 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("不保存") { _, _ -> onDropTrajectory(dir) }
             .setOnCancelListener { keepRun(dir) }
             .show()
+    }
+
+    /**
+     * 结束时的**第一问**：地图存不存。问完（不管选了哪个）接着问轨迹。
+     *
+     * 排在轨迹前面是有原因的：存地图要**当场把文件名定下来**，定完之后写出来的
+     * `run.json` 才记得上它。「轨迹和地图绑定」是下一批的事，但顺序现在就得对。
+     */
+    private fun askMapSave(runDir: File) {
+        SlamBridge.nativeAtlasStats(atlasBuf)
+        val dir = sessionDir
+        if (dir == null || atlasBuf[1] <= 0) {
+            // 这一趟没建出图 —— 没什么好问的，但也别沉默。
+            saveMsg = "这一趟没有可存的地图"
+            askKeepRun(runDir)
+            return
+        }
+
+        val existing = dir.listFiles { f -> f.isFile && f.name.endsWith(".osa") }
+            ?.maxByOrNull { it.lastModified() }
+
+        // 只有「另存为」用得上。不勾就只拷 trajectory.txt / run.json（几毫秒），
+        // 勾了连录像一起拷 —— 那是原始数据，一段可能几百 MB。
+        val copyRec = CheckBox(this).apply {
+            text = "另存时连录像一起拷"
+            setPadding(56, 0, 56, 0)
+        }
+
+        val b = AlertDialog.Builder(this)
+            .setTitle("保存地图？")
+            .setMessage(
+                buildString {
+                    append("关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}\n\n${dir.absolutePath}")
+                    // 这个 .osa 装的是整个 atlas。载入过旧图、本趟又建出了新图就是两张
+                    //（Atlas::PreSave 只会剔掉没有关键帧的空图）。
+                    if (atlasBuf[0] > 1)
+                        append("\n\n注意：这个 .osa 里会有 ${atlasBuf[0]} 张图，不只是当前这一张。")
+                }
+            )
+            .setView(copyRec)
+        // 用户到底选没选「存」。三个肯定按钮都要置 true ——
+        // 只有「不保存」和直接关掉（返回键 / 点外面）才该丢图。
+        var willSave = false
+        if (existing != null) {
+            b.setPositiveButton("覆盖") { _, _ ->
+                willSave = true
+                startMapSave(existing.absolutePath.removeSuffix(".osa"))
+            }
+                .setNeutralButton("另存为") { _, _ ->
+                    willSave = true
+                    saveMapAs(copyRec.isChecked)
+                }
+                .setNegativeButton("不保存", null)
+        } else {
+            b.setPositiveButton("保存") { _, _ ->
+                willSave = true
+                startMapSave(File(dir, stamp()).absolutePath)
+            }
+                .setNegativeButton("不保存", null)
+        }
+        val dlg = b.create()
+        // 挂在「弹窗消失」上：两个轴互不影响，问完接着问轨迹。
+        dlg.setOnDismissListener {
+            if (!willSave) {
+                // 这一趟不要了：把 atlas 退回上一次保存的样子。
+                // 不退回的话，这趟建的图会一直留在内存里，下一趟的回环检测还能匹配到它。
+                Log.i(TAG, "这一趟不存图 → 请求恢复 atlas")
+                atlasSwitching = false
+                SlamBridge.nativeRequestRestoreMap()
+                uiQueueTicker()   // 恢复的进度和结果要靠 ticker 刷
+            }
+            askKeepRun(runDir)
+        }
+        dlg.show()
+    }
+
+    /** 让 SLAM 线程把地图存成 `path + ".osa"`（`path` 不含扩展名）。 */
+    private fun startMapSave(pathNoExt: String) {
+        savedName = File(pathNoExt).name
+        saveMsg = "正在保存地图…"
+        Log.i(TAG, "存图 → $pathNoExt.osa")
+        SlamBridge.nativeRequestSaveMap(pathNoExt)
+        // 刚停止，ticker 本来要停了 —— 叫起来才刷得到「已保存」。
+        saving = true
+        uiQueueTicker()
+        render()
+    }
+
+    /**
+     * 另存：新开一个文件夹，把这张图已有的 run 拷过去，当前这趟也算在新图里。
+     *
+     * 拷的默认只有 `trajectory.txt` / `run.json`；录像要用户自己勾（见 [askMapSave]）。
+     */
+    private fun saveMapAs(copyRecordings: Boolean) {
+        val src = sessionDir ?: return
+        val dst = newSessionDir()
+        File(src, "session.json").takeIf { it.isFile }
+            ?.copyTo(File(dst, "session.json"), overwrite = true)
+
+        src.listFiles { f -> f.isDirectory && f.name.startsWith("run-") }
+            ?.forEach { copyRun(it, File(dst, it.name), copyRecordings) }
+
+        // 当前这趟：trajectory.txt 已经导过了，run.json 等会儿才写 —— 让它写进新文件夹。
+        val cur = curRunDir
+        if (cur != null && cur.parentFile == src) {
+            copyRun(cur, File(dst, cur.name), copyRecordings)
+            curRunDir = File(dst, cur.name)
+        }
+
+        sessionDir = dst   // 之后这一趟的 run 都算这张新图的
+        Log.i(TAG, "另存为新图：${dst.absolutePath}")
+        startMapSave(File(dst, dst.name).absolutePath)
+    }
+
+    /** 拷一个 run 目录里**属于轨迹**的东西；录像另说。 */
+    private fun copyRun(src: File, dst: File, copyRecordings: Boolean) {
+        dst.mkdirs()
+        for (n in listOf("trajectory.txt", "run.json")) {
+            File(src, n).takeIf { it.isFile }?.copyTo(File(dst, n), overwrite = true)
+        }
+        if (!copyRecordings) return
+        src.listFiles { f -> f.isDirectory }?.forEach { copyTree(it, File(dst, it.name)) }
+    }
+
+    private fun copyTree(src: File, dst: File) {
+        dst.mkdirs()
+        src.listFiles()?.forEach { f ->
+            if (f.isDirectory) copyTree(f, File(dst, f.name))
+            else f.copyTo(File(dst, f.name), overwrite = true)
+        }
     }
 
     private fun keepRun(dir: File) {

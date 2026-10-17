@@ -3841,16 +3841,26 @@ void Tracking::Reset(bool bLocMap)
     mbReadyToInitializate = false;
     mbSetInit=false;
 
-    mlRelativeFramePoses.clear();
-    mlpReferences.clear();
-    mlFrameTimes.clear();
-    mlbLost.clear();
+    // 主线程随时可能从 `GetFrameTrajectory` 读这四张表 ⟹ 清的时候要拿同一把锁。
+    {
+        unique_lock<mutex> lockTraj(mMutexTraj);
+        mlRelativeFramePoses.clear();
+        mlpReferences.clear();
+        mlFrameTimes.clear();
+        mlbLost.clear();
+    }
     mCurrentFrame = Frame();
     mnLastRelocFrameId = 0;
     mLastFrame = Frame();
     mpReferenceKF = static_cast<KeyFrame*>(NULL);
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
+
+    // IMU 预积分也属于上一张图：`CreateInitialMapMonocular` 会把它直接挂到
+    // 新图的第一对 KF 上。不清的话，那段预积分带着旧会话的运动。
+    if(mpImuPreintegratedFromLastKF)
+        delete mpImuPreintegratedFromLastKF;
+    mpImuPreintegratedFromLastKF = new IMU::Preintegrated(IMU::Bias(), *mpImuCalib);
 
     if(mpViewer)
         mpViewer->Release();

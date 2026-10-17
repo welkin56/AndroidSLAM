@@ -165,8 +165,7 @@
                 android:textColor="@color/measure_button_text" />
         </LinearLayout>
 
-        <!-- 两个按钮放最下面，好按。「重定位」灰着是**有理由的灰** —— 还没有旧图（§2.2），
-             不是"还没实现"。 -->
+        <!-- 放最下面，好按。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -177,21 +176,9 @@
 
             <Button
                 android:id="@+id/btnSlam"
-                android:layout_width="0dp"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
                 android:text="启动 SLAM"
-                android:textColor="#DE000000" />
-
-            <Button
-                android:id="@+id/btnReloc"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:layout_marginStart="4dp"
-                android:enabled="false"
-                android:text="重定位"
                 android:textColor="#DE000000" />
         </LinearLayout>
     </LinearLayout>
@@ -256,15 +243,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
-        <!-- 还没做的，灰着。空抽屉比一个灰按钮更让人困惑，所以留一条。 -->
-        <Button
-            android:id="@+id/btnSaveMap"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:enabled="false"
-            android:text="保存地图（M8）"
-            android:textColor="#DE000000" />
     </LinearLayout>
 
 </androidx.drawerlayout.widget.DrawerLayout>

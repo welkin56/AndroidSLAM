@@ -147,6 +147,26 @@ public:
     std::vector<MapPoint*> GetAllMapPoints();
 
     /**
+     * add:把当前 atlas **另存到** `<path>.osa`（`path` **不含**扩展名）。
+     *
+     * 不跟 `LoadAtlas` 一样走 yaml：yaml 是构造时读一次就定死的，而文件名要现取。
+     * 只在 SLAM 停止之后调 —— 它序列化整张 atlas。
+     */
+    void SaveAtlasTo(const std::string& path);
+
+    /**
+     * add:在**进程内**把 atlas 换回 `<path>.osa` 的那份状态（`path` 空 = 清成一张空图）。
+     *
+     * **只能在 SLAM 线程、且没有帧在动的时候调** —— 它走 `Tracking::Reset()`，
+     * 那里面会阻塞等 LocalMapping / LoopClosing 应答；主线程调就是卡死界面。
+     * 读失败时留下一张空图（系统还能继续跑），返回 false。
+     */
+    bool ReloadAtlasFrom(const std::string& path);
+
+    /** add：atlas 里现在有几张图 / 一共多少关键帧 / 多少地图点。给界面显示用。 */
+    void GetAtlasStats(int* maps, int* kfs, int* mps);
+
+    /**
      * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
      *
      * `cap` = `out` 能装多少 float ⟹ 最多写 `cap/8` 个点。
@@ -227,6 +247,9 @@ private:
 
     void SaveAtlas(int type);
     bool LoadAtlas(int type);
+
+    // add:同 LoadAtlas，但路径现给，而且**读进现有的 Atlas**（不换指针）。
+    bool LoadAtlasInto(const std::string& path, int type);
 
     string CalculateCheckSum(string filename, int type);
 
