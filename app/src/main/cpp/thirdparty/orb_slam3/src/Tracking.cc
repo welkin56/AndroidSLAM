@@ -3841,10 +3841,14 @@ void Tracking::Reset(bool bLocMap)
     mbReadyToInitializate = false;
     mbSetInit=false;
 
-    mlRelativeFramePoses.clear();
-    mlpReferences.clear();
-    mlFrameTimes.clear();
-    mlbLost.clear();
+    // 主线程随时可能从 `GetFrameTrajectory` 读这四张表 ⟹ 清的时候要拿同一把锁。
+    {
+        unique_lock<mutex> lockTraj(mMutexTraj);
+        mlRelativeFramePoses.clear();
+        mlpReferences.clear();
+        mlFrameTimes.clear();
+        mlbLost.clear();
+    }
     mCurrentFrame = Frame();
     mnLastRelocFrameId = 0;
     mLastFrame = Frame();

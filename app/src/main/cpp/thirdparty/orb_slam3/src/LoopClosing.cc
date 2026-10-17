@@ -2244,6 +2244,17 @@ void LoopClosing::ResetIfRequested()
         mLastLoopKFid=0;  //TODO old variable, it is not use in the new algorithm
         mbResetRequested=false;
         mbResetActiveMapRequested = false;
+
+        // 地图整个换了 ⟹ 半途的候选缓存指向的 KF 已经不在任何活着的图里。
+        // 不清这几个计数，下一个 KF 会走 `mnLoopNumCoincidences > 0` 那条分支，
+        // 拿旧 KF 的位姿去算 Sim3。
+        mnLoopNumCoincidences = 0;
+        mnMergeNumCoincidences = 0;
+        mnLoopNumNotFound = 0;
+        mnMergeNumNotFound = 0;
+        mbLoopDetected = false;
+        mbMergeDetected = false;
+        mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
     }
     else if(mbResetActiveMapRequested)
     {

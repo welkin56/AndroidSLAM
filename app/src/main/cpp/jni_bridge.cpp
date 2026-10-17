@@ -242,6 +242,26 @@ Java_com_example_slamcapture_SlamBridge_nativeSaveState(JNIEnv* /*env*/, jobject
     }
 }
 
+// 把 atlas 恢复成「上一次保存」的样子：**只发请求**。
+// 要重读 .osa（秒级）而且会阻塞等 LocalMapping / LoopClosing，只能在 SLAM 线程上做。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRequestRestoreMap(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::requestRestoreMap();
+    } catch (...) {
+    }
+}
+
+// 恢复状态：0 空闲 / 1 排队 / 2 恢复中 / 3 完成 / 4 失败。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRestoreState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::restoreState();
+    } catch (...) {
+        return 0;
+    }
+}
+
 // atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeAtlasStats(JNIEnv* env, jobject /*thiz*/,

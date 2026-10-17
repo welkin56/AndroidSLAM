@@ -19,6 +19,8 @@
 #include "Atlas.h"
 #include "Viewer.h"
 
+#include <utility>   // std::move（AdoptFrom）
+
 #include "GeometricCamera.h"
 #include "Pinhole.h"
 #include "KannalaBrandt8.h"
@@ -350,6 +352,20 @@ void Atlas::PostLoad()
         numMP += pMi->GetAllMapPoints().size();
     }
     mvpBackupMaps.clear();
+}
+
+void Atlas::AdoptFrom(Atlas* p)
+{
+    if(!p)
+        return;
+
+    // 只搬 `serialize` 装的那几个字段。`mspMaps` / `mpCurrentMap` 由调用方在
+    // `PostLoad()` + `CreateNewMap()` 里重建（这里动会踩到 reset 刚建的那张空图）。
+    // 静态 ID 计数器是 `serialize` 直接写的，已经在全局生效，不用搬。
+    unique_lock<mutex> lock(mMutexAtlas);
+    mvpBackupMaps = std::move(p->mvpBackupMaps);
+    mvpCameras = std::move(p->mvpCameras);
+    mnLastInitKFidMap = p->mnLastInitKFidMap;
 }
 
 void Atlas::SetKeyFrameDababase(KeyFrameDatabase* pKFDB)

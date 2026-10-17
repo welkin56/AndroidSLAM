@@ -74,6 +74,8 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 17 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `SaveAtlasTo(path)` —— 公开包装，让文件名能**现取** | 上游的 `SaveAtlas` 是 private，而且路径只能来自**构造时读的 yaml** ⟹ 而 §9 要「另存、不覆盖」= 每次一个新名字，构造时根本还不知道 |
 | 18 | `orb_slam3/src/System.cc` | 载图失败从 **`exit(-1)` 改成抛异常** | ⚠️ `exit(-1)` 在安卓上表现为「**App 干净地退回桌面、logcat 里只有一行**」⟹ 用户看到的是「点了启动，App 没了」而没有任何提示。抛出去，`slam_engine.cpp` 的 `construct()` 接得住 |
 | 19 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAtlasStats()` —— atlas 里有几张图 / 共多少关键帧 / 多少地图点 | 同 14，给界面显示用。**没有它，「图载进来了没有」在界面上完全看不出来**（载完之后当前图是新建的空图）|
+| 20 | `orb_slam3/include/Atlas.h` + `src/Atlas.cc`、`include/System.h` + `src/System.cc` | **新增** `Atlas::AdoptFrom()` / `System::LoadAtlasInto()` / `System::ReloadAtlasFrom()` —— 在**进程内**把 atlas 换回某份 `.osa` 的状态 | ⚠️ 构造之后想换图，上游只有「换进程」一条路：`LoadAtlas()` 里 `ia >> mpAtlas` **换的是指针**，而 `Tracking` / `LocalMapping` / `LoopClosing` 都攥着旧指针。改成「读进现有对象、只搬内容」，对象身份不变，线程不用改指向 |
+| 21 | `orb_slam3/src/Tracking.cc`（`Reset`）、`src/LoopClosing.cc`（`ResetIfRequested`） | `Reset` 清那四张轨迹表时拿上 `mMutexTraj`；`ResetIfRequested` 顺手清掉半途的回环 / 合并候选计数 | 上游 `Reset` 只在 `Shutdown` 之后调、`ResetIfRequested` 只在 `System::Reset()` 里用 ⟹ 它没考虑「主线程正在读轨迹」和「上一个 KF 的候选缓存」。我们这两条都碰上了 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

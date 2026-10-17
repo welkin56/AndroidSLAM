@@ -917,6 +917,31 @@ void System::SaveAtlasTo(const std::string& path)
         mpLocalMapper->Release();
 }
 
+bool System::ReloadAtlasFrom(const std::string& path)
+{
+    if(mpTracker == nullptr || mpAtlas == nullptr)
+        return false;
+
+    // 清当前图、轨迹和倒排表；KeyFrame / Frame 的 ID 计数器归零
+    //（紧接着的 LoadAtlasInto 会把它们恢复成文件里的值）。
+    // ⚠️ 这一步会阻塞等 LocalMapping / LoopClosing 应答，所以只能从 SLAM 线程调。
+    mpTracker->Reset();
+
+    if(path.empty())
+        return true;   // 上面那次 Reset 已经留了一张空图
+
+    if(!LoadAtlasInto(path, FileType::BINARY_FILE))
+    {
+        cout << "ReloadAtlasFrom: 载入失败，保留一张空图" << endl;
+        return false;
+    }
+
+    // Reset 建的那张空图不在新读进来的 mspMaps 里了 ⟹ 换一张干净的当前图。
+    mpAtlas->CreateNewMap();
+    mpAtlas->SetInertialSensor();
+    return true;
+}
+
 void System::GetAtlasStats(int* maps, int* kfs, int* mps)
 {
     *maps = 0;
@@ -1662,6 +1687,82 @@ bool System::LoadAtlas(int type)
         return true;
     }
     return false;
+}
+
+bool System::LoadAtlasInto(const std::string& path, int type)
+{
+    string strFileVoc, strVocChecksum;
+    bool isRead = false;
+    Atlas* pLoaded = nullptr;
+
+    string pathLoadFileName = path + ".osa";
+
+    try
+    {
+        if(type == TEXT_FILE)
+        {
+            cout << "Starting to read the save text file " << endl;
+            std::ifstream ifs(pathLoadFileName, std::ios::binary);
+            if(!ifs.good())
+            {
+                cout << "Load file not found" << endl;
+                return false;
+            }
+            boost::archive::text_iarchive ia(ifs);
+            ia >> strFileVoc;
+            ia >> strVocChecksum;
+            ia >> pLoaded;
+            isRead = true;
+        }
+        else if(type == BINARY_FILE)
+        {
+            cout << "Starting to read the save binary file" << endl;
+            std::ifstream ifs(pathLoadFileName, std::ios::binary);
+            if(!ifs.good())
+            {
+                cout << "Load file not found" << endl;
+                return false;
+            }
+            boost::archive::binary_iarchive ia(ifs);
+            ia >> strFileVoc;
+            ia >> strVocChecksum;
+            ia >> pLoaded;
+            isRead = true;
+        }
+    }
+    catch(const std::exception& e)
+    {
+        cout << "LoadAtlasInto: 反序列化失败 " << e.what() << endl;
+        delete pLoaded;
+        return false;
+    }
+
+    if(!isRead || pLoaded == nullptr)
+    {
+        delete pLoaded;
+        return false;
+    }
+
+    //Check if the vocabulary is the same
+    string strInputVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath, TEXT_FILE);
+    if(strInputVocabularyChecksum.compare(strVocChecksum) != 0)
+    {
+        cout << "The vocabulary load isn't the same which the load session was created " << endl;
+        cout << "-Vocabulary name: " << strFileVoc << endl;
+        delete pLoaded;
+        return false;
+    }
+
+    // 关键差别：不 `mpAtlas = pLoaded`（那会让各线程手里的指针失效），
+    // 而是把内容搬进现有的 Atlas。
+    mpAtlas->AdoptFrom(pLoaded);
+    delete pLoaded;   // 内容已搬走，只剩空壳（`mspMaps` 还是空的）
+
+    mpAtlas->SetKeyFrameDababase(mpKeyFrameDatabase);
+    mpAtlas->SetORBVocabulary(mpVocabulary);
+    mpAtlas->PostLoad();
+
+    return true;
 }
 
 string System::CalculateCheckSum(string filename, int type)

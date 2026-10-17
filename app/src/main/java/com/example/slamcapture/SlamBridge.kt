@@ -96,6 +96,17 @@ object SlamBridge {
     external fun nativeSaveState(): Int
 
     /**
+     * 把 atlas 恢复成「上一次保存」的样子 —— 目标：最近一次成功存图的文件；
+     * 没存过就用构造时载入的那张；都没有（新建地图）就清成一张空图。
+     *
+     * 一趟结束但没保存时调。**只发请求就返回**，进度看 [nativeRestoreState]。
+     */
+    external fun nativeRequestRestoreMap()
+
+    /** 恢复状态：0 空闲 / 1 排队 / 2 恢复中 / 3 完成 / 4 失败。 */
+    external fun nativeRestoreState(): Int
+
+    /**
      * atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
      *
      * 载图之后这是界面上**唯一**看得出「图进来了」的地方 —— 载进来的图不是当前图，

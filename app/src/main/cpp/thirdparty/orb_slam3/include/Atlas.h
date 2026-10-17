@@ -127,6 +127,11 @@ public:
     void PreSave();
     void PostLoad();
 
+    // add:把另一个 Atlas 反序列化出来的内容搬进来。
+    // Tracking / LocalMapping / LoopClosing 都攥着 `System::mpAtlas` —— 换指针就得让它们
+    // 全部改指向，所以载进现有的对象、只搬内容。搬完 `p` 只剩空壳，可以 delete。
+    void AdoptFrom(Atlas* p);
+
     map<long unsigned int, KeyFrame*> GetAtlasKeyframes();
 
     void SetKeyFrameDababase(KeyFrameDatabase* pKFDB);
