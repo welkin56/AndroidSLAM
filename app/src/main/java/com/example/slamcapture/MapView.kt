@@ -192,6 +192,17 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** 当前缩放档位（`ZOOM_M_PER_DP` 的下标）。给持久化用。 */
+    fun zoomIndex(): Int = zoomIdx
+
+    /** 恢复缩放档位。**越界的直接忽略**（`-1` = 还没存过）。 */
+    fun setZoomIndex(i: Int) {
+        if (i < 0 || i >= ZOOM_M_PER_DP.size || i == zoomIdx) return
+        zoomIdx = i
+        mPerDp = ZOOM_M_PER_DP[i]
+        invalidate()
+    }
+
     /** 切片厚度（**米，全宽**）。抽屉那个滑块调它，值已经被那边夹过，这儿再夹一次兜底。 */
     fun setSliceRange(m: Float) {
         sliceRange = m.coerceIn(SLICE_MIN, SLICE_MAX)

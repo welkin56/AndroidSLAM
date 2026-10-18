@@ -94,6 +94,8 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_MEASURE = "measure"
         private const val PREF_MAP = "map"
         private const val PREF_MAP_RANGE = "mapRange"
+        /** 小地图缩放档位（`MapView.ZOOM_*` 的下标）。 */
+        private const val PREF_MAP_ZOOM = "mapZoom"
 
         /**
          * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
@@ -296,6 +298,9 @@ class MainActivity : AppCompatActivity() {
      *  `removeCallbacksAndMessages(null)` 顺手就把它清了。 */
     private var zoomRepeat: Runnable? = null
 
+    /** 上一次落盘的缩放档位。长按连按时只在**真的换档**时才写盘。 */
+    private var zoomSaved = -1
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -383,9 +388,19 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
-        // 缩放只有加/减两档。**比例是视图状态，不落盘**（和抽屉里的设置分得开）。
-        wireZoomButton(btnMapZoomIn) { mapView.zoomIn() }
-        wireZoomButton(btnMapZoomOut) { mapView.zoomOut() }
+        // 缩放档位要记着：上次按到哪一档，这次进来还是哪一档。
+        // `-1` = 还没存过，`setZoomIndex` 会忽略它、用视图自己的默认档。
+        mapView.setZoomIndex(pref.getInt(PREF_MAP_ZOOM, -1))
+        zoomSaved = mapView.zoomIndex()
+        // 只有加/减两个按钮；**长按连按**由 wireZoomButton 那一侧负责。
+        wireZoomButton(btnMapZoomIn) {
+            mapView.zoomIn()
+            saveZoom()
+        }
+        wireZoomButton(btnMapZoomOut) {
+            mapView.zoomOut()
+            saveZoom()
+        }
 
         // 多点折线：加点 / 断开 / 撤销 / 重置。**折线整个存在 C++ 侧**（它要存 `MapPoint*`），
         // 这一侧只调它、然后把结果读回来画。
@@ -1151,6 +1166,14 @@ class MainActivity : AppCompatActivity() {
     private fun stopZoomRepeat() {
         zoomRepeat?.let { uiHandler.removeCallbacks(it) }
         zoomRepeat = null
+    }
+
+    /** 缩放档位落盘。**只在真的换档时写** —— 长按连按时这个函数每秒会被叫十几次。 */
+    private fun saveZoom() {
+        val i = mapView.zoomIndex()
+        if (i == zoomSaved) return
+        zoomSaved = i
+        pref.edit().putInt(PREF_MAP_ZOOM, i).apply()
     }
 
     /**
