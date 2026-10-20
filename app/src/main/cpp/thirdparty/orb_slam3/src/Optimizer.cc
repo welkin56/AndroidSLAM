@@ -4040,6 +4040,24 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
 
     int N = vpOptimizableKFs.size();
 
+    // ⚠️ 两条时间链可能**重叠**：当前 KF 往前追、合并目标 KF 往前追/往后追，
+    //    会走到同一个 KF 上。重复进 `vpOptimizableKFs` 就是同一个 `mnId` 被
+    //    `addVertex` 两次 —— g2o 只打一行 FATAL，图已经坏了，合并后整张图不刷新。
+    //    这里按对象去重，保留首次出现的顺序。
+    {
+        std::set<KeyFrame*> seen;
+        size_t w = 0;
+        for (size_t r = 0; r < vpOptimizableKFs.size(); ++r)
+        {
+            KeyFrame* pKF = vpOptimizableKFs[r];
+            if (pKF == nullptr || !seen.insert(pKF).second)
+                continue;
+            vpOptimizableKFs[w++] = pKF;
+        }
+        vpOptimizableKFs.resize(w);
+        N = static_cast<int>(w);
+    }
+
     // Optimizable points seen by optimizable keyframes
     list<MapPoint*> lLocalMapPoints;
     map<MapPoint*,int> mLocalObs;
@@ -4163,6 +4181,18 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
     }
 
     // Set Fixed KeyFrame vertices
+    // ⚠️ 去重：可能和上面两个优化集里的 KF 是同一个，重复 `addVertex` 会毁掉这张图。
+    {
+        std::set<KeyFrame*> seen(vpOptimizableKFs.begin(), vpOptimizableKFs.end());
+        seen.insert(vpOptimizableCovKFs.begin(), vpOptimizableCovKFs.end());
+        for(list<KeyFrame*>::iterator lit=lFixedKeyFrames.begin(), lend=lFixedKeyFrames.end(); lit!=lend; )
+        {
+            if(*lit == nullptr || !seen.insert(*lit).second)
+                lit = lFixedKeyFrames.erase(lit);
+            else
+                ++lit;
+        }
+    }
     for(list<KeyFrame*>::iterator lit=lFixedKeyFrames.begin(), lend=lFixedKeyFrames.end(); lit!=lend; lit++)
     {
         KeyFrame* pKFi = *lit;

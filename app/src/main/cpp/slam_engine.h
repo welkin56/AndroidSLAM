@@ -127,6 +127,39 @@ void closePinnedChain();
  */
 int getPinned(float* out, int cap);
 
+// ---------------- 路径点 ----------------
+
+/** 在当前位置记一个路径点（**主线程调**）。发请求就返回，下一帧在 SLAM 线程执行。 */
+void requestAddWaypoint(const std::string& name);
+
+/** 加路径点的结果（**主线程调**）：0 没试过 / 1 排队 / 2 成功 / 3 失败。 */
+int waypointState();
+
+/** 失败原因（**主线程调**）。成功时是空串。 */
+std::string waypointMsg();
+
+/** 改名 / 删除（**主线程调**）。不碰地图，就近生效。 */
+void renameWaypoint(int id, const std::string& name);
+void deleteWaypoint(int id);
+
+/** 变一次加一。界面只在它变了之后重建叠加层。 */
+long long waypointRevision();
+
+/**
+ * 读路径点世界坐标。`pos` 每点 3 个 float，`meta` 每点 `id, mapId, kfId, flags`
+ * （bit0 坐标有效 / bit1 在当前图）。
+ *
+ * **装不下就少给，返回实际写了几条** —— 和 [getPinned] 同一个契约。
+ */
+int getWaypoints(float* pos, int posCap, long long* meta, int metaCap,
+                 std::string* names, int nameCap);
+
+/** 路径点总条数（**主线程调**）。 */
+int waypointCount();
+
+/** 下一个路径点 id —— 默认名字用它的编号，单调递增（**主线程调**）。 */
+int nextWaypointId();
+
 // ---------------- 存图 ----------------
 
 /**

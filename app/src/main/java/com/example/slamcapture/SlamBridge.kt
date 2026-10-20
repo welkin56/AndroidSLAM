@@ -173,4 +173,39 @@ object SlamBridge {
      * `flags` 的位：bit0 在相机前方 / bit1 之后断开 / bit2 不太准。
      */
     external fun nativeGetPinned(out: FloatArray): Int
+
+    // —— 路径点 ——
+    //
+    // 锚在关键帧上、存相对位姿，和轨迹同一套：BA / 回环 / 合并改了地图之后自动跟着走。
+
+    /** 在当前位置记一个路径点。**发请求就返回**，下一帧在 SLAM 线程执行。 */
+    external fun nativeRequestAddWaypoint(name: String)
+
+    /** 加路径点的结果：0 没试过 / 1 排队 / 2 成功 / 3 失败。 */
+    external fun nativeWaypointState(): Int
+
+    /** 失败原因。成功时是空串。 */
+    external fun nativeWaypointMsg(): String
+
+    external fun nativeRenameWaypoint(id: Int, name: String)
+
+    external fun nativeDeleteWaypoint(id: Int)
+
+    /** 变一次加一 —— 只在它变了之后重建小地图那层。 */
+    external fun nativeWaypointRevision(): Long
+
+    /** 路径点总条数（含失效的）。 */
+    external fun nativeWaypointCount(): Int
+
+    /** 下一个路径点 id —— 默认名字用它的编号，**单调递增**，删过点也不会重名。 */
+    external fun nativeNextWaypointId(): Int
+
+    /**
+     * 读路径点。`pos` 每点 3 个 float，`meta` 每点 `id, mapId, kfId, flags`
+     * （bit0 坐标有效 / bit1 在当前图），`names` 收名字。
+     *
+     * 返回**实际写了几条**（装不下就少给）—— 和 [nativeGetPinned] 同一个契约。
+     * 名字元素可为 null（JNI 侧本来就只认 `jobjectArray`，可空性签名不参与链接）。
+     */
+    external fun nativeGetWaypoints(pos: FloatArray, meta: LongArray, names: Array<String?>): Int
 }

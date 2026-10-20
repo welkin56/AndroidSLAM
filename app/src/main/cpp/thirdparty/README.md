@@ -76,6 +76,10 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 19 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `GetAtlasStats()` —— atlas 里有几张图 / 共多少关键帧 / 多少地图点 | 同 14，给界面显示用。**没有它，「图载进来了没有」在界面上完全看不出来**（载完之后当前图是新建的空图）|
 | 20 | `orb_slam3/include/Atlas.h` + `src/Atlas.cc`、`include/System.h` + `src/System.cc` | **新增** `Atlas::AdoptFrom()` / `System::LoadAtlasInto()` / `System::ReloadAtlasFrom()` —— 在**进程内**把 atlas 换回某份 `.osa` 的状态 | ⚠️ 构造之后想换图，上游只有「换进程」一条路：`LoadAtlas()` 里 `ia >> mpAtlas` **换的是指针**，而 `Tracking` / `LocalMapping` / `LoopClosing` 都攥着旧指针。改成「读进现有对象、只搬内容」，对象身份不变，线程不用改指向 |
 | 21 | `orb_slam3/src/Tracking.cc`（`Reset`）、`src/LoopClosing.cc`（`ResetIfRequested`） | `Reset` 清那四张轨迹表时拿上 `mMutexTraj`；`ResetIfRequested` 顺手清掉半途的回环 / 合并候选计数 | 上游 `Reset` 只在 `Shutdown` 之后调、`ResetIfRequested` 只在 `System::Reset()` 里用 ⟹ 它没考虑「主线程正在读轨迹」和「上一个 KF 的候选缓存」。我们这两条都碰上了 |
+| 22 | `orb_slam3/include/Map.h` + `src/Map.cc` | **新增** `Map::GetLatestKeyFrame()` —— 图集合里 `mnId` 最大的那个关键帧 | 路径点要一个**保证活着**的锚点。`Tracking::GetLastKeyFrame()` 不行：它可能还在 `LocalMapping` 队列里，而 `LocalMapping::Release()` 会**直接 delete** 排队的 KF（合并、回环、存图都会调 `Release()`）|
+| 23 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** 路径点：`AddWaypoint` / `Rename` / `Delete` / `Clear` / `GetWaypoints` / `SaveWaypoints` / `LoadWaypoints` | 锚在关键帧上、存相对位姿（`T_rel = Tcw_此刻 * Twc_锚点`），和轨迹同一套。BA / 回环 / 合并改了地图之后**自动跟着走** —— 合并时 `MergeLocal2` 是 `pKF->UpdateMap()` 搬对象，指针不变 |
+| 24 | `orb_slam3/src/Optimizer.cc`（`MergeInertialBA`） | 优化集 `vpOptimizableKFs` 按对象去重；固定集 `lFixedKeyFrames` 去掉与两个优化集重叠的成员 | ⚠️ **上游 bug**：滑动窗口是「当前 KF 的 `mPrevKF` 链」+「合并目标 KF 的前后链」拼起来的，两条链会走到同一个 KF ⟹ 同一个 `mnId` 被 `addVertex` 两次。g2o 只打一行 `addVertex: FATAL` 就继续，**图已经坏了**，之后整张图不刷新、跟踪连续失败。只有「载入旧图 + 再合并」会稳定踩到（载入后两边的 `mPrevKF` 链是互通的） |
+| 25 | `orb_slam3/src/LoopClosing.cc`（`MergeLocal2`） | 在 `ApplyScaledRotation` **之前**打一行 `[MAP] 合并：图 A（KF n）→ 图 B（KF m），scale s` | 合并原本**完全静默**。它同时改变坐标系（`p_new = s·R·p_old + t`）而 map id 不变，出问题时无从对齐时间线 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 

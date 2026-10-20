@@ -23,6 +23,11 @@
 #include <thread>
 #include <iomanip>
 #include <stdexcept>
+#include <algorithm>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include "md5.h"
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/string.hpp>
@@ -41,7 +46,8 @@ Verbose::eLevel Verbose::th = Verbose::VERBOSITY_NORMAL;
 System::System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor,
                const bool bUseViewer, const int initFr, const string &strSequence):
     mSensor(sensor), mpViewer(static_cast<Viewer*>(NULL)), mbReset(false), mbResetActiveMap(false),
-    mbActivateLocalizationMode(false), mbDeactivateLocalizationMode(false), mbShutDown(false)
+    mbActivateLocalizationMode(false), mbDeactivateLocalizationMode(false), mbShutDown(false),
+    mnWaypointRevision(0), mnNextWaypointId(1)
 {
     // Output welcome message
     cout << endl <<
@@ -898,6 +904,422 @@ std::vector<MapPoint*> System::GetAllMapPoints()
     return mpAtlas->GetAllMapPoints();
 }
 
+// ---------------- add：路径点 ----------------
+
+struct System::Waypoint
+{
+    int id = 0;
+    std::string name;
+    KeyFrame* pAnchor = nullptr;   // 非拥有；只在图集合里取
+    Sophus::SE3f T_rel;            // `Tcw_此刻 * Twc_锚点`
+};
+
+namespace {
+
+/**
+ * 把「锚在 `pKF` 上的路径点」解到世界坐标。
+ *
+ * 和 `GetFrameTrajectory()` 里那个 `compose` 是**同一套算法**：
+ * 锚点坏了就沿 `mTcp`（它标坏那一刻记下的「相对父帧」）往上爬，爬到活着的祖先。
+ * 所以关键帧被正常剔除**不影响坐标**；只有 `GetMap() == nullptr`
+ * （`Map::clear()`，即地图被重置）才算失效 —— 那时坐标系真的没了。
+ *
+ * @param T_rel  路径点相对锚点的位姿
+ * @param pKF    锚点
+ * @param Tcw    出参：路径点在世界里的 `Tcw`
+ * @param mapId  出参：解析到的**活着的**祖先落在哪张图
+ * @return false = 这个路径点现在没有有效坐标
+ */
+bool ResolveWaypoint(const Sophus::SE3f& T_rel, KeyFrame* pKF,
+                     Sophus::SE3f& Tcw, unsigned long& mapId)
+{
+    if (pKF == nullptr)
+        return false;
+
+    Sophus::SE3f Trw;
+    int hops = 0;
+    while (pKF->isBad())
+    {
+        if (++hops > 64)        // 上游那个循环没有上界；链坏了（成环 / 爬到 null）就转不出来
+            return false;
+        Trw = Trw * pKF->mTcp;
+        pKF = pKF->GetParent();
+        if (pKF == nullptr)
+            return false;
+    }
+
+    Map* pMap = pKF->GetMap();
+    if (pMap == nullptr)
+        return false;
+
+    Tcw = T_rel * Trw * pKF->GetPose();
+    mapId = pMap->GetId();
+    return true;
+}
+
+/** `T_rel` 里那个 `\t` / `\n` / `\\` 的转义。名字是用户输入的，会带空格。 */
+std::string EscapeWpName(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        if (c == '\\') out += "\\\\";
+        else if (c == '\t') out += "\\t";
+        else if (c == '\n') out += "\\n";
+        else out += c;
+    }
+    return out;
+}
+
+bool UnescapeWpName(const std::string& s, std::string& out)
+{
+    out.clear();
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] != '\\') { out += s[i]; continue; }
+        if (++i >= s.size()) return false;
+        if (s[i] == '\\') out += '\\';
+        else if (s[i] == 't') out += '\t';
+        else if (s[i] == 'n') out += '\n';
+        else { out += '\\'; out += s[i]; }   // 不认识的转义原样留着
+    }
+    return true;
+}
+
+}  // namespace
+
+bool System::AddWaypoint(const std::string& name)
+{
+    if (mpAtlas == nullptr || mpTracker == nullptr)
+        return false;
+
+    // 用 `PeekCurrentMap()`：`GetCurrentMap()` 在图被标坏的窗口里会抱着 atlas 锁
+    // `usleep` 自旋，而这里是 SLAM 线程，卡住等于整个 App 不跟手。
+    Map* pMap = mpAtlas->PeekCurrentMap();
+    if (pMap == nullptr)
+    {
+        std::lock_guard<mutex> lk(mMutexWaypoints);
+        mstrWaypointError = "没有当前图";
+        return false;
+    }
+
+    // ⚠️ 锚点必须**已经在图集合里**：还在 `LocalMapping` 队列里的 KF 会被
+    //    `Release()` 直接 delete，拿它做锚点就是悬空指针。
+    KeyFrame* pAnchor = pMap->GetLatestKeyFrame();
+    if (pAnchor == nullptr)
+    {
+        std::lock_guard<mutex> lk(mMutexWaypoints);
+        mstrWaypointError = "图 " + std::to_string(pMap->GetId()) + " 还没有关键帧";
+        return false;
+    }
+
+    const Frame& F = mpTracker->mCurrentFrame;
+    if (!F.isSet())
+    {
+        std::lock_guard<mutex> lk(mMutexWaypoints);
+        mstrWaypointError = "当前帧没有位姿";
+        return false;
+    }
+
+    Waypoint* p = new Waypoint;
+    p->name = name.empty() ? "路径点" : name;
+    p->pAnchor = pAnchor;
+    p->T_rel = F.GetPose() * pAnchor->GetPoseInverse();
+
+    {
+        unique_lock<mutex> lock(mMutexWaypoints);
+        p->id = mnNextWaypointId++;
+        mvpWaypoints.push_back(p);
+        ++mnWaypointRevision;
+        mstrWaypointError.clear();
+    }
+
+    cout << "[WP] 加路径点 #" << p->id << " 「" << p->name << "」 → 锚 KF "
+         << pAnchor->mnId << "（图 " << pMap->GetId() << "）" << endl;
+    return true;
+}
+
+std::string System::GetWaypointError()
+{
+    std::lock_guard<mutex> lk(mMutexWaypoints);
+    return mstrWaypointError;
+}
+
+void System::RenameWaypoint(int id, const std::string& name)
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    for (Waypoint* p : mvpWaypoints)
+    {
+        if (p->id != id) continue;
+        p->name = name;
+        ++mnWaypointRevision;
+        return;
+    }
+}
+
+void System::DeleteWaypoint(int id)
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    for (std::vector<Waypoint*>::iterator it = mvpWaypoints.begin(); it != mvpWaypoints.end(); ++it)
+    {
+        if ((*it)->id != id) continue;
+        delete *it;
+        mvpWaypoints.erase(it);
+        ++mnWaypointRevision;
+        return;
+    }
+}
+
+void System::ClearWaypoints()
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    for (Waypoint* p : mvpWaypoints)
+        delete p;
+    mvpWaypoints.clear();
+    mnNextWaypointId = 1;
+    ++mnWaypointRevision;
+}
+
+int System::GetWaypointCount()
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    return static_cast<int>(mvpWaypoints.size());
+}
+
+int System::GetNextWaypointId()
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    return mnNextWaypointId;
+}
+
+std::string System::GetWaypointName(int id)
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    for (Waypoint* p : mvpWaypoints)
+        if (p->id == id) return p->name;
+    return std::string();
+}
+
+long long System::GetWaypointRevision()
+{
+    unique_lock<mutex> lock(mMutexWaypoints);
+    return mnWaypointRevision;
+}
+
+int System::GetWaypoints(float* pos, int posCap, long long* meta, int metaCap)
+{
+    if (pos == nullptr || meta == nullptr)
+        return 0;
+
+    // 两条出参与原来一样「装不下就少给」：返回**实际写了几个**。
+    //    调用方看到写满就扩容，下一拍再来 —— 不能返回真实条数。
+    const int canPos = posCap / 3;
+    const int canMeta = metaCap / 4;
+    const int cap = std::min(canPos, canMeta);
+    if (cap <= 0)
+        return 0;
+
+    // 用 `PeekCurrentMap()` 而不是 `GetCurrentMap()` —— 后者在坏图窗口里
+    //    会 `while(IsBad()) usleep(3000)` 抱着 atlas 锁睡。这条是从主线程读的。
+    Map* pCur = mpAtlas == nullptr ? nullptr : mpAtlas->PeekCurrentMap();
+    const unsigned long curId = pCur == nullptr ? 0 : pCur->GetId();
+
+    // 持 `mMutexWaypoints` 期间会去拿 KF 自己的锁（`isBad` / `GetPose` / `GetMap`）。
+    //    只有一个方向（waypoints → KF），没有反向路径。
+    unique_lock<mutex> lock(mMutexWaypoints);
+
+    int m = 0;
+    for (Waypoint* p : mvpWaypoints)
+    {
+        if (m >= cap)
+            break;
+
+        Sophus::SE3f Tcw;
+        unsigned long mapId = 0;
+        const bool ok = ResolveWaypoint(p->T_rel, p->pAnchor, Tcw, mapId);
+
+        long long flags = 0;
+        if (ok)
+        {
+            flags |= 1;                     // bit0 坐标有效
+            if (mapId == curId) flags |= 2; // bit1 在当前图
+            const Eigen::Vector3f t = Tcw.inverse().translation();
+            pos[3 * m] = t.x();
+            pos[3 * m + 1] = t.y();
+            pos[3 * m + 2] = t.z();
+        }
+        else
+        {
+            pos[3 * m] = pos[3 * m + 1] = pos[3 * m + 2] = 0.f;
+        }
+
+        long long* md = meta + 4 * m;
+        md[0] = p->id;
+        md[1] = ok ? static_cast<long long>(mapId) : -1;
+        md[2] = p->pAnchor != nullptr ? static_cast<long long>(p->pAnchor->mnId) : -1;
+        md[3] = flags;
+        ++m;
+    }
+    return m;
+}
+
+bool System::SaveWaypoints(const std::string& path)
+{
+    if (path.empty())
+        return false;
+
+    const std::string file = path + ".waypoints.tsv";
+    const std::string tmp = file + ".tmp";
+
+    std::ofstream f(tmp, std::ios::trunc);
+    if (!f.is_open())
+    {
+        cout << "[WP] 写不出去：" << tmp << endl;
+        return false;
+    }
+    f << "# slam-waypoints 1\n";
+
+    unique_lock<mutex> lock(mMutexWaypoints);
+    int saved = 0, skipped = 0;
+    for (Waypoint* p : mvpWaypoints)
+    {
+        // 沿坏链爬到活着的祖先：存**祖先 id + 修正后的 T_rel**，读的时候不用再爬。
+        KeyFrame* pKF = p->pAnchor;
+        if (pKF == nullptr) { ++skipped; continue; }
+
+        Sophus::SE3f Trw;
+        int hops = 0;
+        bool ok = true;
+        while (pKF->isBad())
+        {
+            if (++hops > 64) { ok = false; break; }
+            Trw = Trw * pKF->mTcp;
+            pKF = pKF->GetParent();
+            if (pKF == nullptr) { ok = false; break; }
+        }
+        if (!ok || pKF->GetMap() == nullptr) { ++skipped; continue; }   // 失效的不落盘
+
+        const Sophus::SE3f T_rel = p->T_rel * Trw;
+        const Eigen::Quaternionf q = T_rel.unit_quaternion();
+        const Eigen::Vector3f t = T_rel.translation();
+
+        f << p->id << '\t' << pKF->GetMap()->GetId() << '\t' << pKF->mnId << '\t'
+          << t.x() << ' ' << t.y() << ' ' << t.z() << ' '
+          << q.x() << ' ' << q.y() << ' ' << q.z() << ' ' << q.w() << '\t'
+          << EscapeWpName(p->name) << '\n';
+        ++saved;
+    }
+    f.close();
+
+    if (!f.good())
+    {
+        std::remove(tmp.c_str());
+        cout << "[WP] 写 sidecar 失败" << endl;
+        return false;
+    }
+    if (std::rename(tmp.c_str(), file.c_str()) != 0)
+    {
+        std::remove(tmp.c_str());
+        cout << "[WP] 改名失败：" << file << endl;
+        return false;
+    }
+
+    cout << "[WP] 路径点已保存 " << saved << " 条" << (skipped ? "（跳过失效 " + std::to_string(skipped) + "）" : "")
+         << " → " << file << endl;
+    return true;
+}
+
+bool System::LoadWaypoints(const std::string& path)
+{
+    ClearWaypoints();
+    if (path.empty())
+        return true;
+
+    const std::string file = path + ".waypoints.tsv";
+    std::ifstream f(file);
+    if (!f.is_open())
+        return true;   // 没有 sidecar 是正常情况（这张图从没加过路径点）
+
+    // kfId → KeyFrame*。⚠️ 不能用 `Atlas::GetAtlasKeyframes()` —— 那个读的是
+    // `mvpBackupMaps`，`PostLoad()` 之后已经清空了。
+    std::map<unsigned long, KeyFrame*> byId;
+    if (mpAtlas != nullptr)
+    {
+        for (Map* pMap : mpAtlas->GetAllMaps())
+        {
+            if (pMap == nullptr) continue;
+            for (KeyFrame* pKF : pMap->GetAllKeyFrames())
+                if (pKF != nullptr) byId[pKF->mnId] = pKF;
+        }
+    }
+
+    std::string line;
+    int loaded = 0, missing = 0, bad = 0;
+    int maxId = 0;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        // id \t mapId \t kfId \t tx ty tz qx qy qz qw \t name
+        const size_t t1 = line.find('\t');
+        if (t1 == std::string::npos) { ++bad; continue; }
+        const size_t t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) { ++bad; continue; }
+        const size_t t3 = line.find('\t', t2 + 1);
+        if (t3 == std::string::npos) { ++bad; continue; }
+
+        std::istringstream head(line.substr(0, t3));
+        int id = 0;
+        unsigned long mapId = 0, kfId = 0;
+        float tx = 0, ty = 0, tz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (!(head >> id >> mapId >> kfId >> tx >> ty >> tz >> qx >> qy >> qz >> qw))
+        {
+            ++bad;
+            continue;
+        }
+
+        std::string name;
+        if (!UnescapeWpName(line.substr(t3 + 1), name))
+            name = "路径点";
+
+        Waypoint* p = new Waypoint;
+        p->id = id;
+        p->name = name;
+        p->T_rel = Sophus::SE3f(Eigen::Quaternionf(qw, qx, qy, qz).normalized(), Eigen::Vector3f(tx, ty, tz));
+
+        auto it = byId.find(kfId);
+        if (it != byId.end())
+        {
+            p->pAnchor = it->second;
+            ++loaded;
+        }
+        else
+        {
+            // 锚点不在这份 atlas 里（覆盖保存过、或那张图被剔掉了）。**保留名字、标失效**，
+            // 让用户能在管理界面看到并手动删 —— 不猜、不静默改写成别的锚点。
+            p->pAnchor = nullptr;
+            ++missing;
+        }
+        if (id > maxId) maxId = id;
+
+        std::lock_guard<mutex> lock(mMutexWaypoints);
+        mvpWaypoints.push_back(p);
+    }
+
+    {
+        unique_lock<mutex> lock(mMutexWaypoints);
+        mnNextWaypointId = maxId + 1;
+        ++mnWaypointRevision;
+    }
+
+    cout << "[WP] 读路径点 " << (loaded + missing) << " 条（有效 " << loaded
+         << " / 失效 " << missing << " / 坏行 " << bad << "）：" << file << endl;
+    return true;
+}
+
 void System::SaveAtlasTo(const std::string& path)
 {
     // 文件名现取：塞进那个成员再走上游那条路（SaveAtlas 只认成员，不带路径参数）。
@@ -921,6 +1343,9 @@ bool System::ReloadAtlasFrom(const std::string& path)
 {
     if(mpTracker == nullptr || mpAtlas == nullptr)
         return false;
+
+    // 路径点属于旧 atlas：换掉之前先清空。失败时也不能留着（坐标已经没有意义）。
+    ClearWaypoints();
 
     // 清当前图、轨迹和倒排表；KeyFrame / Frame 的 ID 计数器归零
     //（紧接着的 LoadAtlasInto 会把它们恢复成文件里的值）。

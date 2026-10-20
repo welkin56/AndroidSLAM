@@ -201,6 +201,24 @@ KeyFrame* Map::GetOriginKF()
     return mpKFinitial;
 }
 
+KeyFrame* Map::GetLatestKeyFrame()
+{
+    unique_lock<mutex> lock(mMutexMap);
+    KeyFrame* pLatest = static_cast<KeyFrame*>(NULL);
+    // 这里 **不能** 调 `pKF->isBad()`：它拿 `mMutexConnections`，而 `SetBadFlag()`
+    // 是 `mMutexConnections → mMutexMap`（锁内调 `EraseKeyFrame`）⟹ 锁序反转。
+    // 也不需要：被标坏时那个 KF 已经从 `mspKeyFrames` 里移除了。
+    for(set<KeyFrame*>::iterator sit = mspKeyFrames.begin(), send = mspKeyFrames.end(); sit != send; ++sit)
+    {
+        KeyFrame* pKF = *sit;
+        if(pKF == nullptr)
+            continue;
+        if(pLatest == nullptr || pKF->mnId > pLatest->mnId)
+            pLatest = pKF;
+    }
+    return pLatest;
+}
+
 void Map::SetCurrentMap()
 {
     mIsInUse = true;

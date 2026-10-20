@@ -7,6 +7,8 @@
 #include <android/log.h>
 
 #include <string>
+#include <cstring>
+#include <vector>
 
 #include "log_redirect.h"
 #include "slam_engine.h"
@@ -396,6 +398,130 @@ Java_com_example_slamcapture_SlamBridge_nativeGetPinned(JNIEnv* env, jobject /*t
         if (p == nullptr) return 0;   // OOM
         const int n = slam::getPinned(p, env->GetArrayLength(out));
         env->ReleaseFloatArrayElements(out, p, 0);   // 写回
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// —— 路径点 ——
+//
+// 名字不逐条跨 JNI 取（那是 N 次字符串往返），而是一次给一个 `String[]`。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRequestAddWaypoint(JNIEnv* env, jobject /*thiz*/,
+                                                                 jstring name) {
+    try {
+        slam::requestAddWaypoint(toStdString(env, name));
+    } catch (...) {
+    }
+}
+
+// 0 没试过 / 1 排队 / 2 成功 / 3 失败。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeWaypointState(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::waypointState());
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeWaypointMsg(JNIEnv* env, jobject /*thiz*/) {
+    try {
+        return env->NewStringUTF(slam::waypointMsg().c_str());
+    } catch (...) {
+        return env->NewStringUTF("");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeRenameWaypoint(JNIEnv* env, jobject /*thiz*/,
+                                                             jint id, jstring name) {
+    try {
+        slam::renameWaypoint(static_cast<int>(id), toStdString(env, name));
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeDeleteWaypoint(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                             jint id) {
+    try {
+        slam::deleteWaypoint(static_cast<int>(id));
+    } catch (...) {
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeWaypointRevision(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jlong>(slam::waypointRevision());
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeWaypointCount(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::waypointCount());
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeNextWaypointId(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jint>(slam::nextWaypointId());
+    } catch (...) {
+        return 1;
+    }
+}
+
+// `pos` 每点 3 个、`meta` 每点 4 个，`names` 收名字。
+// 返回**实际写了几条**（装不下就少给）；`names` 短了只填得下的那几个。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeGetWaypoints(JNIEnv* env, jobject /*thiz*/,
+                                                           jfloatArray pos, jlongArray meta,
+                                                           jobjectArray names) {
+    try {
+        jfloat* p = env->GetFloatArrayElements(pos, nullptr);
+        if (p == nullptr) return 0;
+        jlong* m = env->GetLongArrayElements(meta, nullptr);
+        if (m == nullptr) {
+            env->ReleaseFloatArrayElements(pos, p, JNI_ABORT);
+            return 0;
+        }
+
+        const jsize nameCap = names == nullptr ? 0 : env->GetArrayLength(names);
+        // `jlong` 在 Android 上是 `long`，而引擎那边用 `long long` —— 直接传会报类型不匹配。
+        //    用临时缓冲转一次，别把这个平台别名漏进接口。
+        const jsize metaLen = env->GetArrayLength(meta);
+        std::vector<long long> metaBuf(static_cast<size_t>(metaLen));
+        std::vector<std::string> nameBuf(static_cast<size_t>(nameCap > 0 ? nameCap : 0));
+        std::memcpy(metaBuf.data(), m, sizeof(long long) * static_cast<size_t>(metaLen));
+
+        const int n = slam::getWaypoints(p, env->GetArrayLength(pos),
+                                         metaBuf.data(), static_cast<int>(metaLen),
+                                         nameBuf.empty() ? nullptr : nameBuf.data(),
+                                         static_cast<int>(nameBuf.size()));
+
+        // 引擎写的是 `metaBuf`，不是 `m` —— 必须先拷回来再 Release，
+        // 否则回写的是原始全 0 缓冲（⟹ Kotlin 拿到的 id/flags 全是 0）。
+        std::memcpy(m, metaBuf.data(), sizeof(long long) * static_cast<size_t>(metaLen));
+
+        env->ReleaseFloatArrayElements(pos, p, 0);
+        env->ReleaseLongArrayElements(meta, m, 0);
+
+        // 名字：逐条 NewStringUTF 放回去。**装不下就不写**，Kotlin 那边看到空串。
+        for (int i = 0; i < n && i < nameCap; ++i) {
+            jstring s = env->NewStringUTF(nameBuf[static_cast<size_t>(i)].c_str());
+            if (s == nullptr) break;
+            env->SetObjectArrayElement(names, i, s);
+            env->DeleteLocalRef(s);
+        }
         return static_cast<jint>(n);
     } catch (...) {
         return 0;

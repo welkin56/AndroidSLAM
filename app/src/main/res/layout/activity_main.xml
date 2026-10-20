@@ -243,6 +243,40 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
+        <!-- 路径点：显示开关 + 加 + 管理。
+             路径点锚在关键帧上，BA / 回环 / 合并改了地图之后会自动跟着走。 -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#22000000" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swWaypoints"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="路径点"
+            android:textColor="#DE000000" />
+
+        <Button
+            android:id="@+id/btnWpAdd"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:minWidth="0dp"
+            android:text="添加路径点"
+            android:textColor="@color/measure_button_text" />
+
+        <Button
+            android:id="@+id/btnWpManage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:minWidth="0dp"
+            android:text="管理路径点"
+            android:textColor="@color/measure_button_text" />
+
     </LinearLayout>
 
 </androidx.drawerlayout.widget.DrawerLayout>

@@ -1833,6 +1833,12 @@ void LoopClosing::MergeLocal2()
         float s_on = mSold_new.scale();
         Sophus::SE3f T_on(mSold_new.rotation().cast<float>(), mSold_new.translation().cast<float>());
 
+        // 合并前后的身份：之后 frame 会变（`ApplyScaledRotation` 把当前图搬到对方的系里），
+        // 而 map id 不变。这一行是排查「轨迹属于哪个坐标系」的唯一线索。
+        cout << "[MAP] 合并：图 " << pCurrentMap->GetId() << "（KF " << pCurrentMap->KeyFramesInMap()
+             << "）→ 图 " << pMergeMap->GetId() << "（KF " << pMergeMap->KeyFramesInMap()
+             << "），scale " << s_on << endl;
+
         unique_lock<mutex> lock(mpAtlas->GetCurrentMap()->mMutexMapUpdate);
 
         //cout << "KFs before empty: " << mpAtlas->GetCurrentMap()->KeyFramesInMap() << endl;

@@ -153,6 +153,23 @@ class MapView @JvmOverloads constructor(
         style = Paint.Style.FILL
         color = 0x66000000
     }
+
+    /** 路径点。**绿色** —— 和点云/轨迹/当前位置/测量都不同色。 */
+    private val wpFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF66BB6A.toInt()
+    }
+    private val wpEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.2f * density
+        color = Color.WHITE
+    }
+    private val wpText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 9f * resources.displayMetrics.scaledDensity
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textAlign = Paint.Align.CENTER
+    }
+
     private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1f * density
@@ -170,11 +187,42 @@ class MapView @JvmOverloads constructor(
     private val path = Path()
     private val pt = PointF()
 
+    // ---------------- 路径点（**独立于 Snapshot**）----------------
+    //
+    // 4 Hz 的快照每拍都重造，路径点却是「偶尔变一次」—— 所以单独一组字段，
+    // 由 revision 驱动：[setWaypoints] 只在真的变了的时候被调。
+    /** 世界坐标 `x y`（每点两个）。 */
+    private var wpXY = FloatArray(0)
+    private var wpName = arrayOfNulls<String>(0)
+    private var wpN = 0
+
     // ---------------- 外部命令（主线程）----------------
 
     /** 换一帧内容。**主线程**。 */
     fun submit(s: Snapshot) {
         snap = s
+        invalidate()
+    }
+
+    /**
+     * 换一组路径点（**主线程**）。`xy` 每点两个世界坐标，`names[i]` 是第 i 个的名字。
+     *
+     * 只放**有效且在当前图**的那些 —— 别的图在另一个坐标系里，画上去必然错位。
+     * 调用方按 revision 判断要不要重建，所以这里不做比较。
+     */
+    fun setWaypoints(xy: FloatArray, n: Int, names: Array<String?>) {
+        if (wpXY.size < n * 2) wpXY = FloatArray(n * 2)
+        System.arraycopy(xy, 0, wpXY, 0, n * 2)
+        if (wpName.size < n) wpName = arrayOfNulls(n)
+        for (i in 0 until n) wpName[i] = names.getOrNull(i)
+        wpN = n
+        invalidate()
+    }
+
+    /** 清空路径点图层（**主线程**）。关掉显示开关时用。 */
+    fun clearWaypoints() {
+        if (wpN == 0) return
+        wpN = 0
         invalidate()
     }
 
@@ -287,9 +335,12 @@ class MapView @JvmOverloads constructor(
             }
             canvas.drawPath(path, trajPaint)
         }
+
+        // 路径点画在轨迹之后、当前位置之前 —— 「我在哪」永远压最上层。
+        drawWaypoints(canvas)
+
         if (s.hasCur) {
             worldToView(s.curX, s.curY, pt)
-
             // 朝向三角：贴在点外面，尖端指相机光轴在地面上的投影方向。
             // (0,0) 只在**真的正下方**出现（那时方位角无定义）⟹ 不画。
             // ⚠️ 屏幕 y 向下、世界 y 向上 ⟹ 第二项取负，和 [worldToView] 同一个约定。
@@ -311,14 +362,50 @@ class MapView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * 路径点：绿色菱形 + 名字。
+     *
+     * 只画视口里的 —— 缩小到最外那档时，地图外的点全画一遍没意义。
+     * 名字放不下（互相压）时不画文字，菱形本身还在。
+     */
+    private fun drawWaypoints(canvas: Canvas) {
+        if (wpN <= 0) return
+        val half = 3.2f * density
+        for (i in 0 until wpN) {
+            worldToView(wpXY[i * 2], wpXY[i * 2 + 1], pt)
+            if (pt.x < -half || pt.x > width + half || pt.y < -half || pt.y > height + half) continue
+
+            path.reset()
+            path.moveTo(pt.x, pt.y - half * 1.4f)
+            path.lineTo(pt.x + half, pt.y)
+            path.lineTo(pt.x, pt.y + half * 1.4f)
+            path.lineTo(pt.x - half, pt.y)
+            path.close()
+            canvas.drawPath(path, wpFill)
+            canvas.drawPath(path, wpEdge)
+
+            val name = wpName[i]
+            if (!name.isNullOrEmpty()) {
+                drawOutlinedText(canvas, name.take(10), pt.x, pt.y - half * 2.2f, wpText)
+            }
+        }
+    }
+
     /** 黑描边 + 白填充画两遍 —— 亮暗背景上都看得清。同 [PreviewView] 那套。 */
-    private fun drawOutlinedText(canvas: Canvas, text: String, x: Float, y: Float) {
-        textPaint.style = Paint.Style.STROKE
-        textPaint.strokeWidth = 3f * density
-        textPaint.color = Color.BLACK
-        canvas.drawText(text, x, y, textPaint)
-        textPaint.style = Paint.Style.FILL
-        textPaint.color = Color.WHITE
-        canvas.drawText(text, x, y, textPaint)
+    private fun drawOutlinedText(canvas: Canvas, text: String, x: Float, y: Float,
+                                 paint: Paint = textPaint) {
+        val oldStyle = paint.style
+        val oldColor = paint.color
+        val oldStroke = paint.strokeWidth
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f * density
+        paint.color = Color.BLACK
+        canvas.drawText(text, x, y, paint)
+        paint.style = Paint.Style.FILL
+        paint.color = Color.WHITE
+        canvas.drawText(text, x, y, paint)
+        paint.style = oldStyle
+        paint.color = oldColor
+        paint.strokeWidth = oldStroke
     }
 }

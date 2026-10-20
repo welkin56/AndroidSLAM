@@ -207,6 +207,12 @@ struct Engine {
     };
     /** 折线。和 `measure` 用同一把锁 —— `addPinned` 要读它。**全部主线程碰。** */
     std::vector<Pinned> pinned;
+
+    /** 加路径点的请求。主线程发，worker 在下一帧之后执行一次。 */
+    std::mutex wpMutex;
+    std::string wpName;
+    int wpState = 0;   // 0 没试过 / 1 排队 / 2 成功 / 3 失败
+    std::string wpMsg;
 };
 
 // 故意泄漏，见文件头第 2 条。
@@ -268,6 +274,14 @@ void construct(Engine& e) {
 
     printf("[M5] System 构造完成，耗时 %lld ms\n", (long long)ms);
     fflush(stdout);
+
+    // 路径点 sidecar 跟着 atlas 走：载入旧图才有，新建地图没有这个文件也算正常。
+    std::string lp;
+    {
+        std::lock_guard<std::mutex> lk(e.restoreMutex);
+        lp = e.loadPath;
+    }
+    if (!lp.empty()) s->LoadWaypoints(lp);
 }
 
 void savePose(Engine& e, const TrackResult& r) {
@@ -305,8 +319,7 @@ void rebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
     e.mapSnap.swap(out);
 }
 
-/** 到点了才重建（**SLAM 线程**）。**有帧等着就推迟** —— 别让一次枚举停在 LocalMapping 前面。 */
-void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
+/** 到点了才重建（**SLAM 线程**）。**有帧等着就推迟** —— 别让一次枚举停在 LocalMapping 前面。 */void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
     if (!e.running.load() || !e.mapCloudOn.load()) return;
     const long long now = nowMs();
     if (now - e.mapSnapAtMs.load() < kMapSnapMs) return;
@@ -316,6 +329,37 @@ void maybeRebuildMapSnap(Engine& e, ORB_SLAM3::System* sys) {
     }
     e.mapSnapAtMs.store(now);
     rebuildMapSnap(e, sys);
+}
+
+/**
+ * 执行挂着的「加路径点」请求（**SLAM 线程**）。下一帧就做，不排队。
+ *
+ * 不等到「跟踪恢复」再执行：那样用户按完丢了十秒，会在站错的地方冒出一个路径点。
+ * 这一帧不行就直接失败，界面看得见。
+ */
+void maybeAddWaypoint(Engine& e, ORB_SLAM3::System* sys, bool poseOk) {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lk(e.wpMutex);
+        if (e.wpState != 1) return;
+        e.wpState = 2;
+        name.swap(e.wpName);
+        e.wpMsg.clear();
+    }
+
+    const bool ok = poseOk && sys->AddWaypoint(name);
+    if (!ok) {
+        std::lock_guard<std::mutex> lk(e.wpMutex);
+        e.wpState = 3;
+        if (!poseOk) {
+            e.wpMsg = "没有有效位姿（跟踪没跟上）";
+        } else {
+            // 具体是「没有当前图」还是「图里还没有关键帧」由 `System` 说，
+            // 别在这儿一律说成后者 —— 合并之后这两种原因的修法完全不同。
+            const std::string why = sys->GetWaypointError();
+            e.wpMsg = why.empty() ? "加不了路径点" : why;
+        }
+    }
 }
 
 /** 会话结束之后的一次性存图。**只在没有帧的时候调** —— 那时那张图才是静的。 */
@@ -343,8 +387,15 @@ void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
         e.saveState = ok ? 3 : 4;
     }
     if (ok) {
-        std::lock_guard<std::mutex> lk(e.restoreMutex);
-        e.savedPath = path;   // 「上一次保存」= 这一份
+        {
+            std::lock_guard<std::mutex> lk(e.restoreMutex);
+            e.savedPath = path;   // 「上一次保存」= 这一份
+        }
+        // sidecar 失败不算存图失败 —— 图本身已经落盘了。
+        if (!sys->SaveWaypoints(path)) {
+            printf("[MAP] 路径点 sidecar 写失败（地图已保存）\n");
+            fflush(stdout);
+        }
     }
     printf("[MAP] 存图%s\n", ok ? "完成" : "失败");
     fflush(stdout);
@@ -411,6 +462,10 @@ bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
     fflush(stdout);
 
     const bool ok = sys->ReloadAtlasFrom(path);
+    // 路径点属于 atlas：`ReloadAtlasFrom` 已经清空了旧的那份，
+    // 这里按新源重新读 sidecar（`ok == false` 时读的是空图那份，同样是清空）。
+    if (ok) sys->LoadWaypoints(path);
+
 
     {
         std::lock_guard<std::mutex> lk(e.restoreMutex);
@@ -550,6 +605,8 @@ void worker(Engine& e) {
         // `r.valid` 只在跟踪状态是 OK 时为 true（见 orb_track.cpp）。
         if (r.valid) savePose(e, r);
 
+        maybeAddWaypoint(e, sys, r.valid);
+
         // 刚处理完一帧、队列大概又空了 —— 同一个帧间空隙。
         // ⚠️ 必须在这儿也调一次：30fps 下 `wait_for` 的谓词每次都立刻为真，
         //    上面那个超时分支**根本不执行**。
@@ -670,12 +727,29 @@ void start() {
         e.measureRing.clear();
     }
     e.resetCount.store(0);
+    {
+        // 上一趟没消费掉的加路径点请求不该留到这一趟。
+        std::lock_guard<std::mutex> lk(e.wpMutex);
+        e.wpState = 0;
+        e.wpName.clear();
+        e.wpMsg.clear();
+    }
     e.running.store(true);
 }
 
 void stop() {
     Engine& e = engine();
     e.running.store(false);
+    // 挂着的加路径点请求：不执行了，也别留到下一趟。
+    {
+        std::lock_guard<std::mutex> lk(e.wpMutex);
+        if (e.wpState == 1) {
+            e.wpState = 3;
+            e.wpMsg = "已停止，没有添加";
+            printf("[WP] 停止前挂着的加路径点请求已丢弃\n");
+            fflush(stdout);
+        }
+    }
     // **清空两个队列**：不然下次启动会把停止前积压的旧帧当成新帧喂进去，
     // 而那些帧的时间戳已经落后一大截，跟踪会当场乱掉。
     std::lock_guard<std::mutex> lk(e.qMutex);
@@ -994,6 +1068,67 @@ int getPinned(float* out, int cap) {
     }
 
     return n;
+}
+
+// ---------------- 路径点 ----------------
+
+void requestAddWaypoint(const std::string& name) {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.wpMutex);
+    // 已经排着一个就不再排 —— 连按两下只该加一个点。
+    if (e.wpState == 1) return;
+    e.wpName = name;
+    e.wpMsg.clear();
+    e.wpState = 1;   // 排队
+}
+
+int waypointState() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.wpMutex);
+    return e.wpState;
+}
+
+std::string waypointMsg() {
+    Engine& e = engine();
+    std::lock_guard<std::mutex> lk(e.wpMutex);
+    return e.wpMsg;
+}
+
+void renameWaypoint(int id, const std::string& name) {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys != nullptr) sys->RenameWaypoint(id, name);
+}
+
+void deleteWaypoint(int id) {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys != nullptr) sys->DeleteWaypoint(id);
+}
+
+long long waypointRevision() {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 0 : sys->GetWaypointRevision();
+}
+
+int getWaypoints(float* pos, int posCap, long long* meta, int metaCap,
+                 std::string* names, int nameCap) {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys == nullptr || pos == nullptr || meta == nullptr) return 0;
+
+    const int n = sys->GetWaypoints(pos, posCap, meta, metaCap);
+    // 名字按同一顺序填；装不下就留空串（坐标照给，只是这一拍不显示名字）。
+    for (int i = 0; i < n && names != nullptr && i < nameCap; ++i)
+        names[i] = sys->GetWaypointName(static_cast<int>(meta[4 * i]));
+    return n;
+}
+
+int waypointCount() {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 0 : sys->GetWaypointCount();
+}
+
+int nextWaypointId() {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 1 : sys->GetNextWaypointId();
 }
 
 int resetCount() { return engine().resetCount.load(); }

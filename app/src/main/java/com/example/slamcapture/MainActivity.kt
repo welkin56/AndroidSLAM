@@ -14,6 +14,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -96,6 +97,7 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_MAP_RANGE = "mapRange"
         /** 小地图缩放档位（`MapView.ZOOM_*` 的下标）。 */
         private const val PREF_MAP_ZOOM = "mapZoom"
+        private const val PREF_WAYPOINTS = "waypoints"
 
         /**
          * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
@@ -127,6 +129,10 @@ class MainActivity : AppCompatActivity() {
         private const val kFlagFront = 1   // 在相机前方
         private const val kFlagClosed = 2  // 它之后「断开」了
         private const val kFlagLow = 4     // 不太准（平面兜底/勉强）⟹ 画空心圈
+
+        /** 路径点 flags 的位。**和 `System::GetWaypoints` 一一对应。** */
+        private const val kFlagWpValid = 1L
+        private const val kFlagWpCurrent = 2L
     }
 
     private lateinit var btnSlam: Button
@@ -301,6 +307,26 @@ class MainActivity : AppCompatActivity() {
     /** 上一次落盘的缩放档位。长按连按时只在**真的换档**时才写盘。 */
     private var zoomSaved = -1
 
+    // ---------------- 路径点 ----------------
+    private lateinit var swWaypoints: SwitchCompat
+    private lateinit var btnWpAdd: Button
+    private lateinit var btnWpManage: Button
+
+    /** 路径点缓冲。`wpMeta` 每点 4 个：`id, mapId, kfId, flags`。 */
+    private var wpPos = FloatArray(3 * 16)
+    private var wpMeta = LongArray(4 * 16)
+    private var wpNames = arrayOfNulls<String>(16)
+    private var wpN = 0
+
+    /** 上次读到的那一版。只有它变了才重建小地图那一层。 */
+    private var wpRevisionSeen = -1L
+
+    /** 上一次加路径点的结果（`nativeWaypointState`），用来只提示一次。 */
+    private var wpStateSeen = 0
+
+    /** 加路径点失败时给人看的那句话。 */
+    private var wpMsg: String? = null
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -319,6 +345,9 @@ class MainActivity : AppCompatActivity() {
         tvMapRange = findViewById(R.id.tvMapRange)
         btnMapZoomIn = findViewById(R.id.btnMapZoomIn)
         btnMapZoomOut = findViewById(R.id.btnMapZoomOut)
+        swWaypoints = findViewById(R.id.swWaypoints)
+        btnWpAdd = findViewById(R.id.btnWpAdd)
+        btnWpManage = findViewById(R.id.btnWpManage)
         drawer = findViewById(R.id.drawer)
         rowMeasure = findViewById(R.id.rowMeasure)
         btnAddPoint = findViewById(R.id.btnAddPoint)
@@ -414,6 +443,17 @@ class MainActivity : AppCompatActivity() {
             SlamBridge.nativeClearPinned()
             refreshPinned()
         }
+
+        // 路径点。开关只影响**画不画**；管理界面始终能看（否则关掉开关就再也找不到它们了）。
+        swWaypoints.isChecked = pref.getBoolean(PREF_WAYPOINTS, true)
+        swWaypoints.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_WAYPOINTS, checked).apply()
+            // 关掉时 `clearWaypoints()`；打开时必须**强制重读**，否则 revision 没变会一直空着。
+            wpRevisionSeen = -1
+            refreshWaypoints()
+        }
+        btnWpAdd.setOnClickListener { askAddWaypoint() }
+        btnWpManage.setOnClickListener { showWaypointManager() }
 
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
@@ -967,6 +1007,20 @@ class MainActivity : AppCompatActivity() {
         btnUndoPoint.isEnabled = pinnedN > 0
         btnResetPoints.isEnabled = pinnedN > 0
 
+        // 放路径点：跑着且有位姿才可点。
+        btnWpAdd.isEnabled = slamRunning && poseValid
+        btnWpManage.isEnabled = SlamBridge.nativeWaypointCount() > 0
+
+        // 加路径点的结果：**只提示一次**（`wpState` 是粘性的，会一直是 2/3）。
+        val wpState = SlamBridge.nativeWaypointState()
+        if (wpState != wpStateSeen) {
+            wpStateSeen = wpState
+            when (wpState) {
+                3 -> wpMsg = "放路径点失败：${SlamBridge.nativeWaypointMsg()}"
+                2 -> wpMsg = null
+            }
+        }
+
         // ---- 状态栏 ----
         val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
         // `System` 造好之后有两种情形，先算出来 —— 塞进 `when` 的 else 分支里会写出
@@ -1034,17 +1088,161 @@ class MainActivity : AppCompatActivity() {
                 SlamBridge.nativeAtlasStats(atlasBuf)
                 if (isNotEmpty()) append("\n")
                 append("地图 ${atlasBuf[0]} 张 / 关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}")
+                // 路径点：有才显示，免得平时多占一行。
+                val wpTotal = SlamBridge.nativeWaypointCount()
+                if (wpTotal > 0) append("　路径点 $wpTotal")
             }
             // 词袋加载期间那条「正在载入地图…」只是排队，别和加载进度叠在一起。
             if (slamState != SLAM_LOADING) restoreMsg?.let { append("\n$it") }
             saveMsg?.let { append("\n$it") }
+            wpMsg?.let { append("\n$it") }
             lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
         }
         tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
         // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
-        if (!restoring) refreshMap()
+        if (!restoring) {
+            refreshMap()
+            refreshWaypoints()
+        }
+    }
+
+    // ---------------- 路径点 ----------------
+
+    /**
+     * 读一次路径点喂给小地图。
+     *
+     * ⚠️ **不能按 revision 跳过**：回环/合并会把整张图的位姿改掉（`ApplyScaledRotation`），
+     * 坐标变了而 revision 不变，只认 revision 的话标记会一直停在旧位置（看着就是「没了」）。
+     * 点只有几个，每拍重读的代价可以忽略。
+     *
+     * 只把**有效且在当前图**的交给 [MapView]：别的图在另一个坐标系里，画上去必然错位。
+     */
+    private fun refreshWaypoints() {
+        if (!swWaypoints.isChecked) {
+            mapView.clearWaypoints()
+            return
+        }
+
+        // 和 `readPinned` 一个契约：装不下就少给，看到写满就扩容重来。
+        while (true) {
+            val n = SlamBridge.nativeGetWaypoints(wpPos, wpMeta, wpNames)
+            if (n < wpPos.size / 3 && n < wpMeta.size / 4 && n < wpNames.size) {
+                wpN = n
+                break
+            }
+            wpPos = FloatArray(wpPos.size * 2)
+            wpMeta = LongArray(wpMeta.size * 2)
+            wpNames = arrayOfNulls(wpNames.size * 2)
+        }
+
+        // 挑出「有效 + 在当前图」的，压成 `MapView` 要的那种扁平数组。
+        val xs = FloatArray(wpN * 2)
+        val ns = arrayOfNulls<String>(wpN)
+        var k = 0
+        for (i in 0 until wpN) {
+            val flags = wpMeta[i * 4 + 3]
+            if ((flags and kFlagWpValid) == 0L || (flags and kFlagWpCurrent) == 0L) continue
+            xs[k * 2] = wpPos[i * 3]
+            xs[k * 2 + 1] = wpPos[i * 3 + 1]
+            ns[k] = wpNames[i]
+            k++
+        }
+        mapView.setWaypoints(xs, k, ns)
+    }
+
+    /** 加路径点：先问名字，再发请求。**名字可以当场改**。 */
+    private fun askAddWaypoint() {
+        val input = EditText(this).apply {
+            // 用**下一个 id** 而不是「现有条数 + 1」：删过点之后条数会回退，
+            // 那样新点会和还没删的那个重名。
+            setText("路径点 ${SlamBridge.nativeNextWaypointId()}")
+            setSelectAllOnFocus(true)
+            setPadding(56, 0, 56, 0)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("添加路径点")
+            .setView(input)
+            .setPositiveButton("添加") { _, _ ->
+                val name = input.text.toString().trim().ifEmpty { "路径点" }
+                Log.i(TAG, "加路径点「$name」")
+                SlamBridge.nativeRequestAddWaypoint(name)
+                wpStateSeen = 1
+                uiQueueTicker()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 管理界面：每条路径点一行，点了就能改名或删掉。**含不在当前图 / 已失效的**。 */
+    private fun showWaypointManager() {
+        val total = SlamBridge.nativeWaypointCount()
+        if (total == 0) {
+            AlertDialog.Builder(this)
+                .setTitle("路径点")
+                .setMessage("还没有路径点。\n\n在 SLAM 跑起来之后，走到想记的地方点「添加路径点」。")
+                .setPositiveButton("好", null)
+                .show()
+            return
+        }
+
+        val pos = FloatArray(3 * total)
+        val meta = LongArray(4 * total)
+        val names = arrayOfNulls<String>(total)
+        val n = SlamBridge.nativeGetWaypoints(pos, meta, names)
+
+        val labels = Array(n) { i ->
+            val name = names[i] ?: "路径点"
+            val flags = meta[i * 4 + 3]
+            val mapId = meta[i * 4 + 1]
+            when {
+                (flags and kFlagWpValid) == 0L -> "$name · 已失效"
+                (flags and kFlagWpCurrent) == 0L -> "$name · 图 #$mapId（不在当前图）"
+                else -> "$name · 图 #$mapId"
+            }
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("路径点（$n）")
+            .setItems(labels) { _, which ->
+                val id = meta[which * 4].toInt()
+                val name = names[which] ?: "路径点"
+                AlertDialog.Builder(this)
+                    .setTitle(name)
+                    .setItems(arrayOf("重命名", "删除")) { _, pick ->
+                        when (pick) {
+                            0 -> askRenameWaypoint(id, name)
+                            else -> {
+                                SlamBridge.nativeDeleteWaypoint(id)
+                                refreshWaypoints()
+                                render()
+                            }
+                        }
+                    }
+                    .show()
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun askRenameWaypoint(id: Int, old: String) {
+        val input = EditText(this).apply {
+            setText(old)
+            setSelectAllOnFocus(true)
+            setPadding(56, 0, 56, 0)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("重命名")
+            .setView(input)
+            .setPositiveButton("确定") { _, _ ->
+                val name = input.text.toString().trim().ifEmpty { old }
+                SlamBridge.nativeRenameWaypoint(id, name)
+                refreshWaypoints()
+                render()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     // ---------------- 2D 地图小窗 ----------------

@@ -115,6 +115,10 @@ public:
 
     Map* GetCurrentMap();
 
+    // add：只读，**不会**睡眠等坏图。给「从别的线程问一句」用 ——
+    // `GetCurrentMap()` 在坏图窗口里是 `while(IsBad()) usleep(3000)`，还抱着 `mMutexAtlas`。
+    Map* PeekCurrentMap();
+
     void SetMapBad(Map* pMap);
     void RemoveBadMaps();
 

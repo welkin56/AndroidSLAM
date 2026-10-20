@@ -95,6 +95,10 @@ public:
 
     KeyFrame* GetOriginKF();
 
+    // add：本图里 mnId 最大的关键帧。**只在图集合里找** —— 排队等 LocalMapping 的 KF
+    // 会被 `LocalMapping::Release()` delete，拿它做锚点会悬空。
+    KeyFrame* GetLatestKeyFrame();
+
     void SetCurrentMap();
     void SetStoredMap();
 

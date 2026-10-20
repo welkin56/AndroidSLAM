@@ -182,6 +182,53 @@ public:
     /** 上游那份轨迹表里有多少帧（含跟丢的）。给状态栏的计数用 —— 不抽稀。 */
     int GetFrameTrajectorySize();
 
+    // ---------------- add：路径点 ----------------
+    //
+    // 「记一个路径点」= 记下**此刻的相机位姿 + 一个名字**。它和轨迹用同一套存法：
+    // 锚在一个关键帧上、存相对位姿，读的时候现乘 —— 于是 BA / 回环 / 合并改了地图之后，
+    // 路径点自动跟着走，不用任何合并钩子。锚点被剔了就沿 `mTcp` 爬到活着的父帧；
+    // 只有 `GetMap() == nullptr`（`Map::clear()`，即地图被重置）才算失效。
+
+    /**
+     * add：在当前相机位置记一个路径点（**SLAM 线程调** —— 要读 `mCurrentFrame`）。
+     * 当前图里还没有关键帧时返回 false。
+     */
+    bool AddWaypoint(const std::string& name);
+    /** 最后一次 `AddWaypoint` 失败的原因（空串 = 上次成功）。 */
+    std::string GetWaypointError();
+
+    /** add：改名 / 删除 / 清空。**任意线程** —— 只碰字符串和容器。 */
+    void RenameWaypoint(int id, const std::string& name);
+    void DeleteWaypoint(int id);
+    void ClearWaypoints();
+
+    /** add：路径点条数（任意线程）。 */
+    int GetWaypointCount();
+
+    /** add：下一个会分配的 id（= 默认名字里的编号）。任意线程。 */
+    int GetNextWaypointId();
+
+    /** add：第 `i` 条的 id 与名字（任意线程）。找不到返回空串。 */
+    std::string GetWaypointName(int id);
+
+    /**
+     * add：读路径点的世界坐标（**主线程调**）。
+     *
+     * `pos` 每点 3 个 float（`x y z`），`meta` 每点 4 个：
+     * `id, mapId, frameId, flags`（bit0 = 坐标有效 / bit1 = 在当前图）。
+     *
+     * ⚠️ 容量契约和 `getPinned` 一样：**装不下就少给，返回实际写了几个**，
+     * 调用方看到写满就扩容 —— 不能返回真实条数，那调用方会读到没写过的内存。
+     */
+    int GetWaypoints(float* pos, int posCap, long long* meta, int metaCap);
+
+    /** add：变一次就加一。给界面判断「要不要重建那层叠加」用。 */
+    long long GetWaypointRevision();
+
+    /** add：存 / 读 sidecar（`<path>.waypoints.tsv`）。**SLAM 线程调**；空路径 = 只清空。 */
+    bool SaveWaypoints(const std::string& path);
+    bool LoadWaypoints(const std::string& path);
+
     /** add：清空那份轨迹表。**一次运行 = 一份轨迹**，`start` 时调（否则会跨 run 累加）。 */
     void ClearFrameTrajectory();
 
@@ -314,6 +361,16 @@ private:
     string mStrSaveAtlasToFile;
 
     string mStrVocabularyFilePath;
+
+    // add：路径点。**只在 `System.cc` 里定义具体类型** —— 这个头文件只用前置声明，
+    // 免得为了一个 `Sophus::SE3f` 成员把它们拖进来。
+    struct Waypoint;
+    std::vector<Waypoint*> mvpWaypoints;
+    std::mutex mMutexWaypoints;
+    long long mnWaypointRevision;
+    int mnNextWaypointId;
+    /** 最后一次 `AddWaypoint` 失败的原因。空串 = 上次是成功的。 */
+    std::string mstrWaypointError;
 
     Settings* settings_;
 };
