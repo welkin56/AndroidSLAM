@@ -136,6 +136,32 @@ public:
     // 全部改指向，所以载进现有的对象、只搬内容。搬完 `p` 只剩空壳，可以 delete。
     void AdoptFrom(Atlas* p);
 
+    // ---------------- add：合并链（仅内存）----------------
+    //
+    // 合并只改**坐标系**、不改图的身份：活着的是当前图，被吸收的图 0 关键帧、
+    // 存盘时会被 `PreSave()` 剔掉。磁盘上的轨迹要跟着坐标系走，所以得把变换记下来。
+
+    /** 一次合并。`T_on` 把幸存图**合并前**的坐标搬到吸收图的坐标里（`p' = s·R·p + t`）。 */
+    struct MapMergeRecord
+    {
+        unsigned long survivor, absorbed;
+        float s;
+        float q[4];   // T_on 旋转 x y z w
+        float t[3];   // T_on 平移
+    };
+
+    /** 记一次合并（LoopClosing 线程）。 */
+    void RecordMerge(unsigned long survivor, unsigned long absorbed,
+                     const Sophus::SE3f& T_on, float s);
+
+    /**
+     * 读合并链（主线程）：每条 10 个 float `survivor absorbed s qx qy qz qw tx ty tz`，
+     * 按发生顺序。**装不下就少给，返回实际写了几条。**
+     */
+    int GetMergeRecords(float* out, int cap);
+
+    void ClearMergeRecords();
+
     map<long unsigned int, KeyFrame*> GetAtlasKeyframes();
 
     void SetKeyFrameDababase(KeyFrameDatabase* pKFDB);
@@ -160,6 +186,10 @@ protected:
     std::vector<GeometricCamera*> mvpCameras;
 
     unsigned long int mnLastInitKFidMap;
+
+    // add：合并链。进程内、按发生顺序。独立锁 —— 读写都不需要碰 `mMutexAtlas`。
+    std::vector<MapMergeRecord> mvMerges;
+    std::mutex mMutexMerge;
 
     Viewer* mpViewer;
     bool mHasViewer;

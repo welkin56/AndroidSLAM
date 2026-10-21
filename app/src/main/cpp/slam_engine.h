@@ -240,4 +240,25 @@ void setMapCloudEnabled(bool on);
  */
 void dumpTrajectory(const std::string& path);
 
+/**
+ * 本趟最后一段轨迹属于哪张图（**主线程调**）。-1 = 没有。
+ *
+ * 值在 `stop()` 里快照 —— `nativeStop()` 之后 worker 可能立刻消费挂着的「恢复 atlas」
+ * 请求，那会把整个 atlas 换掉；事后再问拿到的就是空图。
+ */
+long long lastTrajMapId();
+
+/** 本趟的合并链（**主线程调**）：每条 10 个 float，按发生顺序。装不下就少给。 */
+int lastMerges(float* out, int cap);
+
+/**
+ * 把一个轨迹文件按合并变换写到 `dst`（**主线程调**）。成功返回 true。
+ *
+ * `T_on` 的 `p' = s·R·p + t` 作用在 `Twc` 上 ⟹ `q' = q_on⊗q`、`t' = s·R_on·t + t_on`。
+ * 写的是 `dst`（不是原地改）：调用方负责「全部写完再统一 rename」。
+ */
+bool transformTrajFile(const std::string& src, const std::string& dst,
+                       float s, float qx, float qy, float qz, float qw,
+                       float tx, float ty, float tz);
+
 }  // namespace slam

@@ -9,6 +9,21 @@ git 记的是「结果」，这里记的是「为什么」，以及**考虑过�
 
 ## 2026-10
 
+- [2026-10-21 存图崩溃：初始关键帧被 delete 后还留在地图里](2026-10-21-presave-crash-dangling-kf.md)
+  —— 点「保存地图」秒崩 `SIGSEGV`，符号化后落在 `MapPoint::PreSave` 的 `++it`。
+  ⭐ **根因是上游**：`InitializeIMU()` 删 `mlNewKeyFrames` 时不看 `isBad()`，而
+  `SetBadFlag()` 对**初始关键帧**直接 return（保护原点）⟹ 初始 KF 被删了还留在
+  `mspKeyFrames` / 观测里。补丁 27、28（顺带修了 `PreSave` 边遍历边 erase 的 UB）。
+  **未验证。**
+
+- [2026-10-21 轨迹按 atlas 图分文件夹](2026-10-21-map-folders-for-trajectory.md)
+  —— `run-N/trajectory.txt` 换成 `map-<id>/traj-<时间>.txt`，一个 atlas 图一个文件夹。
+  ⭐ **文件夹里的轨迹全部在同一坐标系**：合并时存活目录的存量乘 `T_on`、被吸收目录原样
+  并进来再删掉。⭐ **延迟归档**：轨迹先落 `traj/`，存图成功才进 `map-<id>/` ——
+  否则「不保存」会留下混合坐标系，回滚后 map id 还会被下一张图复用。
+  ⚠️ 存图完成只在「保存中 → 完成」那一拍触发一次（`saveState` 是粘性的）。
+  **未验证。**
+
 - [2026-10-20 路径点](2026-10-20-waypoints.md) — 锚在关键帧上存相对位姿，和轨迹同一套；
   合并自动跟随、被剔爬链、地图重置才失效。含 `<base>.waypoints.tsv` 与显示/管理界面。
 - [2026-10-18 记住小地图的缩放档位](2026-10-18-minimap-zoom-persist.md)

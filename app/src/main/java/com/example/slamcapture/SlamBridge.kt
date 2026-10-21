@@ -208,4 +208,23 @@ object SlamBridge {
      * 名字元素可为 null（JNI 侧本来就只认 `jobjectArray`，可空性签名不参与链接）。
      */
     external fun nativeGetWaypoints(pos: FloatArray, meta: LongArray, names: Array<String?>): Int
+
+    // —— 轨迹归属 / 合并链 ——
+
+    /**
+     * 本趟最后一段轨迹属于哪张图（-1 = 没有）。
+     * **`nativeStop()` 之后立刻读** —— 快照就在 `slam::stop()` 里做的。
+     */
+    external fun nativeLastTrajMapId(): Long
+
+    /** 本趟的合并链：每条 10 个 float `survivor absorbed s qx qy qz qw tx ty tz`。 */
+    external fun nativeLastMerges(out: FloatArray): Int
+
+    /**
+     * 把一个轨迹文件按合并变换写到 [dst]。8 列：`time tx ty tz qx qy qz qw`（Twc）。
+     * 写的是**副本** —— 调用方负责「全部写完再统一 rename」。
+     */
+    external fun nativeTransformTrajFile(src: String, dst: String,
+                                         s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
+                                         tx: Float, ty: Float, tz: Float): Boolean
 }

@@ -19,6 +19,7 @@
 #include "Atlas.h"
 #include "Viewer.h"
 
+#include <algorithm> // std::min（GetMergeRecords）
 #include <utility>   // std::move（AdoptFrom）
 
 #include "GeometricCamera.h"
@@ -358,6 +359,9 @@ void Atlas::PostLoad()
         numMP += pMi->GetAllMapPoints().size();
     }
     mvpBackupMaps.clear();
+
+    // 链属于**被换掉的**那个 atlas：读进来的图各自是独立坐标系，旧链一条都不能留。
+    ClearMergeRecords();
 }
 
 void Atlas::AdoptFrom(Atlas* p)
@@ -372,6 +376,50 @@ void Atlas::AdoptFrom(Atlas* p)
     mvpBackupMaps = std::move(p->mvpBackupMaps);
     mvpCameras = std::move(p->mvpCameras);
     mnLastInitKFidMap = p->mnLastInitKFidMap;
+}
+
+void Atlas::RecordMerge(unsigned long survivor, unsigned long absorbed,
+                        const Sophus::SE3f& T_on, float s)
+{
+    MapMergeRecord r;
+    r.survivor = survivor;
+    r.absorbed = absorbed;
+    r.s = s;
+
+    const Eigen::Quaternionf q = T_on.unit_quaternion();
+    r.q[0] = q.x(); r.q[1] = q.y(); r.q[2] = q.z(); r.q[3] = q.w();
+    const Eigen::Vector3f t = T_on.translation();
+    r.t[0] = t.x(); r.t[1] = t.y(); r.t[2] = t.z();
+
+    unique_lock<mutex> lock(mMutexMerge);
+    mvMerges.push_back(r);
+}
+
+int Atlas::GetMergeRecords(float* out, int cap)
+{
+    if (out == nullptr || cap < 10)
+        return 0;
+
+    unique_lock<mutex> lock(mMutexMerge);
+    const int n = std::min(static_cast<int>(mvMerges.size()), cap / 10);
+    for (int i = 0; i < n; ++i)
+    {
+        const MapMergeRecord& r = mvMerges[static_cast<size_t>(i)];
+        float* o = out + 10 * i;
+        // id 走 float 传：一次会话里的 map id 远小于 2^24，精度够。
+        o[0] = static_cast<float>(r.survivor);
+        o[1] = static_cast<float>(r.absorbed);
+        o[2] = r.s;
+        o[3] = r.q[0]; o[4] = r.q[1]; o[5] = r.q[2]; o[6] = r.q[3];
+        o[7] = r.t[0]; o[8] = r.t[1]; o[9] = r.t[2];
+    }
+    return n;
+}
+
+void Atlas::ClearMergeRecords()
+{
+    unique_lock<mutex> lock(mMutexMerge);
+    mvMerges.clear();
 }
 
 void Atlas::SetKeyFrameDababase(KeyFrameDatabase* pKFDB)

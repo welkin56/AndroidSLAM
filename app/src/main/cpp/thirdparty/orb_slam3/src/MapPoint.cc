@@ -188,7 +188,12 @@ void MapPoint::EraseObservation(KeyFrame* pKF)
             mObservations.erase(pKF);
 
             if(mpRefKF==pKF)
-                mpRefKF=mObservations.begin()->first;
+            {
+                // 擦到空的时候 `begin()` 就是 `end()`，解引用它是未定义行为。
+                mpRefKF = mObservations.empty()
+                        ? static_cast<KeyFrame*>(NULL)
+                        : mObservations.begin()->first;
+            }
 
             // If only 2 observations or less, discard point
             if(nObs<=2)
@@ -578,19 +583,25 @@ void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
     mBackupObservationsId1.clear();
     mBackupObservationsId2.clear();
     // Save the id and position in each KF who view it
+    // ⚠️ 不能边遍历 `mObservations` 边 `EraseObservation()` —— erase 会让当前迭代器失效，
+    //    下一次 `++it` 就是 use-after-free（真机崩在 `__tree_next_iter`）。
+    //    先把要删的挑出来，循环结束再删。
+    vector<KeyFrame*> vpStale;
     for(std::map<KeyFrame*,std::tuple<int,int> >::const_iterator it = mObservations.begin(), end = mObservations.end(); it != end; ++it)
     {
         KeyFrame* pKFi = it->first;
         if(spKF.find(pKFi) != spKF.end())
         {
-            mBackupObservationsId1[it->first->mnId] = get<0>(it->second);
-            mBackupObservationsId2[it->first->mnId] = get<1>(it->second);
+            mBackupObservationsId1[pKFi->mnId] = get<0>(it->second);
+            mBackupObservationsId2[pKFi->mnId] = get<1>(it->second);
         }
         else
         {
-            EraseObservation(pKFi);
+            vpStale.push_back(pKFi);
         }
     }
+    for(KeyFrame* pKFi : vpStale)
+        EraseObservation(pKFi);
 
     // Save the id of the reference KF
     if(spKF.find(mpRefKF) != spKF.end())

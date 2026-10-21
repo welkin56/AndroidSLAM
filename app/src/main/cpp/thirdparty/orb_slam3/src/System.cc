@@ -791,6 +791,28 @@ int System::GetFrameTrajectorySize()
     return static_cast<int>(mpTracker->mlRelativeFramePoses.size());
 }
 
+long long System::GetTrajectoryMapId()
+{
+    if (mpTracker == nullptr)
+        return -1;
+
+    // 判据和 `GetFrameTrajectory()` 逐字一致 —— 那边也是这么挑 `pMap` 的。
+    unique_lock<mutex> lockTraj(mpTracker->mMutexTraj);
+    Map* pMap = nullptr;
+    for (list<KeyFrame*>::const_reverse_iterator it = mpTracker->mlpReferences.rbegin();
+         it != mpTracker->mlpReferences.rend(); ++it)
+        if (*it) { pMap = (*it)->GetMap(); break; }
+
+    return pMap == nullptr ? -1 : static_cast<long long>(pMap->GetId());
+}
+
+int System::GetMergeRecords(float* out, int cap)
+{
+    if (mpAtlas == nullptr)
+        return 0;
+    return mpAtlas->GetMergeRecords(out, cap);
+}
+
 void System::ClearFrameTrajectory()
 {
     if (mpTracker != nullptr)
@@ -1346,6 +1368,8 @@ bool System::ReloadAtlasFrom(const std::string& path)
 
     // 路径点属于旧 atlas：换掉之前先清空。失败时也不能留着（坐标已经没有意义）。
     ClearWaypoints();
+    // 合并链同理：后面 `LoadAtlasInto` 成功时 `PostLoad()` 也会清，这里兜住失败那条路。
+    mpAtlas->ClearMergeRecords();
 
     // 清当前图、轨迹和倒排表；KeyFrame / Frame 的 ID 计数器归零
     //（紧接着的 LoadAtlasInto 会把它们恢复成文件里的值）。

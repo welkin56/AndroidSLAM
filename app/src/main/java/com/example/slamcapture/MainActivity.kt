@@ -219,11 +219,42 @@ class MainActivity : AppCompatActivity() {
     /** 最近一次请求是「入口页换源」而不是「这一趟没保存」。只影响提示语。 */
     private var atlasSwitching = false
 
-    /** 这一次「启动 SLAM → 结束」的子目录 `<会话>/run-N/`。**它才是坐标系单元**。 */
-    private var curRunDir: File? = null
+    /** 本趟的时间戳 —— 轨迹和录像都用它，一趟固定（中途开录制也不换目录）。 */
+    private var runStamp = ""
+
+    /** 本趟的录像目录 `<会话>/rec/<runStamp>/`。没录过就是 null。 */
+    private var curRecDir: File? = null
+
+    /**
+     * 本趟轨迹的前缀（含目录、**不含扩展名**）：`<会话>/traj/traj-<runStamp>`。
+     *
+     * 先落在 `traj/`，**存图成功那一刻**才搬进 `map-<id>/`（见 [applyPendingSave]）。
+     * 没存下的图不该在磁盘上留下文件夹 —— 否则回滚后 map id 会被下一张图复用。
+     */
+    private var curTrajBase: File? = null
+
+    /** 本趟轨迹所属的图。`nativeStop()` 之后立刻快照；-1 = 没有。 */
+    private var runMapId = -1L
+
+    /** 本趟的合并链，每条 10 个 float（见 [SlamBridge.nativeLastMerges]）。 */
+    private var runMerges: List<FloatArray> = emptyList()
 
     /** 上一次保留的目录，只给状态栏显示。 */
     private var lastRunDir: File? = null
+
+    /**
+     * 存图请求发出时的归档上下文。
+     *
+     * ⚠️ 存图是异步的，完成时用户可能已经开了**下一趟** —— 那时 `runMapId` /
+     * `curTrajBase` 都已经被重置成新趟的值了。归档要用请求那一刻的快照。
+     */
+    private class PendingArchive(
+        val session: File,
+        val mapId: Long,
+        val merges: List<FloatArray>,
+        val base: File?
+    )
+    private var pendingArchive: PendingArchive? = null
 
     // ---------------- 位姿 ----------------
 
@@ -585,16 +616,15 @@ class MainActivity : AppCompatActivity() {
         SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
 
-        // 会话目录只建一次；本次「启动→结束」在它下面开一个 run-N/。
+        // 会话目录只建一次；本趟的轨迹和录像都放在它下面。
         //
-        // 载入了旧图的话，会话目录就是那张图所在的目录（不新建）：这样一趟趟的 run-N/
+        // 载入了旧图的话，会话目录就是那张图所在的目录（不新建）：这样一趟趟的轨迹
         // 会攒在同一张图下面，「同一张图的轨迹」不用另外存一份。
-        val session = sessionDir ?: run {
+        if (sessionDir == null) {
             val loaded = mapFile?.let { File(it).parentFile }
             if (loaded != null) {
                 loaded.mkdirs()
                 sessionDir = loaded   // 不写 session.json —— 那是这张图第一次建的时候写的
-                loaded
             } else {
                 newSessionDir().also {
                     sessionDir = it
@@ -602,7 +632,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        curRunDir = nextRunDir(session)
+        // 一趟固定一个时间戳；轨迹先落 `traj/`，存图成功才归档到 `map-<id>/`。
+        runStamp = stamp()
+        curTrajBase = null
+        curRecDir = null
+        runMapId = -1
+        runMerges = emptyList()
         if (swRecord.isChecked) startRecording()
 
         Log.i(TAG, "SLAM 开始吃帧")
@@ -622,18 +657,26 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "SLAM 停止吃帧（$reason）")
 
         SlamBridge.nativeStop()   // 先让它别吃了，再拆硬件
+
+        // ⚠️ 紧跟 `nativeStop()` 读：快照就在 `slam::stop()` 里做的。
+        // 再晚一步，worker 可能已经消费「恢复 atlas」请求、把整张图换掉了。
+        runMapId = SlamBridge.nativeLastTrajMapId()
+        runMerges = readMerges()
         slamRunning = false
 
         stopRecording()           // 正在录的话文件一律保留（录到一半也是真数据）
 
-        // 轨迹落在这一趟的 run-N/ 里。**主动结束**才弹窗问留不留；
-        // 切后台 / 退出直接留着（数据是真的，回来按「启动」是新的 run）。
-        val dir = curRunDir
-        curRunDir = null
-        if (dir != null) {
-            exportTrajectory(dir)
+        // 轨迹先落 `traj/`；存图成功那一刻才归档进 `map-<id>/`（见 applyPendingSave）。
+        // **主动结束**才弹窗问留不留；切后台 / 退出直接留着（数据是真的）。
+        val base = newTrajBase()
+        if (base != null) {
+            curTrajBase = base
+            exportTrajectory(base)
+            // 元信息**当场就写**，不等「留不留」那个弹窗 —— 存图可能在用户回答之前完成，
+            // 那时归档会把这两个文件一起搬走；晚写就会一个在 map/、一个留在 traj/。
+            writeRunMeta(base)
             // 先问地图、再问轨迹（askMapSave 问完会接着问轨迹）。一次只弹一个。
-            if (reason == "用户结束") askMapSave(dir) else keepRun(dir)
+            if (reason == "用户结束") askMapSave(base) else keepRun(base)
         }
 
         cam.stop()
@@ -691,12 +734,20 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 落盘开关（抽屉里）----------------
 
     private fun startRecording() {
-        val run = curRunDir
-        if (!slamRunning || run == null) {
+        if (!slamRunning) {
             Log.w(TAG, "SLAM 没在跑，不能录")
             return
         }
         if (writer != null) return
+        val session = sessionDir
+        if (session == null || runStamp.isEmpty()) {
+            Log.w(TAG, "没有会话目录，不能录")
+            return
+        }
+
+        // 一趟一个 `rec/<runStamp>/`；中途开录制也落在同一个底下。
+        val run = curRecDir
+            ?: File(TrajectoryStore.recDir(session), runStamp).also { curRecDir = it }
 
         // ⚠️ **每一段写自己的目录**（`session-1/`、`session-2/`…）。不能复用同一个 ——
         // `SessionWriter.start()` 用 `FileOutputStream` 打开 csv 会**截断**，
@@ -735,10 +786,10 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 位姿与轨迹 ----------------
 
-    private fun exportTrajectory(dir: File) {
-        val f = File(dir, "trajectory.txt")
+    /** [base] 不含扩展名 —— 轨迹写 `base.txt`，元信息写 `base.json`。 */
+    private fun exportTrajectory(base: File) {
         try {
-            SlamBridge.nativeDumpTrajectory(f.absolutePath)
+            SlamBridge.nativeDumpTrajectory("$base.txt")
         } catch (e: Throwable) {
             Log.e(TAG, "导出轨迹失败", e)
         }
@@ -1046,12 +1097,17 @@ class MainActivity : AppCompatActivity() {
         when (SlamBridge.nativeSaveState()) {
             1, 2 -> saveMsg = "正在保存地图…"
             3 -> {
+                // ⚠️ 只在「保存中 → 完成」这一拍归档。`saveState` 是**粘性的**（一直是 3），
+                // 之后任何一次 render 都会再看到它 —— 不加这个闸，坐标会被变换很多遍。
+                val justFinished = saving
                 saveMsg = "地图已保存 → ${savedName ?: "?"}.osa"
                 saving = false
+                if (justFinished) applyPendingSave()
             }
             4 -> {
                 saveMsg = "地图保存失败（看 logcat 的 slam）"
                 saving = false
+                pendingArchive = null   // 磁盘不动，松文件留在 traj/
             }
         }
 
@@ -1480,24 +1536,40 @@ class MainActivity : AppCompatActivity() {
     /** 目录名和地图文件名的统一时间戳格式。 */
     private fun stamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
 
-    /** `<会话>/run-N/`，N 取第一个没被占的号。**这才是坐标系单元** —— 轨迹在它下面。 */
-    private fun nextRunDir(session: File): File {
-        var n = 1
-        while (File(session, "run-$n").exists()) n++
-        return File(session, "run-$n").apply { mkdirs() }
-    }
-
-    /** `<run-N>/session-M/`，M 取第一个没被占的号。每段录制一个目录，理由见 [startRecording]。 */
+    /** `<rec/<runStamp>>/session-M/`，M 取第一个没被占的号。理由见 [startRecording]。 */
     private fun nextSessionDir(run: File): File {
         var n = 1
         while (File(run, "session-$n").exists()) n++
         return File(run, "session-$n")
     }
 
-    /** 这一趟已经录出来的段（`run-N/session-M/`）。 */
-    private fun sessionDirs(run: File): List<File> =
-        run.listFiles { f -> f.isDirectory && f.name.startsWith("session-") }
+    /** 这一趟已经录出来的段（`rec/<runStamp>/session-M/`）。 */
+    private fun sessionDirs(run: File?): List<File> =
+        run?.listFiles { f -> f.isDirectory && f.name.startsWith("session-") }
             ?.sorted() ?: emptyList()
+
+    /**
+     * 本趟轨迹的前缀：`<会话>/traj/traj-<runStamp>`（不含扩展名）。
+     *
+     * 落在这里而不是 `map-<id>/` —— 图还没存下来之前，那个 id 随时可能被回滚复用。
+     */
+    private fun newTrajBase(): File? {
+        val session = sessionDir ?: return null
+        if (runStamp.isEmpty()) return null
+        val dir = TrajectoryStore.trajDir(session)
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.e(TAG, "建轨迹目录失败：${dir.absolutePath}")
+            return null
+        }
+        return File(dir, "traj-$runStamp")
+    }
+
+    /** 读本趟的合并链（`slam::stop()` 里快照好的）。每条 10 个 float。 */
+    private fun readMerges(): List<FloatArray> {
+        val buf = FloatArray(10 * 16)
+        val n = SlamBridge.nativeLastMerges(buf)
+        return (0 until n).map { i -> buf.copyOfRange(i * 10, i * 10 + 10) }
+    }
 
     // ---------------- 这一趟留不留 ----------------
 
@@ -1505,22 +1577,27 @@ class MainActivity : AppCompatActivity() {
      * 弹窗问「这一趟留不留」。
      * ⚠️ **「不保存」必须是明确动作** —— 点外面 / 按返回都算保存，免得手滑丢数据。
      */
-    private fun askKeepRun(dir: File) {
-        val segs = sessionDirs(dir).size
+    private fun askKeepRun(base: File) {
+        val segs = sessionDirs(curRecDir).size
         val resets = SlamBridge.nativeResetCount()
         val msg = buildString {
             append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
+            if (runMapId >= 0) append(" · 图 #$runMapId")
             if (segs > 0) append("，会话 $segs 段")
             append("\n")
+            if (runMerges.isNotEmpty())
+                append("本趟合并：" + runMerges.joinToString("，") {
+                    "图 #${it[0].toLong()} ← 图 #${it[1].toLong()}"
+                } + "\n")
             if (resets > 0) append("地图被重置 $resets 次 —— 轨迹只保留了最后一段\n")
-            append("\n${dir.absolutePath}")
+            append("\n${base.parentFile?.absolutePath ?: base.absolutePath}")
         }
         AlertDialog.Builder(this)
             .setTitle("保存这一趟？")
             .setMessage(msg)
-            .setPositiveButton("保存") { _, _ -> keepRun(dir) }
-            .setNegativeButton("不保存") { _, _ -> onDropTrajectory(dir) }
-            .setOnCancelListener { keepRun(dir) }
+            .setPositiveButton("保存") { _, _ -> keepRun(base) }
+            .setNegativeButton("不保存") { _, _ -> onDropTrajectory(base) }
+            .setOnCancelListener { keepRun(base) }
             .show()
     }
 
@@ -1528,22 +1605,22 @@ class MainActivity : AppCompatActivity() {
      * 结束时的**第一问**：地图存不存。问完（不管选了哪个）接着问轨迹。
      *
      * 排在轨迹前面是有原因的：存地图要**当场把文件名定下来**，定完之后写出来的
-     * `run.json` 才记得上它。「轨迹和地图绑定」是下一批的事，但顺序现在就得对。
+     * 轨迹 json 才记得上它。
      */
-    private fun askMapSave(runDir: File) {
+    private fun askMapSave(trajBase: File) {
         SlamBridge.nativeAtlasStats(atlasBuf)
         val dir = sessionDir
         if (dir == null || atlasBuf[1] <= 0) {
             // 这一趟没建出图 —— 没什么好问的，但也别沉默。
             saveMsg = "这一趟没有可存的地图"
-            askKeepRun(runDir)
+            askKeepRun(trajBase)
             return
         }
 
         val existing = dir.listFiles { f -> f.isFile && f.name.endsWith(".osa") }
             ?.maxByOrNull { it.lastModified() }
 
-        // 只有「另存为」用得上。不勾就只拷 trajectory.txt / run.json（几毫秒），
+        // 只有「另存为」用得上。不勾就只拷轨迹（几毫秒），
         // 勾了连录像一起拷 —— 那是原始数据，一段可能几百 MB。
         val copyRec = CheckBox(this).apply {
             text = "另存时连录像一起拷"
@@ -1593,7 +1670,7 @@ class MainActivity : AppCompatActivity() {
                 SlamBridge.nativeRequestRestoreMap()
                 uiQueueTicker()   // 恢复的进度和结果要靠 ticker 刷
             }
-            askKeepRun(runDir)
+            askKeepRun(trajBase)
         }
         dlg.show()
     }
@@ -1603,6 +1680,8 @@ class MainActivity : AppCompatActivity() {
         savedName = File(pathNoExt).name
         saveMsg = "正在保存地图…"
         Log.i(TAG, "存图 → $pathNoExt.osa")
+        // 先存归档上下文：存图完成时这一趟可能已经被下一趟顶掉了。
+        sessionDir?.let { pendingArchive = PendingArchive(it, runMapId, runMerges, curTrajBase) }
         SlamBridge.nativeRequestSaveMap(pathNoExt)
         // 刚停止，ticker 本来要停了 —— 叫起来才刷得到「已保存」。
         saving = true
@@ -1611,9 +1690,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 另存：新开一个文件夹，把这张图已有的 run 拷过去，当前这趟也算在新图里。
-     *
-     * 拷的默认只有 `trajectory.txt` / `run.json`；录像要用户自己勾（见 [askMapSave]）。
+     * 另存：新开一个文件夹，把已经归档的图目录、还没归档的松轨迹拷过去，
+     * 当前这趟也算在新图里。录像只在勾了的时候带（见 [askMapSave]）。
      */
     private fun saveMapAs(copyRecordings: Boolean) {
         val src = sessionDir ?: return
@@ -1621,29 +1699,23 @@ class MainActivity : AppCompatActivity() {
         File(src, "session.json").takeIf { it.isFile }
             ?.copyTo(File(dst, "session.json"), overwrite = true)
 
-        src.listFiles { f -> f.isDirectory && f.name.startsWith("run-") }
-            ?.forEach { copyRun(it, File(dst, it.name), copyRecordings) }
-
-        // 当前这趟：trajectory.txt 已经导过了，run.json 等会儿才写 —— 让它写进新文件夹。
-        val cur = curRunDir
-        if (cur != null && cur.parentFile == src) {
-            copyRun(cur, File(dst, cur.name), copyRecordings)
-            curRunDir = File(dst, cur.name)
+        src.listFiles { f -> f.isDirectory && f.name.startsWith("map-") }
+            ?.forEach { copyTree(it, File(dst, it.name)) }
+        TrajectoryStore.trajDir(src).takeIf { it.isDirectory }
+            ?.let { copyTree(it, TrajectoryStore.trajDir(dst)) }
+        if (copyRecordings) {
+            TrajectoryStore.recDir(src).takeIf { it.isDirectory }
+                ?.let { copyTree(it, TrajectoryStore.recDir(dst)) }
         }
 
-        sessionDir = dst   // 之后这一趟的 run 都算这张新图的
+        // 本趟的松文件也换位置了 —— **指针必须跟着改**，否则存图成功后会去旧目录搬。
+        curTrajBase?.let { base ->
+            curTrajBase = File(TrajectoryStore.trajDir(dst), base.name)
+        }
+
+        sessionDir = dst   // 之后这一趟的东西都算这张新图的
         Log.i(TAG, "另存为新图：${dst.absolutePath}")
         startMapSave(File(dst, dst.name).absolutePath)
-    }
-
-    /** 拷一个 run 目录里**属于轨迹**的东西；录像另说。 */
-    private fun copyRun(src: File, dst: File, copyRecordings: Boolean) {
-        dst.mkdirs()
-        for (n in listOf("trajectory.txt", "run.json")) {
-            File(src, n).takeIf { it.isFile }?.copyTo(File(dst, n), overwrite = true)
-        }
-        if (!copyRecordings) return
-        src.listFiles { f -> f.isDirectory }?.forEach { copyTree(it, File(dst, it.name)) }
     }
 
     private fun copyTree(src: File, dst: File) {
@@ -1654,10 +1726,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun keepRun(dir: File) {
-        writeRunMeta(dir)
-        lastRunDir = dir
-        Log.i(TAG, "保留这一趟：${dir.absolutePath}")
+    private fun keepRun(base: File) {
+        lastRunDir = base.parentFile
+        Log.i(TAG, "保留这一趟：${base.absolutePath}")
         render()
     }
 
@@ -1665,76 +1736,188 @@ class MainActivity : AppCompatActivity() {
      * 用户不要这一趟的轨迹了。
      *
      * ⚠️ **录过会话就再问一次** —— 那段得走一趟才录得到，成本比轨迹高得多，
-     * 不该跟着轨迹一起没。没录过就直接全删。
+     * 不该跟着轨迹一起没。没录过就直接删。
      */
-    private fun onDropTrajectory(dir: File) {
-        val segs = sessionDirs(dir).size
+    private fun onDropTrajectory(base: File) {
+        val segs = sessionDirs(curRecDir).size
         if (segs == 0) {
-            discardAll(dir)
+            discardAll(base)
             return
         }
         AlertDialog.Builder(this)
             .setTitle("这一趟录了 $segs 段会话")
             .setMessage(
                 "要保留吗？\n\n" +
-                    "「保留会话」只删掉轨迹相关的（trajectory.txt + run.json）；" +
-                    "「全部删除」连会话一起删。\n\n${dir.absolutePath}"
+                    "「保留会话」只删掉本趟的轨迹和它的 json；" +
+                    "「全部删除」连录像一起删。\n\n${base.absolutePath}"
             )
-            .setPositiveButton("保留会话") { _, _ -> dropTrajectoryOnly(dir) }
-            .setNegativeButton("全部删除") { _, _ -> discardAll(dir) }
-            .setOnCancelListener { dropTrajectoryOnly(dir) }
+            .setPositiveButton("保留会话") { _, _ -> dropTrajectoryOnly(base) }
+            .setNegativeButton("全部删除") { _, _ -> discardAll(base) }
+            .setOnCancelListener { dropTrajectoryOnly(base) }
             .show()
     }
 
-    /** 只删轨迹相关的（`trajectory.txt` + `run.json`），留下会话段目录。 */
-    private fun dropTrajectoryOnly(dir: File) {
-        File(dir, "trajectory.txt").delete()
-        File(dir, "run.json").delete()
-        lastRunDir = dir
-        Log.i(TAG, "丢掉轨迹、保留会话：${dir.absolutePath}")
-        render()
+    /**
+     * 本趟轨迹现在在哪 —— 可能还在 `traj/`，也可能已经被存图成功归档进 `map-<id>/`。
+     *
+     * ⚠️ 存图可能在「留不留轨迹」那个弹窗回答之前就完成 ⟹ 不查这里的话，
+     * 「不保存」会删一个不存在的路径，文件反而留在图目录里。
+     */
+    private fun runTrajFile(base: File, ext: String): File {
+        val direct = File("${base}$ext")
+        if (direct.isFile) return direct
+        val session = sessionDir
+        if (session != null && runMapId >= 0) {
+            val archived = File(TrajectoryStore.mapDir(session, runMapId), base.name + ext)
+            if (archived.isFile) return archived
+        }
+        return direct
     }
 
-    private fun discardAll(dir: File) {
-        Log.i(TAG, "丢弃这一趟：${dir.absolutePath} ${dir.deleteRecursively()}")
-        lastRunDir = null
-        // 整个会话都丢空了就把会话目录也删掉，免得留一地空文件夹。
-        sessionDir?.let { s ->
-            val rest = s.listFiles { f -> f.isDirectory && f.name.startsWith("run-") }
-            if (rest.isNullOrEmpty()) {
-                Log.i(TAG, "会话目录已空，一并删掉：${s.absolutePath} ${s.deleteRecursively()}")
-                sessionDir = null
-            }
-        }
+    /** 只删本趟的轨迹和 json，留下录像。 */
+    private fun dropTrajectoryOnly(base: File) {
+        runTrajFile(base, ".txt").delete()
+        runTrajFile(base, ".json").delete()
+        lastRunDir = curRecDir
+        Log.i(TAG, "丢掉轨迹、保留会话：${base.absolutePath}")
         render()
     }
 
     /**
-     * `run-N/run.json`：这一趟的元信息。
-     * 轨迹只含跟踪 OK 的帧；地图每次重置后轨迹清空重来，所以只有最后一段。
+     * 整趟不要了：轨迹 + 录像都删。
+     *
+     * ⚠️ **不能删会话目录** —— `map-<id>/` 里是别的趟的轨迹，`rec/` 里也可能是别的趟的录像。
      */
-    private fun writeRunMeta(dir: File) {
+    private fun discardAll(base: File) {
+        Log.i(TAG, "丢弃这一趟：${base.absolutePath}")
+        runTrajFile(base, ".txt").delete()
+        runTrajFile(base, ".json").delete()
+        curRecDir?.deleteRecursively()
+        curRecDir = null
+        lastRunDir = null
+        render()
+    }
+
+    /**
+     * `traj-<stamp>.json`：这一趟的元信息。
+     * 轨迹只含跟踪 OK 的帧；地图每次重置后轨迹清空重来，所以只有最后一段。
+     *
+     * `merges` 记的是**坐标系怎么来的**：重组只在存图成功那一刻做一次，之后被吸收的
+     * 目录就删了，链从磁盘上再也看不出来。
+     */
+    private fun writeRunMeta(base: File) {
         try {
-            File(dir, "run.json").writeText(
+            File("${base}.json").writeText(
                 """
                 {
                   "created": "${nowStamp()}",
                   "map_source": "${jsonEsc(mapSourceLabel())}",
-                  "sessions": ${sessionDirs(dir).size},
+                  "sessions": ${sessionDirs(curRecDir).size},
                   "traj_points": ${SlamBridge.nativeTrajSize()},
-                  "map_resets": ${SlamBridge.nativeResetCount()}
+                  "map_resets": ${SlamBridge.nativeResetCount()},
+                  "map_id": $runMapId,
+                  "merges": ${mergesJson()}
                 }
                 """.trimIndent()
             )
         } catch (e: Exception) {
-            Log.e(TAG, "写 run.json 失败", e)
+            Log.e(TAG, "写轨迹 json 失败", e)
         }
+    }
+
+    /** 合并链的 JSON：`[[survivor, absorbed, s, qx, qy, qz, qw, tx, ty, tz], …]`。 */
+    private fun mergesJson(): String =
+        runMerges.joinToString(", ", "[", "]") { r ->
+            "[" + r[0].toLong() + ", " + r[1].toLong() + ", " +
+                (2..9).joinToString(", ") { i -> r[i].toString() } + "]"
+        }
+
+    /**
+     * 存图成功之后把本趟轨迹归档进 `map-<id>/`，并按合并链把磁盘上的坐标系统一。
+     *
+     * ⚠️ **只在「保存中 → 完成」那一拍调一次**（见 [render]）—— `saveState` 是粘性的。
+     * ⚠️ 按链**逐条**做：每一步「幸存目录里现有的东西」正好在当时的坐标系里 ——
+     *    先变换、再把被吸收目录原样搬进来。两条合并记录不能拆成「先全变换再全搬」。
+     */
+    private fun applyPendingSave() {
+        val p = pendingArchive ?: return
+        pendingArchive = null
+        val session = p.session
+        val id = p.mapId
+
+        for (r in p.merges) {
+            val survivor = r[0].toLong()
+            val absorbed = r[1].toLong()
+            val dir = TrajectoryStore.mapDir(session, survivor)
+
+            // ① 存量轨迹按 `T_on` 变换。先全部写 `.tmp`，都成功了再统一换名。
+            if (dir.isDirectory) {
+                val files = dir.listFiles { f ->
+                    f.isFile && f.name.startsWith("traj-") && f.name.endsWith(".txt")
+                }.orEmpty()
+                for (f in files) {
+                    if (!SlamBridge.nativeTransformTrajFile(
+                            f.absolutePath, "${f.absolutePath}.tmp",
+                            r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+                        )
+                    ) {
+                        Log.e(TAG, "轨迹变换失败，重排中止：${f.absolutePath}")
+                        dir.listFiles { g -> g.name.endsWith(".txt.tmp") }?.forEach { it.delete() }
+                        return
+                    }
+                }
+                for (g in dir.listFiles { f -> f.name.endsWith(".txt.tmp") }.orEmpty()) {
+                    val target = File(g.absolutePath.removeSuffix(".tmp"))
+                    if (!g.renameTo(target)) {
+                        Log.e(TAG, "轨迹换名失败，重排中止：${g.absolutePath}")
+                        return
+                    }
+                }
+            }
+
+            // ② 被吸收目录：**原样**搬进来（它本来就在最终坐标系里），空了才删。
+            val src = TrajectoryStore.mapDir(session, absorbed)
+            if (!src.isDirectory) continue
+            val dst = dir.apply { mkdirs() }
+            for (f in src.listFiles().orEmpty()) {
+                if (!moveInto(f, dst)) {
+                    Log.e(TAG, "合并目录中止：${src.absolutePath}")
+                    return
+                }
+            }
+            if (src.listFiles().isNullOrEmpty()) src.delete()
+        }
+
+        // ③ 本趟的松轨迹：已经在最终坐标系里，直接搬，**不参与任何变换**。
+        if (id < 0) return   // 没有图：松文件留在 traj/
+        val base = p.base ?: return
+        val dst = TrajectoryStore.mapDir(session, id).apply { mkdirs() }
+        moveInto(File("${base}.txt"), dst)
+        moveInto(File("${base}.json"), dst)
+        lastRunDir = dst
+    }
+
+    /** 把 [f] 搬进 [dst]；重名时加 `-2`。失败返回 false（调用方**不能**因此删源目录）。 */
+    private fun moveInto(f: File, dst: File): Boolean {
+        if (!f.isFile) return true
+        val dot = f.name.lastIndexOf('.')
+        val stem = if (dot > 0) f.name.substring(0, dot) else f.name
+        val ext = if (dot > 0) f.name.substring(dot) else ""
+        var target = File(dst, f.name)
+        var n = 2
+        while (target.exists()) {
+            target = File(dst, "$stem-$n$ext")
+            n++
+        }
+        val ok = f.renameTo(target)
+        if (!ok) Log.e(TAG, "搬文件失败：${f.absolutePath} → ${target.absolutePath}")
+        return ok
     }
 
     /**
      * `<会话>/session.json`：整个会话的汇总。建目录时写一次，之后不动。
      *
-     * ⚠️ 名字故意不叫 `run.json` —— 免得和 `run-N/run.json` 混淆（一个是会话级、一个是趟级）。
+     * ⚠️ 名字故意不叫 `traj-*.json` —— 免得和趟级那份混淆（一个是会话级、一个是趟级）。
      */
     private fun writeSessionMeta(session: File) {
         try {
@@ -1743,7 +1926,7 @@ class MainActivity : AppCompatActivity() {
                 {
                   "created": "${nowStamp()}",
                   "map_source": "${jsonEsc(mapSourceLabel())}",
-                  "note": "一次「新建地图/打开地图」= 这个目录；每次「启动 SLAM→结束」是它下面的 run-N/。"
+                  "note": "一次「新建地图/打开地图」= 这个目录。轨迹按图分在 map-<id>/，未归档的在 traj/，录像在 rec/。"
                 }
                 """.trimIndent()
             )
