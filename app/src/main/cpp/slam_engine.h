@@ -252,6 +252,25 @@ long long lastTrajMapId();
 int lastMerges(float* out, int cap);
 
 /**
+ * 界面显示用的「文件夹 id → 当前坐标系」变换（**主线程调**）。
+ *
+ * 每条 9 个 float：`id s qx qy qz qw tx ty tz`，**第一条固定是 displayMapId**。
+ * 没有图时返回 0。id 和变换一次给完 —— 分两次问的话中间夹一次合并会对不上。
+ */
+int displayTransforms(float* out, int cap);
+
+/**
+ * 读一个已归档的轨迹文件、变换到显示坐标系（**主线程调**）。
+ *
+ * 每行 `time tx ty tz qx qy qz qw`（`Twc`）；只取位置：
+ * `tw' = s·(q_on·tw) + t_on`。**stride 抽稀**到 `cap/3` 点，写 `3n` 个 xyz。
+ */
+int readTrajFile(const std::string& path,
+                 float s, float qx, float qy, float qz, float qw,
+                 float tx, float ty, float tz,
+                 float* out, int cap);
+
+/**
  * 把一个轨迹文件按合并变换写到 `dst`（**主线程调**）。成功返回 true。
  *
  * `T_on` 的 `p' = s·R·p + t` 作用在 `Twc` 上 ⟹ `q' = q_on⊗q`、`t' = s·R_on·t + t_on`。

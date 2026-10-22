@@ -98,6 +98,11 @@
 
 **App 未验证**（还没编译 / 装机 —— 编译由用户跑 `./gradlew :app:assembleDebug`）。
 
+> **2026-10-22 补记（后续提交的真机日志）**：同一会话三趟、两次合并、每趟都存图，
+> 最终只剩 `map-2/`，里面 `traj-131113` / `131211` / `131313` 三份，`traj/` 为空 ——
+> 多跳重组对上了。日志见
+> [2026-10-21-atlas-stale-backup-maps.md](2026-10-21-atlas-stale-backup-maps.md#验证)。
+
 > 第一次装机验证跑到了存图那一步就崩了 —— **不是本功能的问题**，是上游的初始
 > KF 悬空指针（见 [2026-10-21-presave-crash-dangling-kf.md](2026-10-21-presave-crash-dangling-kf.md)）。
 > 修完之后这一份的验证表要重跑一遍。

@@ -813,6 +813,29 @@ int System::GetMergeRecords(float* out, int cap)
     return mpAtlas->GetMergeRecords(out, cap);
 }
 
+int System::DropMergeRecords(int n)
+{
+    return mpAtlas == nullptr ? 0 : mpAtlas->DropMergeRecords(n);
+}
+
+long long System::GetDisplayMapId()
+{
+    const long long id = GetTrajectoryMapId();
+    if (id >= 0 || mpAtlas == nullptr)
+        return id;
+    return mpAtlas->GetBestMapId();
+}
+
+int System::GetDisplayTransforms(float* out, int cap)
+{
+    if (mpAtlas == nullptr)
+        return 0;
+    const long long id = GetDisplayMapId();
+    if (id < 0)
+        return 0;
+    return mpAtlas->GetDisplayTransforms(id, out, cap);
+}
+
 void System::ClearFrameTrajectory()
 {
     if (mpTracker != nullptr)
@@ -2119,6 +2142,13 @@ bool System::LoadAtlas(int type)
 
     if(isRead)
     {
+        // 引用对不上就到此为止：`PostLoad()` 会往连接表里塞 nullptr，下一句就崩。
+        if(!mpAtlas->CheckBackupConsistency())
+        {
+            cout << "载图失败：文件内部引用不一致（旧版本在同一个进程里连续存图留下的）" << endl;
+            return false;
+        }
+
         //Check if the vocabulary is the same
         string strInputVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
 
@@ -2188,6 +2218,14 @@ bool System::LoadAtlasInto(const std::string& path, int type)
 
     if(!isRead || pLoaded == nullptr)
     {
+        delete pLoaded;
+        return false;
+    }
+
+    // 引用对不上就到此为止（和构造时那条路一样）。
+    if(!pLoaded->CheckBackupConsistency())
+    {
+        cout << "载图失败：文件内部引用不一致（旧版本在同一个进程里连续存图留下的）" << endl;
         delete pLoaded;
         return false;
     }

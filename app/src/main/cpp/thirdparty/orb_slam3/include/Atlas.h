@@ -131,6 +131,13 @@ public:
     void PreSave();
     void PostLoad();
 
+    /**
+     * add：反序列化之后、`PostLoad()` 之前自检 —— 每张图的备份引用是不是都落在
+     * **同一张图**里。不一致的文件 `PostLoad()` 会往容器里塞 nullptr（旧的文件可能
+     * 有这种，见 `Atlas::PreSave` 的注释），所以宁可当场判载入失败，也别让它崩。
+     */
+    bool CheckBackupConsistency();
+
     // add:把另一个 Atlas 反序列化出来的内容搬进来。
     // Tracking / LocalMapping / LoopClosing 都攥着 `System::mpAtlas` —— 换指针就得让它们
     // 全部改指向，所以载进现有的对象、只搬内容。搬完 `p` 只剩空壳，可以 delete。
@@ -140,6 +147,9 @@ public:
     //
     // 合并只改**坐标系**、不改图的身份：活着的是当前图，被吸收的图 0 关键帧、
     // 存盘时会被 `PreSave()` 剔掉。磁盘上的轨迹要跟着坐标系走，所以得把变换记下来。
+    //
+    // 链里留的是**还没写到磁盘上的**合并：存图成功后由 `System::DropMergeRecords()`
+    // 丢掉已经随 `.osa` 落盘的那几条。`PostLoad()` / `ReloadAtlasFrom()` 整条清空。
 
     /** 一次合并。`T_on` 把幸存图**合并前**的坐标搬到吸收图的坐标里（`p' = s·R·p + t`）。 */
     struct MapMergeRecord
@@ -160,7 +170,23 @@ public:
      */
     int GetMergeRecords(float* out, int cap);
 
+    /** 丢掉链里最前面的 n 条（已经随 `.osa` 落盘的）。返回实际丢了几条。 */
+    int DropMergeRecords(int n);
+
     void ClearMergeRecords();
+
+    /** 图集里 id 最大且有关键帧的那张图（0 关键帧的不算）；一张都没有返回 -1。 */
+    long long GetBestMapId();
+
+    /**
+     * `displayId` **那个合并族里**每个文件夹 id 到它此刻所在坐标系的变换，每条 9 个
+     * float：`id, s, qx, qy, qz, qw, tx, ty, tz`（`p' = s·R·p + t`）。
+     *
+     * `displayId` 那条**固定排第一**；没有合并时它就是单位变换。被吸收的图原样，
+     * 幸存图那一族再乘 `T_on` —— 多跳按链的顺序逐条累积。别的族（换过 current map
+     * 之前留下的合并）不输出。装不下就少给。
+     */
+    int GetDisplayTransforms(long long displayId, float* out, int cap);
 
     map<long unsigned int, KeyFrame*> GetAtlasKeyframes();
 

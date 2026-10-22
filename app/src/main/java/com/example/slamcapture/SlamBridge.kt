@@ -227,4 +227,21 @@ object SlamBridge {
     external fun nativeTransformTrajFile(src: String, dst: String,
                                          s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
                                          tx: Float, ty: Float, tz: Float): Boolean
+
+    /**
+     * 小地图显示历史轨迹用的坐标系信息：每条 9 个 float
+     * `id, s, qx, qy, qz, qw, tx, ty, tz`。**第一条的 id 就是显示用的图**（没有图时返回 0）。
+     *
+     * 被吸收的图原样（变换是单位），幸存图那一族带合并的 `T_on`；多跳已经合成。
+     * `out` 要 ≥ `9 × 期望条数`。
+     */
+    external fun nativeDisplayTransforms(out: FloatArray): Int
+
+    /**
+     * 读一个已归档的轨迹文件、按上面那个变换换算，`out` 收 `3n` 个 float（world xyz）。
+     * 返回点数；**stride 抽稀**到 `out.size / 3`，不是截断。
+     */
+    external fun nativeReadTrajFile(path: String,
+                                    s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
+                                    tx: Float, ty: Float, tz: Float, out: FloatArray): Int
 }

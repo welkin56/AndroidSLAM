@@ -277,6 +277,31 @@
             android:text="管理路径点"
             android:textColor="@color/measure_button_text" />
 
+        <!-- 历史轨迹：同一张图以前各趟的轨迹（`map-<id>/traj-*.txt`）。
+             开关只管画不画；管理页里能逐条隐藏 / 删除 —— 隐藏状态记在 SharedPreferences。 -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#22000000" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swHistory"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="历史轨迹"
+            android:textColor="#DE000000" />
+
+        <Button
+            android:id="@+id/btnHistoryManage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:minWidth="0dp"
+            android:text="管理历史轨迹"
+            android:textColor="@color/measure_button_text" />
+
     </LinearLayout>
 
 </androidx.drawerlayout.widget.DrawerLayout>

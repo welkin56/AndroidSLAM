@@ -844,6 +844,29 @@ void KeyFrame::UpdateMap(Map* pMap)
     mpMap = pMap;
 }
 
+bool KeyFrame::CheckBackupConsistency(const std::set<long unsigned int>& sIds)
+{
+    for (const auto& kv : mBackupConnectedKeyFrameIdWeights)
+        if (sIds.find(kv.first) == sIds.end())
+            return false;
+    for (long unsigned int id : mvBackupChildrensId)
+        if (sIds.find(id) == sIds.end())
+            return false;
+    for (long unsigned int id : mvBackupLoopEdgesId)
+        if (sIds.find(id) == sIds.end())
+            return false;
+    for (long unsigned int id : mvBackupMergeEdgesId)
+        if (sIds.find(id) == sIds.end())
+            return false;
+    if (mBackupParentId >= 0 && sIds.find((long unsigned int)mBackupParentId) == sIds.end())
+        return false;
+    if (mBackupPrevKFId >= 0 && sIds.find((long unsigned int)mBackupPrevKFId) == sIds.end())
+        return false;
+    if (mBackupNextKFId >= 0 && sIds.find((long unsigned int)mBackupNextKFId) == sIds.end())
+        return false;
+    return true;
+}
+
 void KeyFrame::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP, set<GeometricCamera*>& spCam)
 {
     // Save the id of each MapPoint in this KF, there can be null pointer in the vector
@@ -944,33 +967,45 @@ void KeyFrame::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsi
     for(map<long unsigned int, int>::const_iterator it = mBackupConnectedKeyFrameIdWeights.begin(), end = mBackupConnectedKeyFrameIdWeights.end();
         it != end; ++it)
     {
+        // 自检（`CheckBackupConsistency`）应该已经挡住了；这里只是不让坏文件把 App 带走。
         KeyFrame* pKFi = mpKFid[it->first];
-        mConnectedKeyFrameWeights[pKFi] = it->second;
+        if(pKFi)
+            mConnectedKeyFrameWeights[pKFi] = it->second;
     }
 
     // Restore parent KeyFrame
     if(mBackupParentId>=0)
-        mpParent = mpKFid[mBackupParentId];
+    {
+        KeyFrame* pKFi = mpKFid[mBackupParentId];
+        if(pKFi)
+            mpParent = pKFi;
+    }
 
     // KeyFrame childrens
     mspChildrens.clear();
     for(vector<long unsigned int>::const_iterator it = mvBackupChildrensId.begin(), end = mvBackupChildrensId.end(); it!=end; ++it)
     {
-        mspChildrens.insert(mpKFid[*it]);
+        KeyFrame* pKFi = mpKFid[*it];
+        if(pKFi)
+            mspChildrens.insert(pKFi);
     }
 
     // Loop edge KeyFrame
     mspLoopEdges.clear();
     for(vector<long unsigned int>::const_iterator it = mvBackupLoopEdgesId.begin(), end = mvBackupLoopEdgesId.end(); it != end; ++it)
     {
-        mspLoopEdges.insert(mpKFid[*it]);
+        KeyFrame* pKFi = mpKFid[*it];
+        if(pKFi)
+            mspLoopEdges.insert(pKFi);
     }
 
     // Merge edge KeyFrame
     mspMergeEdges.clear();
     for(vector<long unsigned int>::const_iterator it = mvBackupMergeEdgesId.begin(), end = mvBackupMergeEdgesId.end(); it != end; ++it)
     {
-        mspMergeEdges.insert(mpKFid[*it]);
+        KeyFrame* pKFi = mpKFid[*it];
+        if(pKFi)
+            mspMergeEdges.insert(pKFi);
     }
 
     //Camera data
@@ -990,11 +1025,15 @@ void KeyFrame::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsi
     //Inertial data
     if(mBackupPrevKFId != -1)
     {
-        mPrevKF = mpKFid[mBackupPrevKFId];
+        KeyFrame* pKFi = mpKFid[mBackupPrevKFId];
+        if(pKFi)
+            mPrevKF = pKFi;
     }
     if(mBackupNextKFId != -1)
     {
-        mNextKF = mpKFid[mBackupNextKFId];
+        KeyFrame* pKFi = mpKFid[mBackupNextKFId];
+        if(pKFi)
+            mNextKF = pKFi;
     }
     mpImuPreintegrated = &mBackupImuPreintegrated;
 

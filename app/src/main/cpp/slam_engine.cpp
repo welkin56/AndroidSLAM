@@ -173,6 +173,8 @@ struct Engine {
     bool saveRequest = false;
     std::string savePath;   // 不含 .osa
     int saveState = 0;      // 0 空闲 / 1 排队 / 2 保存中 / 3 完成 / 4 失败
+    /** 这次存图要「落盘」几条合并记录（请求那一刻的快照）。成功后丢掉它们。 */
+    int saveMergeCount = 0;
 
     /**
      * 「换成哪份 atlas」的请求。和存图同一条：主线程发，worker 空闲时做。
@@ -377,12 +379,14 @@ void maybeAddWaypoint(Engine& e, ORB_SLAM3::System* sys, bool poseOk) {
 /** 会话结束之后的一次性存图。**只在没有帧的时候调** —— 那时那张图才是静的。 */
 void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
     std::string path;
+    int mergesAtSave = 0;
     {
         std::lock_guard<std::mutex> lk(e.saveMutex);
         if (!e.saveRequest) return;
         e.saveRequest = false;
         e.saveState = 2;   // 保存中
         path = e.savePath;
+        mergesAtSave = e.saveMergeCount;
     }
 
     printf("[MAP] 开始存图 → %s.osa\n", path.c_str());
@@ -399,6 +403,8 @@ void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
         e.saveState = ok ? 3 : 4;
     }
     if (ok) {
+        // 这几条合并已经随 `.osa` 落盘了；留着的话下一次存图会再乘一遍 `T_on`。
+        sys->DropMergeRecords(mergesAtSave);
         {
             std::lock_guard<std::mutex> lk(e.restoreMutex);
             e.savedPath = path;   // 「上一次保存」= 这一份
@@ -1196,6 +1202,9 @@ void requestSaveMap(const std::string& path) {
     // 排着队或者正在存 ⟹ 丢掉这次。界面上那条路万一重复触发，也不该存两遍。
     if (e.saveState == 1 || e.saveState == 2) return;
     e.savePath = path;
+    // 存图成功后要丢掉哪几条合并：**请求这一刻**的快照。
+    // 完成时再数的话，存图期间 LoopClosing 补记的那条会被一起丢掉。
+    e.saveMergeCount = e.nLastMerges;
     e.saveRequest = true;
     e.saveState = 1;             // 排队
 }
@@ -1296,6 +1305,59 @@ int lastMerges(float* out, int cap) {
     const int n = std::min(e.nLastMerges, cap / 10);
     if (n <= 0) return 0;
     std::memcpy(out, e.lastMerges, sizeof(float) * 10 * static_cast<size_t>(n));
+    return n;
+}
+
+int displayTransforms(float* out, int cap) {
+    if (out == nullptr || cap < 9) return 0;
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys == nullptr) return 0;
+    return sys->GetDisplayTransforms(out, cap);
+}
+
+int readTrajFile(const std::string& path,
+                 float s, float qx, float qy, float qz, float qw,
+                 float tx, float ty, float tz,
+                 float* out, int cap) {
+    if (out == nullptr || cap < 3) return 0;
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        printf("[TRAJ] 显示：读不开 %s\n", path.c_str());
+        return 0;
+    }
+
+    const Eigen::Quaternionf qOn = Eigen::Quaternionf(qw, qx, qy, qz).normalized();
+    const Eigen::Vector3f tOn(tx, ty, tz);
+
+    // 文件可能是几万行；先收完再抽稀，这样 stride 覆盖全程。
+    std::vector<Eigen::Vector3f> pts;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        double ts, x, y, z, lqx, lqy, lqz, lqw;
+        if (!(ls >> ts >> x >> y >> z >> lqx >> lqy >> lqz >> lqw)) continue;
+        pts.push_back(s * (qOn * Eigen::Vector3f((float)x, (float)y, (float)z)) + tOn);
+    }
+    if (pts.empty()) return 0;
+
+    const int maxPts = cap / 3;
+    const size_t stride = std::max<size_t>(1, (pts.size() + maxPts - 1) / maxPts);
+    int n = 0;
+    for (size_t i = 0; i < pts.size() && n < maxPts; i += stride) {
+        out[3 * n] = pts[i].x();
+        out[3 * n + 1] = pts[i].y();
+        out[3 * n + 2] = pts[i].z();
+        ++n;
+    }
+    // 末点常常不在网格上；不补的话轨迹会短最后一截。
+    if (n > 0 && n < maxPts && (pts.size() - 1) % stride != 0) {
+        const Eigen::Vector3f& p = pts.back();
+        out[3 * n] = p.x();
+        out[3 * n + 1] = p.y();
+        out[3 * n + 2] = p.z();
+        ++n;
+    }
     return n;
 }
 

@@ -1839,11 +1839,6 @@ void LoopClosing::MergeLocal2()
              << "）→ 图 " << pMergeMap->GetId() << "（KF " << pMergeMap->KeyFramesInMap()
              << "），scale " << s_on << endl;
 
-        // 磁盘上的轨迹跟着坐标系走：存图成功后按这条链重组文件夹。
-        // ⚠️ 必须在 `ApplyScaledRotation` **之前** —— 后面 `numKFnew<10` 提前 return 时，
-        //    变换和 KF 的搬迁已经做过了。
-        mpAtlas->RecordMerge(pCurrentMap->GetId(), pMergeMap->GetId(), T_on, s_on);
-
         unique_lock<mutex> lock(mpAtlas->GetCurrentMap()->mMutexMapUpdate);
 
         //cout << "KFs before empty: " << mpAtlas->GetCurrentMap()->KeyFramesInMap() << endl;
@@ -1859,6 +1854,10 @@ void LoopClosing::MergeLocal2()
             bScaleVel=true;
         mpAtlas->GetCurrentMap()->ApplyScaledRotation(T_on,s_on,bScaleVel);
         mpTracker->UpdateFrameIMU(s_on,mpCurrentKF->GetImuBias(),mpTracker->GetLastKeyFrame());
+
+        // 磁盘上的轨迹跟着坐标系走：存图成功后按这条链重组文件夹。
+        // 放在变换**之后**：显示侧一看到链就会去变换文件夹，那时 map 必须已经搬完。
+        mpAtlas->RecordMerge(pCurrentMap->GetId(), pMergeMap->GetId(), T_on, s_on);
 
         std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
     }

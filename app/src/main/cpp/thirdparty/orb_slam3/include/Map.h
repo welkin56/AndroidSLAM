@@ -136,6 +136,9 @@ public:
     void PreSave(std::set<GeometricCamera*> &spCams);
     void PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc/*, map<long unsigned int, KeyFrame*>& mpKeyFrameId*/, map<unsigned int, GeometricCamera*> &mpCams);
 
+    /** add：载入前自检 —— 这张图的备份引用是不是都落在自己身上。 */
+    bool CheckBackupConsistency();
+
     void printReprojectionError(list<KeyFrame*> &lpLocalWindowKFs, KeyFrame* mpCurrentKF, string &name, string &name_folder);
 
     vector<KeyFrame*> mvpKeyFrameOrigins;

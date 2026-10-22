@@ -91,6 +91,9 @@ erase 已经把当前节点释放了，`__tree_next_iter` 从**已释放的节�
 [2026-10-21-map-folders-for-trajectory.md](2026-10-21-map-folders-for-trajectory.md#验证)）
 的 ①②⑤ 都会顺带覆盖它。
 
+> **2026-10-22 补记**：同一进程三次存图（两次合并之后覆盖）全部 `[MAP] 存图完成`，
+> 没有再出现 `MapPoint::PreSave` 的 SIGSEGV。
+
 定向复现步骤：
 
 | # | 做什么 | 期望 |

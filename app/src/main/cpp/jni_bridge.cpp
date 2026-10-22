@@ -570,3 +570,38 @@ Java_com_example_slamcapture_SlamBridge_nativeTransformTrajFile(
         return JNI_FALSE;
     }
 }
+
+// 每条 9 个 float：id s qx qy qz qw tx ty tz。第一条固定是 displayMapId。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeDisplayTransforms(JNIEnv* env, jobject /*thiz*/,
+                                                                jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::displayTransforms(o, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// out 收 3n 个 float；返回点数。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeReadTrajFile(
+    JNIEnv* env, jobject /*thiz*/, jstring path,
+    jfloat s, jfloat qx, jfloat qy, jfloat qz, jfloat qw,
+    jfloat tx, jfloat ty, jfloat tz, jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::readTrajFile(toStdString(env, path), s, qx, qy, qz, qw, tx, ty, tz,
+                                         o, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}

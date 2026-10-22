@@ -98,6 +98,15 @@ class MainActivity : AppCompatActivity() {
         /** 小地图缩放档位（`MapView.ZOOM_*` 的下标）。 */
         private const val PREF_MAP_ZOOM = "mapZoom"
         private const val PREF_WAYPOINTS = "waypoints"
+        private const val PREF_HISTORY = "historyOn"
+        /** 逐条隐藏的历史轨迹：绝对路径集合。 */
+        private const val PREF_HIST_HIDDEN = "historyHidden"
+
+        /** 历史轨迹每条最多画这么多点（文件可能几万行，stride 抽稀）。 */
+        private const val kHistoryMaxPts = 2000
+
+        /** `nativeDisplayTransforms` 的缓冲：够放一条很长的合并链。 */
+        private const val kDisplayTfMax = 32
 
         /**
          * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
@@ -358,6 +367,38 @@ class MainActivity : AppCompatActivity() {
     /** 加路径点失败时给人看的那句话。 */
     private var wpMsg: String? = null
 
+    // ---------------- 历史轨迹（小地图上的蓝色层）----------------
+
+    private lateinit var swHistory: SwitchCompat
+    private lateinit var btnHistoryManage: Button
+
+    /** `nativeDisplayTransforms` 的缓冲：每条 9 个 float（`id s qx qy qz qw tx ty tz`）。 */
+    private val histTfBuf = FloatArray(9 * kDisplayTfMax)
+
+    /** 读一条轨迹的缓冲：`3 × kHistoryMaxPts`。 */
+    private val histPtsBuf = FloatArray(3 * kHistoryMaxPts)
+
+    /** 当前显示图里存在的全部轨迹（含隐藏的）。 */
+    private var histEntries: List<TraceEntry> = emptyList()
+
+    /** 上次重建用的上下文（会话路径 + displayId + 所有变换）。没变就不碰磁盘。 */
+    private var histCtx = ""
+
+    /** 下次一定要重建：开关 / 增删 / 存图归档 / 换图。 */
+    private var histDirty = true
+
+    /** 真正画出来的条数 —— [refreshMap] 的 hint 要用。 */
+    private var histShown = 0
+
+    /** 存在的条数 —— 管理按钮的可用状态。 */
+    private var histAll = 0
+
+    /** 隐藏的轨迹（绝对路径），和 pref 里的 StringSet 同步。 */
+    private var histHidden: MutableSet<String> = mutableSetOf()
+
+    /** `map-<id>/traj-*.txt` + 那个文件夹到当前坐标系的累计变换（9 个 float）。 */
+    private class TraceEntry(val file: File, val mapId: Long, val tf: FloatArray)
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -379,6 +420,8 @@ class MainActivity : AppCompatActivity() {
         swWaypoints = findViewById(R.id.swWaypoints)
         btnWpAdd = findViewById(R.id.btnWpAdd)
         btnWpManage = findViewById(R.id.btnWpManage)
+        swHistory = findViewById(R.id.swHistory)
+        btnHistoryManage = findViewById(R.id.btnHistoryManage)
         drawer = findViewById(R.id.drawer)
         rowMeasure = findViewById(R.id.rowMeasure)
         btnAddPoint = findViewById(R.id.btnAddPoint)
@@ -486,11 +529,33 @@ class MainActivity : AppCompatActivity() {
         btnWpAdd.setOnClickListener { askAddWaypoint() }
         btnWpManage.setOnClickListener { showWaypointManager() }
 
+        // 历史轨迹：开关只管画不画；逐条隐藏 / 删除在管理页（开关关着也能管）。
+        histHidden = (pref.getStringSet(PREF_HIST_HIDDEN, emptySet()) ?: emptySet())
+            .toMutableSet()
+        swHistory.isChecked = pref.getBoolean(PREF_HISTORY, true)
+        // 这行在挂监听**之前**，不会触发 listener；而 `applyMapVisible` 已经先跑过一轮
+        // （那时开关还是默认的关）⟹ 不置脏的话第一轮会停在那结果上，历史一直不出来。
+        histDirty = true
+        swHistory.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_HISTORY, checked).apply()
+            histDirty = true
+            render()
+        }
+        btnHistoryManage.setOnClickListener { showHistoryManager() }
+
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
 
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
+        // 载入地图的话，会话目录就是 `.osa` 的父目录。**提前**定下来（原先在 startHardware
+        // 里才定）—— 这样没启动 SLAM 也能看 / 管理这张图的历史轨迹。
+        mapFile?.let { f ->
+            File(f).parentFile?.let { dir ->
+                dir.mkdirs()
+                sessionDir = dir
+            }
+        }
 
         // 读一次构造状态：可能是**上一个 Activity 实例**留下的（从入口页再进来一次）。
         // System 是进程级的，Kotlin 这边每次都要重新问，不能自己记。
@@ -638,6 +703,7 @@ class MainActivity : AppCompatActivity() {
         curRecDir = null
         runMapId = -1
         runMerges = emptyList()
+        histDirty = true   // 新一趟：显示用的图 id / 合并链都会变
         if (swRecord.isChecked) startRecording()
 
         Log.i(TAG, "SLAM 开始吃帧")
@@ -690,6 +756,8 @@ class MainActivity : AppCompatActivity() {
         preview.setActive(false)
         measureState = PreviewView.MeasureState.NO_TRACK
         // ticker 停了，小窗不会再被喂 ⟹ 在这儿补一次，**把整趟的图定格下来**（复盘好看）。
+        // 历史要先刷：hint 取决于这一拍有没有东西可画。
+        refreshHistory()
         refreshMap()
     }
 
@@ -1102,7 +1170,12 @@ class MainActivity : AppCompatActivity() {
                 val justFinished = saving
                 saveMsg = "地图已保存 → ${savedName ?: "?"}.osa"
                 saving = false
-                if (justFinished) applyPendingSave()
+                if (justFinished) {
+                    applyPendingSave()
+                    // 文件夹内容变了（归档 / 合并重组）。脏标记放调用点：
+                    // applyPendingSave 有好几条提前 return 的路径。
+                    histDirty = true
+                }
             }
             4 -> {
                 saveMsg = "地图保存失败（看 logcat 的 slam）"
@@ -1158,7 +1231,9 @@ class MainActivity : AppCompatActivity() {
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
         // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
+        // **历史先刷**：`refreshMap` 的 hint 要看这一拍有没有历史可画。
         if (!restoring) {
+            refreshHistory()
             refreshMap()
             refreshWaypoints()
         }
@@ -1318,22 +1393,27 @@ class MainActivity : AppCompatActivity() {
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
         // ⚠️ **不沉默**：空窗也要说清为什么空。**分开四态**（STAGE6 §2.7）——
         // 「加载中」和「没启动」混成一句的话，用户会去擦镜头。
-        // ⚠️ 判据是「**两样都没有**」：有点云可画时再拿提示盖上去，点云就白出来了。
+        // ⚠️ 判据是「**两样都没有**」：有点云 / 轨迹 / 历史可画时再拿提示盖上去，
+        //    那些就白出来了。停止之后也保留最后一趟 + 历史轨迹（复盘用）。
+        val anything = n > 0 || pn > 0 || histShown > 0
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
             slamState == SLAM_FAILED -> "构造失败"
-            !slamRunning -> "SLAM 未启动"
-            n == 0 && pn == 0 && trkState != TRK_OK -> "跟踪未就绪"
-            n == 0 && pn == 0 -> "等待定位…"
+            !anything && !slamRunning -> "SLAM 未启动"
+            !anything && trkState != TRK_OK -> "跟踪未就绪"
+            !anything -> "等待定位…"
             else -> null
         }
+        // 停止后不再画当前位置：`poseValid` 是最后一帧的旧值，历史轨迹的坐标系
+        // 可能已经换过（恢复 atlas）。视图中心由 MapView 冻住，不会跳。
+        val hasCur = slamRunning && poseValid
         // 朝向：相机光轴投到 XY 地面。`poseBuf` 是 **Twc**（列主序），
         // 所以**第 3 列**就是相机系 `+z`（光轴）在世界里的方向。
         // ⚠️ 只挡**除零**（真的正下方，方位角无定义）。**不挡「朝下」** ——
         //    低头测地板时那点水平分量仍然是**稳定的方位角**（晃 1° 就动 1°）。
         var dx = 0f
         var dy = 0f
-        if (poseValid) {
+        if (hasCur) {
             val fx = poseBuf[8]
             val fy = poseBuf[9]
             val len = Math.hypot(fx.toDouble(), fy.toDouble()).toFloat()
@@ -1344,11 +1424,150 @@ class MainActivity : AppCompatActivity() {
         }
         mapView.submit(MapView.Snapshot(
             trajBuf, n,
-            if (poseValid) poseBuf[12] else 0f,
-            if (poseValid) poseBuf[13] else 0f,
-            if (poseValid) poseBuf[14] else 0f,
-            poseValid, hint, dx, dy,
+            if (hasCur) poseBuf[12] else 0f,
+            if (hasCur) poseBuf[13] else 0f,
+            if (hasCur) poseBuf[14] else 0f,
+            hasCur, hint, dx, dy,
             mapPtBuf, pn))
+    }
+
+    // ---------------- 历史轨迹 ----------------
+
+    /**
+     * 读一次「当前这张图」的历史轨迹喂给小地图。
+     *
+     * 只画轨迹所属那张图的文件夹（`map-<id>/`）—— 别的图各有一个原点，叠上来必然错位。
+     * 合并还没落盘时文件夹要乘 `T_on`；`nativeDisplayTransforms` 已经按链合成好了。
+     *
+     * ⚠️ 只在上下文变了 / 置脏时列目录、读文件。ticker 是 4 Hz，每拍读盘白付不起。
+     */
+    private fun refreshHistory() {
+        if (restoring) return
+
+        val nTf = SlamBridge.nativeDisplayTransforms(histTfBuf)
+        val ctx = buildString {
+            append(sessionDir?.absolutePath).append('|').append(nTf)
+            for (i in 0 until nTf * 9) append(',').append(histTfBuf[i])
+        }
+        if (ctx == histCtx && !histDirty) return
+        histCtx = ctx
+        histDirty = false
+
+        val session = sessionDir
+        histEntries = if (nTf == 0 || session == null) emptyList() else {
+            val list = ArrayList<TraceEntry>()
+            for (i in 0 until nTf) {
+                val mapId = histTfBuf[i * 9].toLong()
+                val tf = histTfBuf.copyOfRange(i * 9, i * 9 + 9)
+                for (f in TrajectoryStore.tracesFor(session, mapId)) {
+                    list += TraceEntry(f, mapId, tf)
+                }
+            }
+            list
+        }
+        histAll = histEntries.size
+        btnHistoryManage.isEnabled = histAll > 0
+        if (histAll > 0) Log.i(TAG, "历史轨迹：图 #${histTfBuf[0].toLong()} · $histAll 条")
+
+        if (!swHistory.isChecked || mapWrap.visibility != View.VISIBLE) {
+            histShown = 0
+            mapView.clearHistory()
+            return
+        }
+
+        val traces = ArrayList<FloatArray>()
+        for (e in histEntries) {
+            if (e.file.absolutePath in histHidden) continue
+            val n = SlamBridge.nativeReadTrajFile(
+                e.file.absolutePath,
+                e.tf[1], e.tf[2], e.tf[3], e.tf[4], e.tf[5], e.tf[6], e.tf[7], e.tf[8],
+                histPtsBuf)
+            if (n > 0) traces += histPtsBuf.copyOf(n * 3)
+        }
+        // 单点的轨迹画不出来（`MapView` 要 ≥ 2 点），别让它把 hint 顶掉。
+        histShown = traces.count { it.size >= 6 }
+        mapView.setHistory(traces)
+    }
+
+    /** 管理当前图的已归档轨迹：逐条显示 / 隐藏、删除。 */
+    private fun showHistoryManager() {
+        // 重新算一次条目：用户可能刚在别处删过 / 加过。
+        histDirty = true
+        refreshHistory()
+        val entries = histEntries
+        if (entries.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("历史轨迹")
+                .setMessage(
+                    "这张图还没有已保存的轨迹。\n\n" +
+                        "轨迹在存图成功之后才会从 traj/ 归档进 map-<id>/。"
+                )
+                .setPositiveButton("好", null)
+                .show()
+            return
+        }
+
+        val labels = Array(entries.size) { i ->
+            val e = entries[i]
+            val stamp = e.file.name.removePrefix("traj-").removeSuffix(".txt")
+            val pts = readTracePoints(e.file)
+            buildString {
+                append(stamp).append(" · 图 #").append(e.mapId)
+                if (pts >= 0) append(" · ").append(pts).append(" 点")
+                if (e.file.absolutePath in histHidden) append(" · 已隐藏")
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("历史轨迹（${entries.size}）")
+            .setItems(labels) { _, which -> showTraceActions(entries[which]) }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun showTraceActions(e: TraceEntry) {
+        val hidden = e.file.absolutePath in histHidden
+        AlertDialog.Builder(this)
+            .setTitle(e.file.name)
+            .setItems(arrayOf(if (hidden) "显示" else "隐藏", "删除")) { _, pick ->
+                if (pick == 0) setTraceHidden(e.file, !hidden) else askDeleteTrace(e.file)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun setTraceHidden(f: File, hidden: Boolean) {
+        if (hidden) histHidden.add(f.absolutePath) else histHidden.remove(f.absolutePath)
+        // 不能改 `getStringSet` 返回的那个对象；存一份新的。
+        pref.edit().putStringSet(PREF_HIST_HIDDEN, histHidden.toSet()).apply()
+        histDirty = true
+        render()
+    }
+
+    private fun askDeleteTrace(f: File) {
+        AlertDialog.Builder(this)
+            .setTitle("删除这条轨迹？")
+            .setMessage(
+                "${f.name}\n\n" +
+                    "只删轨迹数据（.txt）和元信息（.json）；已保存的地图（.osa）不受影响。"
+            )
+            .setPositiveButton("删除") { _, _ ->
+                f.delete()
+                File(f.absolutePath.removeSuffix(".txt") + ".json").delete()
+                histDirty = true
+                render()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 轨迹的元信息里那个点数；没有 / 读不到返回 -1。 */
+    private fun readTracePoints(txt: File): Int = try {
+        val meta = File(txt.absolutePath.removeSuffix(".txt") + ".json")
+        if (!meta.isFile) -1
+        else Regex("\"traj_points\"\\s*:\\s*(\\d+)").find(meta.readText())
+            ?.groupValues?.get(1)?.toInt() ?: -1
+    } catch (e: Exception) {
+        -1
     }
 
     // ---------------- 小地图的开关和切片厚度 ----------------
@@ -1370,6 +1589,9 @@ class MainActivity : AppCompatActivity() {
         sbMapRange.alpha = if (on) 1f else 0.4f
         tvMapRange.alpha = if (on) 1f else 0.4f
         SlamBridge.nativeSetMapCloudEnabled(on)
+        // 藏起来时 `refreshHistory` 会清掉历史层；重新打开要重读一遍。
+        histDirty = true
+        refreshHistory()
         refreshMap()
     }
 

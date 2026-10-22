@@ -299,6 +299,12 @@ public:
     void PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP, set<GeometricCamera*>& spCam);
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid, map<unsigned int, GeometricCamera*>& mpCamId);
 
+    /**
+     * add：载入前自检 —— 备份里的连接 / 父子 / 边有没有指向 `sIds` 之外的 id。
+     * 有的话 `PostLoad()` 会往容器里塞 nullptr，`UpdateBestCovisibles()` 当场崩。
+     */
+    bool CheckBackupConsistency(const std::set<long unsigned int>& sIds);
+
 
     void SetORBVocabulary(ORBVocabulary* pORBVoc);
     void SetKeyFrameDatabase(KeyFrameDatabase* pKFDB);

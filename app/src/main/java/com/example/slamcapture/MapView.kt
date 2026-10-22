@@ -13,7 +13,8 @@ import android.view.View
 import kotlin.math.abs
 
 /**
- * 2D 地图**画中画**：浮在预览右上角的小窗，画**地图点云的一层横切** + 走过的轨迹 + 当前位置。
+ * 2D 地图**画中画**：浮在预览右上角的小窗，画**地图点云的一层横切** + 走过的轨迹
+ * （白色是本趟、蓝色是这张图以前各趟）+ 当前位置。
  *
  * 坐标系：**世界 XY 平面俯视**（Mono-Inertial 重力对齐 ⟹ **Z 是竖直**，所以地面就是 XY）。
  * 屏幕 x 取世界 x、屏幕 y 取世界 **-y**（屏幕 y 向下）。
@@ -138,6 +139,15 @@ class MapView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
     }
 
+    /** 历史轨迹：蓝色、比实时那条细，压在白线下面。 */
+    private val histPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.4f * density
+        color = 0xCC64B5F6.toInt()
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+    }
+
     /** 当前位置：琥珀实心 + 白描边（琥珀 = 「系统标的那个点」，和十字旁边的吸附圈一个语系）。 */
     private val curFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -223,6 +233,27 @@ class MapView @JvmOverloads constructor(
     fun clearWaypoints() {
         if (wpN == 0) return
         wpN = 0
+        invalidate()
+    }
+
+    // ---------------- 历史轨迹（**独立于 Snapshot**）----------------
+    //
+    // 同一张图以前各趟的轨迹，已经从磁盘读成**当前图坐标系**里的世界坐标。
+    // 只在换了一组文件 / 变换时才调，每拍只是重画。
+
+    /** 每条 `3n` 个 float（world x y z）。调用方每次新建数组，这里直接持有。 */
+    private var hist: List<FloatArray> = emptyList()
+
+    /** 换一组历史轨迹（**主线程**）。数组归本视图所有，调用方之后别再改。 */
+    fun setHistory(traces: List<FloatArray>) {
+        hist = traces
+        invalidate()
+    }
+
+    /** 清空历史轨迹层（**主线程**）。关掉开关 / 没有可画的时用。 */
+    fun clearHistory() {
+        if (hist.isEmpty()) return
+        hist = emptyList()
         invalidate()
     }
 
@@ -324,6 +355,7 @@ class MapView @JvmOverloads constructor(
         }
 
         drawCloud(canvas, s)
+        drawHistory(canvas)
 
         // ⚠️ `Path` 是**累积**的 —— 不 reset 的话每一帧都往里再加一条折线，
         //    画面上会越描越粗、而且旧轨迹永远擦不掉。
@@ -360,6 +392,26 @@ class MapView @JvmOverloads constructor(
             canvas.drawCircle(pt.x, pt.y, 4f * density, curFill)
             canvas.drawCircle(pt.x, pt.y, 4f * density, curEdge)
         }
+    }
+
+    /**
+     * 历史轨迹：所有条共用一个 `Path`（每条一个子路径），一次画完。
+     * 和实时轨迹一样只取 XY —— 小窗是**世界俯视**。
+     */
+    private fun drawHistory(canvas: Canvas) {
+        if (hist.isEmpty()) return
+        path.reset()
+        var any = false
+        for (t in hist) {
+            val n = t.size / 3
+            if (n < 2) continue
+            for (i in 0 until n) {
+                worldToView(t[i * 3], t[i * 3 + 1], pt)
+                if (i == 0) path.moveTo(pt.x, pt.y) else path.lineTo(pt.x, pt.y)
+            }
+            any = true
+        }
+        if (any) canvas.drawPath(path, histPaint)
     }
 
     /**
