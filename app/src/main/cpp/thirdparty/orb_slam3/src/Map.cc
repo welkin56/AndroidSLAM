@@ -397,14 +397,22 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
         }
     }
 
+    // ⚠️ 过滤集只放**真的会写进文件**的 KF（`mvpBackupKeyFrames` 跳过 isBad 的）。
+    //    直接用 `mspKeyFrames` 的话，万一里面还留着一个坏帧，保存下来的连接 id
+    //    就指向一个不存在的帧 —— 载入时 `PostLoad` 往连接表里塞 nullptr，下一句就崩。
+    std::set<KeyFrame*> spKFs;
+    for(KeyFrame* pKFi : mspKeyFrames)
+        if(pKFi && !pKFi->isBad())
+            spKFs.insert(pKFi);
+
     // Saves the id of KF origins
     mvBackupKeyFrameOriginsId.clear();
     mvBackupKeyFrameOriginsId.reserve(mvpKeyFrameOrigins.size());
     for(int i = 0, numEl = mvpKeyFrameOrigins.size(); i < numEl; ++i)
     {
-        mvBackupKeyFrameOriginsId.push_back(mvpKeyFrameOrigins[i]->mnId);
+        if(mvpKeyFrameOrigins[i] && spKFs.count(mvpKeyFrameOrigins[i]))
+            mvBackupKeyFrameOriginsId.push_back(mvpKeyFrameOrigins[i]->mnId);
     }
-
 
     // Backup of MapPoints
     mvpBackupMapPoints.clear();
@@ -414,7 +422,7 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
             continue;
 
         mvpBackupMapPoints.push_back(pMPi);
-        pMPi->PreSave(mspKeyFrames,mspMapPoints);
+        pMPi->PreSave(spKFs,mspMapPoints);
     }
 
     // Backup of KeyFrames
@@ -425,21 +433,49 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
             continue;
 
         mvpBackupKeyFrames.push_back(pKFi);
-        pKFi->PreSave(mspKeyFrames,mspMapPoints, spCams);
+        pKFi->PreSave(spKFs,mspMapPoints, spCams);
     }
 
     mnBackupKFinitialID = -1;
-    if(mpKFinitial)
+    if(mpKFinitial && spKFs.count(mpKFinitial))
     {
         mnBackupKFinitialID = mpKFinitial->mnId;
     }
 
     mnBackupKFlowerID = -1;
-    if(mpKFlowerID)
+    if(mpKFlowerID && spKFs.count(mpKFlowerID))
     {
         mnBackupKFlowerID = mpKFlowerID->mnId;
     }
 
+}
+
+bool Map::CheckBackupConsistency()
+{
+    std::set<long unsigned int> sIds;
+    for (KeyFrame* pKF : mvpBackupKeyFrames)
+        if (pKF)
+            sIds.insert(pKF->mnId);
+
+    for (MapPoint* pMP : mvpBackupMapPoints)
+    {
+        if (!pMP)
+            continue;
+        const long unsigned int id = pMP->GetBackupRefKFId();
+        // `-1` = 存的时候就没有参考帧（`PostLoad` 会退到第一个观测帧）。
+        if (id != static_cast<long unsigned int>(-1) && sIds.find(id) == sIds.end())
+            return false;
+    }
+
+    for (KeyFrame* pKF : mvpBackupKeyFrames)
+        if (pKF && !pKF->CheckBackupConsistency(sIds))
+            return false;
+
+    for (long unsigned int id : mvBackupKeyFrameOriginsId)
+        if (sIds.find(id) == sIds.end())
+            return false;
+
+    return true;
 }
 
 void Map::PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc/*, map<long unsigned int, KeyFrame*>& mpKeyFrameId*/, map<unsigned int, GeometricCamera*> &mpCams)

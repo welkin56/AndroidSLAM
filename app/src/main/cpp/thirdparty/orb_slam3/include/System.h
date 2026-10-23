@@ -182,6 +182,35 @@ public:
     /** 上游那份轨迹表里有多少帧（含跟丢的）。给状态栏的计数用 —— 不抽稀。 */
     int GetFrameTrajectorySize();
 
+    /**
+     * add：这一趟**最后一段**轨迹属于哪张图（没有 → -1）。
+     *
+     * ⚠️ 判据必须和 `GetFrameTrajectory()` 完全一致（最后那个非空 reference 属于哪张图），
+     * 否则导出的轨迹和它落进的文件夹会对不上。
+     */
+    long long GetTrajectoryMapId();
+
+    /**
+     * add：本进程的合并链，每条 10 个 float
+     * `survivor absorbed s qx qy qz qw tx ty tz`，按发生顺序。**装不下就少给。**
+     */
+    int GetMergeRecords(float* out, int cap);
+
+    /** add：丢掉链里最前面的 n 条（已经随 `.osa` 落盘的）。返回实际丢了几条。 */
+    int DropMergeRecords(int n);
+
+    /**
+     * add：界面显示用的图 id —— 当前轨迹所属的图；没有轨迹（刚载入 / Reset 之后）
+     * 就取图集里 id 最大且有关键帧的那张。没有 → -1。
+     */
+    long long GetDisplayMapId();
+
+    /**
+     * add：`GetDisplayMapId()` 那张图所在坐标系里，每个文件夹 id 的累计变换。
+     * 每条 9 个：`id s qx qy qz qw tx ty tz`，**第一条固定是 displayMapId**。
+     */
+    int GetDisplayTransforms(float* out, int cap);
+
     // ---------------- add：路径点 ----------------
     //
     // 「记一个路径点」= 记下**此刻的相机位姿 + 一个名字**。它和轨迹用同一套存法：

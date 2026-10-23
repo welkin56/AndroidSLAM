@@ -208,4 +208,40 @@ object SlamBridge {
      * 名字元素可为 null（JNI 侧本来就只认 `jobjectArray`，可空性签名不参与链接）。
      */
     external fun nativeGetWaypoints(pos: FloatArray, meta: LongArray, names: Array<String?>): Int
+
+    // —— 轨迹归属 / 合并链 ——
+
+    /**
+     * 本趟最后一段轨迹属于哪张图（-1 = 没有）。
+     * **`nativeStop()` 之后立刻读** —— 快照就在 `slam::stop()` 里做的。
+     */
+    external fun nativeLastTrajMapId(): Long
+
+    /** 本趟的合并链：每条 10 个 float `survivor absorbed s qx qy qz qw tx ty tz`。 */
+    external fun nativeLastMerges(out: FloatArray): Int
+
+    /**
+     * 把一个轨迹文件按合并变换写到 [dst]。8 列：`time tx ty tz qx qy qz qw`（Twc）。
+     * 写的是**副本** —— 调用方负责「全部写完再统一 rename」。
+     */
+    external fun nativeTransformTrajFile(src: String, dst: String,
+                                         s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
+                                         tx: Float, ty: Float, tz: Float): Boolean
+
+    /**
+     * 小地图显示历史轨迹用的坐标系信息：每条 9 个 float
+     * `id, s, qx, qy, qz, qw, tx, ty, tz`。**第一条的 id 就是显示用的图**（没有图时返回 0）。
+     *
+     * 被吸收的图原样（变换是单位），幸存图那一族带合并的 `T_on`；多跳已经合成。
+     * `out` 要 ≥ `9 × 期望条数`。
+     */
+    external fun nativeDisplayTransforms(out: FloatArray): Int
+
+    /**
+     * 读一个已归档的轨迹文件、按上面那个变换换算，`out` 收 `3n` 个 float（world xyz）。
+     * 返回点数；**stride 抽稀**到 `out.size / 3`，不是截断。
+     */
+    external fun nativeReadTrajFile(path: String,
+                                    s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
+                                    tx: Float, ty: Float, tz: Float, out: FloatArray): Int
 }

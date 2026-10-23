@@ -1855,6 +1855,10 @@ void LoopClosing::MergeLocal2()
         mpAtlas->GetCurrentMap()->ApplyScaledRotation(T_on,s_on,bScaleVel);
         mpTracker->UpdateFrameIMU(s_on,mpCurrentKF->GetImuBias(),mpTracker->GetLastKeyFrame());
 
+        // 磁盘上的轨迹跟着坐标系走：存图成功后按这条链重组文件夹。
+        // 放在变换**之后**：显示侧一看到链就会去变换文件夹，那时 map 必须已经搬完。
+        mpAtlas->RecordMerge(pCurrentMap->GetId(), pMergeMap->GetId(), T_on, s_on);
+
         std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
     }
 

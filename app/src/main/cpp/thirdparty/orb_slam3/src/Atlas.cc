@@ -19,6 +19,8 @@
 #include "Atlas.h"
 #include "Viewer.h"
 
+#include <algorithm> // std::min（GetMergeRecords）
+#include <map>       // 文件夹 id → 累计变换（GetDisplayTransforms）
 #include <utility>   // std::move（AdoptFrom）
 
 #include "GeometricCamera.h"
@@ -321,11 +323,17 @@ void Atlas::PreSave()
             return elem1->GetId() < elem2->GetId();
         }
     };
-    std::copy(mspMaps.begin(), mspMaps.end(), std::back_inserter(mvpBackupMaps));
-    sort(mvpBackupMaps.begin(), mvpBackupMaps.end(), compFunctor());
+
+    // ⚠️ 先清空再重建。同一进程里连续存图（跑一趟→存→再跑→存）时，这里会留着
+    //    上一次的列表：被合并掉的图还挂着**上一次**的备份数组，而里面的 KF/MP
+    //    早已搬到别的图去了 —— 写出去的文件自相矛盾，载入时 `PostLoad` 找不到 id。
+    //    空图 / 坏图也一并挡在列表外（它们没有意义，还可能是上面那种旧数组）。
+    mvpBackupMaps.clear();
+    vector<Map*> vMaps(mspMaps.begin(), mspMaps.end());
+    sort(vMaps.begin(), vMaps.end(), compFunctor());
 
     std::set<GeometricCamera*> spCams(mvpCameras.begin(), mvpCameras.end());
-    for(Map* pMi : mvpBackupMaps)
+    for(Map* pMi : vMaps)
     {
         if(!pMi || pMi->IsBad())
             continue;
@@ -335,9 +343,18 @@ void Atlas::PreSave()
             SetMapBad(pMi);
             continue;
         }
+        mvpBackupMaps.push_back(pMi);
         pMi->PreSave(spCams);
     }
     RemoveBadMaps();
+}
+
+bool Atlas::CheckBackupConsistency()
+{
+    for (Map* pMap : mvpBackupMaps)
+        if (pMap && !pMap->CheckBackupConsistency())
+            return false;
+    return true;
 }
 
 void Atlas::PostLoad()
@@ -358,6 +375,9 @@ void Atlas::PostLoad()
         numMP += pMi->GetAllMapPoints().size();
     }
     mvpBackupMaps.clear();
+
+    // 链属于**被换掉的**那个 atlas：读进来的图各自是独立坐标系，旧链一条都不能留。
+    ClearMergeRecords();
 }
 
 void Atlas::AdoptFrom(Atlas* p)
@@ -372,6 +392,151 @@ void Atlas::AdoptFrom(Atlas* p)
     mvpBackupMaps = std::move(p->mvpBackupMaps);
     mvpCameras = std::move(p->mvpCameras);
     mnLastInitKFidMap = p->mnLastInitKFidMap;
+}
+
+void Atlas::RecordMerge(unsigned long survivor, unsigned long absorbed,
+                        const Sophus::SE3f& T_on, float s)
+{
+    MapMergeRecord r;
+    r.survivor = survivor;
+    r.absorbed = absorbed;
+    r.s = s;
+
+    const Eigen::Quaternionf q = T_on.unit_quaternion();
+    r.q[0] = q.x(); r.q[1] = q.y(); r.q[2] = q.z(); r.q[3] = q.w();
+    const Eigen::Vector3f t = T_on.translation();
+    r.t[0] = t.x(); r.t[1] = t.y(); r.t[2] = t.z();
+
+    unique_lock<mutex> lock(mMutexMerge);
+    mvMerges.push_back(r);
+}
+
+int Atlas::GetMergeRecords(float* out, int cap)
+{
+    if (out == nullptr || cap < 10)
+        return 0;
+
+    unique_lock<mutex> lock(mMutexMerge);
+    const int n = std::min(static_cast<int>(mvMerges.size()), cap / 10);
+    for (int i = 0; i < n; ++i)
+    {
+        const MapMergeRecord& r = mvMerges[static_cast<size_t>(i)];
+        float* o = out + 10 * i;
+        // id 走 float 传：一次会话里的 map id 远小于 2^24，精度够。
+        o[0] = static_cast<float>(r.survivor);
+        o[1] = static_cast<float>(r.absorbed);
+        o[2] = r.s;
+        o[3] = r.q[0]; o[4] = r.q[1]; o[5] = r.q[2]; o[6] = r.q[3];
+        o[7] = r.t[0]; o[8] = r.t[1]; o[9] = r.t[2];
+    }
+    return n;
+}
+
+int Atlas::DropMergeRecords(int n)
+{
+    unique_lock<mutex> lock(mMutexMerge);
+    const int k = std::min(std::max(n, 0), static_cast<int>(mvMerges.size()));
+    if (k > 0)
+        mvMerges.erase(mvMerges.begin(), mvMerges.begin() + k);
+    return k;
+}
+
+void Atlas::ClearMergeRecords()
+{
+    unique_lock<mutex> lock(mMutexMerge);
+    mvMerges.clear();
+}
+
+long long Atlas::GetBestMapId()
+{
+    long long best = -1;
+    for (Map* pMap : GetAllMaps())
+    {
+        if (pMap == nullptr || pMap->KeyFramesInMap() == 0)
+            continue;
+        const long long id = static_cast<long long>(pMap->GetId());
+        if (id > best)
+            best = id;
+    }
+    return best;
+}
+
+int Atlas::GetDisplayTransforms(long long displayId, float* out, int cap)
+{
+    if (out == nullptr || cap < 9 || displayId < 0)
+        return 0;
+
+    // 只用 POD，不让 Eigen 类型进容器（对对齐有要求）。
+    struct Xform
+    {
+        float s;
+        float q[4];           // x y z w
+        float t[3];
+        unsigned long owner;  // 已经并进哪张图的那一族
+    };
+
+    unique_lock<mutex> lock(mMutexMerge);
+
+    const unsigned long display = static_cast<unsigned long>(displayId);
+    std::map<unsigned long, Xform> m;
+    auto ensure = [&m](unsigned long id) -> Xform& {
+        auto it = m.find(id);
+        if (it == m.end())
+            it = m.emplace(id, Xform{1.f, {0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}, id}).first;
+        return it->second;
+    };
+    ensure(display);
+
+    for (const MapMergeRecord& r : mvMerges)
+    {
+        ensure(r.survivor);
+        ensure(r.absorbed);
+
+        const Eigen::Quaternionf q2(r.q[3], r.q[0], r.q[1], r.q[2]);
+        const Eigen::Vector3f t2(r.t[0], r.t[1], r.t[2]);
+
+        // 幸存图那一族整体再乘一次 T_on：p' = s2·R2·(s1·R1·p + t1) + t2。
+        for (auto& kv : m)
+        {
+            if (kv.second.owner != r.survivor)
+                continue;
+            Xform& x = kv.second;
+            const Eigen::Quaternionf qx(x.q[3], x.q[0], x.q[1], x.q[2]);
+            const Eigen::Vector3f t =
+                r.s * (q2 * Eigen::Vector3f(x.t[0], x.t[1], x.t[2])) + t2;
+            const Eigen::Quaternionf q = (q2 * qx).normalized();
+            x.s = r.s * x.s;
+            x.q[0] = q.x(); x.q[1] = q.y(); x.q[2] = q.z(); x.q[3] = q.w();
+            x.t[0] = t.x(); x.t[1] = t.y(); x.t[2] = t.z();
+        }
+
+        // 被吸收图连同它已有的族并进幸存图；它自己的变换**不变**（本来就在最终系里）。
+        for (auto& kv : m)
+            if (kv.second.owner == r.absorbed)
+                kv.second.owner = r.survivor;
+        ensure(r.absorbed).owner = r.survivor;
+    }
+
+    int n = 0;
+    auto put = [&](unsigned long id, const Xform& x) -> bool {
+        if (n * 9 + 9 > cap)
+            return false;
+        float* o = out + 9 * n;
+        o[0] = static_cast<float>(id);
+        o[1] = x.s;
+        o[2] = x.q[0]; o[3] = x.q[1]; o[4] = x.q[2]; o[5] = x.q[3];
+        o[6] = x.t[0]; o[7] = x.t[1]; o[8] = x.t[2];
+        ++n;
+        return true;
+    };
+
+    put(display, m[display]);
+    // 只给 display 那一族：链里可能还留着别的图（地图被重置后换过 current map）的合并，
+    // 那些图的坐标系和 display 无关，画上去是错的。
+    for (const auto& kv : m)
+        if (kv.first != display && kv.second.owner == display && !put(kv.first, kv.second))
+            break;
+    return n;
 }
 
 void Atlas::SetKeyFrameDababase(KeyFrameDatabase* pKFDB)

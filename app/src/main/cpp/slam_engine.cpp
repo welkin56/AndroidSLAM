@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -56,6 +57,9 @@ constexpr int kTrackingOk = 2;
 
 // 测距读数做中值的窗口。锁定之后它只需要压**毫米级**的位姿噪声，小窗口滞后更小。
 constexpr size_t kMeasureRing = 3;
+
+// 一趟里最多记这么多条合并链（每条 10 个 float）。一次合并 = 多吸收一张图，够用。
+constexpr int kLastMergesMax = 16;
 
 // 连续测不到这么多帧才真的把中值窗口扔掉。
 // 一次就清的话，「有/无/有/无」的抖动会让中值反复重开 —— 等于没有平滑。
@@ -169,6 +173,8 @@ struct Engine {
     bool saveRequest = false;
     std::string savePath;   // 不含 .osa
     int saveState = 0;      // 0 空闲 / 1 排队 / 2 保存中 / 3 完成 / 4 失败
+    /** 这次存图要「落盘」几条合并记录（请求那一刻的快照）。成功后丢掉它们。 */
+    int saveMergeCount = 0;
 
     /**
      * 「换成哪份 atlas」的请求。和存图同一条：主线程发，worker 空闲时做。
@@ -213,6 +219,14 @@ struct Engine {
     std::string wpName;
     int wpState = 0;   // 0 没试过 / 1 排队 / 2 成功 / 3 失败
     std::string wpMsg;
+
+    /**
+     * 本趟轨迹的归属与合并链。**在 `stop()` 里当场快照**（`nativeStop()` 之后 worker
+     * 可能立刻换掉 atlas）。主线程写、主线程读，不用锁。
+     */
+    long long lastTrajMapId = -1;
+    float lastMerges[10 * 16];
+    int nLastMerges = 0;
 };
 
 // 故意泄漏，见文件头第 2 条。
@@ -365,12 +379,14 @@ void maybeAddWaypoint(Engine& e, ORB_SLAM3::System* sys, bool poseOk) {
 /** 会话结束之后的一次性存图。**只在没有帧的时候调** —— 那时那张图才是静的。 */
 void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
     std::string path;
+    int mergesAtSave = 0;
     {
         std::lock_guard<std::mutex> lk(e.saveMutex);
         if (!e.saveRequest) return;
         e.saveRequest = false;
         e.saveState = 2;   // 保存中
         path = e.savePath;
+        mergesAtSave = e.saveMergeCount;
     }
 
     printf("[MAP] 开始存图 → %s.osa\n", path.c_str());
@@ -387,6 +403,8 @@ void maybeSaveMap(Engine& e, ORB_SLAM3::System* sys) {
         e.saveState = ok ? 3 : 4;
     }
     if (ok) {
+        // 这几条合并已经随 `.osa` 落盘了；留着的话下一次存图会再乘一遍 `T_on`。
+        sys->DropMergeRecords(mergesAtSave);
         {
             std::lock_guard<std::mutex> lk(e.restoreMutex);
             e.savedPath = path;   // 「上一次保存」= 这一份
@@ -739,6 +757,15 @@ void start() {
 
 void stop() {
     Engine& e = engine();
+
+    // **先快照**：`running = false` 之后 worker 可能立刻消费挂着的「恢复 atlas」请求，
+    // 那会把整个 atlas 换掉 —— 事后再问「这趟轨迹属于哪张图」只会拿到空图。
+    if (ORB_SLAM3::System* sys = e.sys.load()) {
+        e.lastTrajMapId = sys->GetTrajectoryMapId();
+        // `cap` 的单位是 **float**（每条 10 个），不是条数。
+        e.nLastMerges = sys->GetMergeRecords(e.lastMerges, kLastMergesMax * 10);
+    }
+
     e.running.store(false);
     // 挂着的加路径点请求：不执行了，也别留到下一趟。
     {
@@ -1175,6 +1202,9 @@ void requestSaveMap(const std::string& path) {
     // 排着队或者正在存 ⟹ 丢掉这次。界面上那条路万一重复触发，也不该存两遍。
     if (e.saveState == 1 || e.saveState == 2) return;
     e.savePath = path;
+    // 存图成功后要丢掉哪几条合并：**请求这一刻**的快照。
+    // 完成时再数的话，存图期间 LoopClosing 补记的那条会被一起丢掉。
+    e.saveMergeCount = e.nLastMerges;
     e.saveRequest = true;
     e.saveState = 1;             // 排队
 }
@@ -1265,6 +1295,121 @@ void dumpTrajectory(const std::string& path) {
     }
     printf("[M5] 轨迹导出 %d 条 → %s\n", n, path.c_str());
     fflush(stdout);
+}
+
+long long lastTrajMapId() { return engine().lastTrajMapId; }
+
+int lastMerges(float* out, int cap) {
+    Engine& e = engine();
+    if (out == nullptr || cap < 10) return 0;
+    const int n = std::min(e.nLastMerges, cap / 10);
+    if (n <= 0) return 0;
+    std::memcpy(out, e.lastMerges, sizeof(float) * 10 * static_cast<size_t>(n));
+    return n;
+}
+
+int displayTransforms(float* out, int cap) {
+    if (out == nullptr || cap < 9) return 0;
+    ORB_SLAM3::System* sys = engine().sys.load();
+    if (sys == nullptr) return 0;
+    return sys->GetDisplayTransforms(out, cap);
+}
+
+int readTrajFile(const std::string& path,
+                 float s, float qx, float qy, float qz, float qw,
+                 float tx, float ty, float tz,
+                 float* out, int cap) {
+    if (out == nullptr || cap < 3) return 0;
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        printf("[TRAJ] 显示：读不开 %s\n", path.c_str());
+        return 0;
+    }
+
+    const Eigen::Quaternionf qOn = Eigen::Quaternionf(qw, qx, qy, qz).normalized();
+    const Eigen::Vector3f tOn(tx, ty, tz);
+
+    // 文件可能是几万行；先收完再抽稀，这样 stride 覆盖全程。
+    std::vector<Eigen::Vector3f> pts;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        double ts, x, y, z, lqx, lqy, lqz, lqw;
+        if (!(ls >> ts >> x >> y >> z >> lqx >> lqy >> lqz >> lqw)) continue;
+        pts.push_back(s * (qOn * Eigen::Vector3f((float)x, (float)y, (float)z)) + tOn);
+    }
+    if (pts.empty()) return 0;
+
+    const int maxPts = cap / 3;
+    const size_t stride = std::max<size_t>(1, (pts.size() + maxPts - 1) / maxPts);
+    int n = 0;
+    for (size_t i = 0; i < pts.size() && n < maxPts; i += stride) {
+        out[3 * n] = pts[i].x();
+        out[3 * n + 1] = pts[i].y();
+        out[3 * n + 2] = pts[i].z();
+        ++n;
+    }
+    // 末点常常不在网格上；不补的话轨迹会短最后一截。
+    if (n > 0 && n < maxPts && (pts.size() - 1) % stride != 0) {
+        const Eigen::Vector3f& p = pts.back();
+        out[3 * n] = p.x();
+        out[3 * n + 1] = p.y();
+        out[3 * n + 2] = p.z();
+        ++n;
+    }
+    return n;
+}
+
+bool transformTrajFile(const std::string& src, const std::string& dst,
+                       float s, float qx, float qy, float qz, float qw,
+                       float tx, float ty, float tz) {
+    std::ifstream in(src);
+    if (!in.is_open()) {
+        printf("[TRAJ] 变换：读不开 %s\n", src.c_str());
+        return false;
+    }
+    std::ofstream out(dst, std::ios::trunc);
+    if (!out.is_open()) {
+        printf("[TRAJ] 变换：写不开 %s\n", dst.c_str());
+        return false;
+    }
+
+    const Eigen::Quaternionf qOn = Eigen::Quaternionf(qw, qx, qy, qz).normalized();
+    const Eigen::Vector3f tOn(tx, ty, tz);
+
+    // 行为和 `dumpTrajectory` 完全一致：`time tx ty tz qx qy qz qw`，都是 **Twc**。
+    out << std::setprecision(9);
+    std::string line;
+    int bad = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        double ts, x, y, z, lqx, lqy, lqz, lqw;
+        if (!(ls >> ts >> x >> y >> z >> lqx >> lqy >> lqz >> lqw)) {
+            ++bad;
+            continue;
+        }
+        const Eigen::Quaternionf q((float)lqw, (float)lqx, (float)lqy, (float)lqz);
+        const Eigen::Vector3f tw =
+            s * (qOn * Eigen::Vector3f((float)x, (float)y, (float)z)) + tOn;
+        const Eigen::Quaternionf q2 = (qOn * q).normalized();
+        out << ts << " " << tw.x() << " " << tw.y() << " " << tw.z() << " "
+            << q2.x() << " " << q2.y() << " " << q2.z() << " " << q2.w() << "\n";
+    }
+    out.close();
+    if (!out.good()) {
+        printf("[TRAJ] 变换：写失败 %s\n", dst.c_str());
+        return false;
+    }
+    if (bad > 0) {
+        // 坏行说明文件本身不完整；**当成失败**，别让调用方拿半截结果去覆盖原件。
+        printf("[TRAJ] 变换：%s 有 %d 行解析不了\n", src.c_str(), bad);
+        return false;
+    }
+    printf("[TRAJ] 变换完成 → %s\n", dst.c_str());
+    fflush(stdout);
+    return true;
 }
 
 }  // namespace slam

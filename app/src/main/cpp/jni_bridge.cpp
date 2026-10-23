@@ -527,3 +527,81 @@ Java_com_example_slamcapture_SlamBridge_nativeGetWaypoints(JNIEnv* env, jobject 
         return 0;
     }
 }
+
+// —— 轨迹归属 / 合并链 / 轨迹变换 ——
+
+// `nativeStop()` 里做的快照。**停止之后立刻读**才有意义。
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeLastTrajMapId(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jlong>(slam::lastTrajMapId());
+    } catch (...) {
+        return -1;
+    }
+}
+
+// 每条 10 个 float：survivor absorbed s qx qy qz qw tx ty tz。返回实际写了几条。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeLastMerges(JNIEnv* env, jobject /*thiz*/,
+                                                         jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::lastMerges(o, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeTransformTrajFile(
+    JNIEnv* env, jobject /*thiz*/, jstring src, jstring dst,
+    jfloat s, jfloat qx, jfloat qy, jfloat qz, jfloat qw,
+    jfloat tx, jfloat ty, jfloat tz) {
+    try {
+        return slam::transformTrajFile(toStdString(env, src), toStdString(env, dst),
+                                       s, qx, qy, qz, qw, tx, ty, tz)
+                   ? JNI_TRUE
+                   : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+// 每条 9 个 float：id s qx qy qz qw tx ty tz。第一条固定是 displayMapId。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeDisplayTransforms(JNIEnv* env, jobject /*thiz*/,
+                                                                jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::displayTransforms(o, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// out 收 3n 个 float；返回点数。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeReadTrajFile(
+    JNIEnv* env, jobject /*thiz*/, jstring path,
+    jfloat s, jfloat qx, jfloat qy, jfloat qz, jfloat qw,
+    jfloat tx, jfloat ty, jfloat tz, jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::readTrajFile(toStdString(env, path), s, qx, qy, qz, qw, tx, ty, tz,
+                                         o, env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
