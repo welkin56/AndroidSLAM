@@ -10,7 +10,9 @@ import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -64,8 +66,10 @@ class EntryActivity : AppCompatActivity() {
     private fun refreshMapList() {
         val list = findViewById<ListView>(R.id.mapList)
         val empty = findViewById<TextView>(R.id.tvEmpty)
+        val hint = findViewById<TextView>(R.id.tvListHint)
         val maps = listMaps()
 
+        hint.visibility = if (maps.isEmpty()) View.GONE else View.VISIBLE
         if (maps.isEmpty()) {
             list.visibility = View.GONE
             empty.visibility = View.VISIBLE
@@ -85,21 +89,31 @@ class EntryActivity : AppCompatActivity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val v = convertView ?: layoutInflater.inflate(R.layout.item_map, parent, false)
             val f = items[position]
-            val dir = f.parentFile?.name ?: ""
-            val base = f.name.removeSuffix(EXT)
-            v.findViewById<TextView>(R.id.tvMapTitle).text =
-                if (base == dir) dir else "$dir / $base"
+            v.findViewById<TextView>(R.id.tvMapTitle).text = mapTitle(f)
             val when_ = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
                 .format(Date(f.lastModified()))
             val size = Formatter.formatShortFileSize(this@EntryActivity, f.length())
             v.findViewById<TextView>(R.id.tvMapSubtitle).text = "$when_ · $size"
             // 点击交给卡片：ListView 的 listSelector 是矩形，会盖住圆角。
-            v.findViewById<View>(R.id.mapCard).setOnClickListener {
-                Log.i(TAG, "选了地图：${f.absolutePath}")
-                open(f.absolutePath)
+            v.findViewById<View>(R.id.mapCard).apply {
+                setOnClickListener {
+                    Log.i(TAG, "选了地图：${f.absolutePath}")
+                    open(f.absolutePath)
+                }
+                setOnLongClickListener {
+                    askDeleteMap(f)
+                    true
+                }
             }
             return v
         }
+    }
+
+    /** 文件名与目录名重复时只显示目录名。 */
+    private fun mapTitle(f: File): String {
+        val dir = f.parentFile?.name ?: ""
+        val base = f.name.removeSuffix(EXT)
+        return if (base == dir) dir else "$dir / $base"
     }
 
     /**
@@ -116,6 +130,59 @@ class EntryActivity : AppCompatActivity() {
     }
 
     private fun mapsDir(): File = File(getExternalFilesDir(null) ?: filesDir, MAPS_DIR)
+
+    /**
+     * 删整个会话目录。一行地图背后是一个目录：地图本体、按图归档的轨迹、录像都在里面。
+     * 只删 .osa 会留下首页再也看不到的孤儿数据，所以这里连目录一起删。
+     */
+    private fun askDeleteMap(osa: File) {
+        val dir = osa.parentFile ?: return
+        val others = (dir.listFiles { f -> f.isFile && f.name.endsWith(EXT) }?.size ?: 1) - 1
+        val msg = buildString {
+            append(mapTitle(osa)).append("\n\n").append(dir.absolutePath).append("\n\n")
+            append(summarize(dir))
+            if (others > 0) append("\n\n目录里另外 $others 份地图也会一起删掉。")
+            append("\n\n删除后不可恢复。")
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("删除地图？")
+            .setMessage(msg)
+            .setPositiveButton("删除") { _, _ ->
+                Log.i(TAG, "删除地图目录：${dir.absolutePath}")
+                if (deleteRecursively(dir)) refreshMapList()
+                else Toast.makeText(this, "删除失败，详情见日志", Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 目录内容的粗统计：地图份数、轨迹条数、录像文件数与总大小。 */
+    private fun summarize(dir: File): String {
+        var osa = 0
+        var traces = 0
+        var recs = 0
+        var bytes = 0L
+        dir.walkTopDown().filter { it.isFile }.forEach { f ->
+            bytes += f.length()
+            val rel = f.relativeTo(dir).path
+            when {
+                rel.endsWith(EXT) -> osa++
+                // 归档在 map-<id>/ 的与尚未归档的 traj/ 里的都是轨迹文本。
+                rel.endsWith(".txt") && (rel.startsWith("traj/") || rel.startsWith("map-")) -> traces++
+                rel.startsWith("rec/") -> recs++
+            }
+        }
+        val parts = mutableListOf("$osa 份地图")
+        if (traces > 0) parts += "$traces 条轨迹"
+        if (recs > 0) parts += "$recs 个录像文件"
+        parts += Formatter.formatShortFileSize(this, bytes)
+        return parts.joinToString(" · ")
+    }
+
+    private fun deleteRecursively(f: File): Boolean {
+        if (f.isDirectory) f.listFiles()?.forEach { deleteRecursively(it) }
+        return f.delete()
+    }
 
     /**
      * @param mapFile 已保存地图的绝对路径；null 表示新建地图。

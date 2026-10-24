@@ -47,15 +47,34 @@
         app:iconSize="20dp"
         app:iconTint="?attr/colorOnPrimary" />
 
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginStart="20dp"
         android:layout_marginTop="24dp"
+        android:layout_marginEnd="20dp"
         android:layout_marginBottom="8dp"
-        android:text="已保存的地图"
-        android:textAppearance="?attr/textAppearanceLabelLarge"
-        android:textColor="?attr/colorPrimary" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="已保存的地图"
+            android:textAppearance="?attr/textAppearanceLabelLarge"
+            android:textColor="?attr/colorPrimary" />
+
+        <!-- 删除是长按，藏起来的东西没人点，留一行提示。空列表时随列表一起收起。 -->
+        <TextView
+            android:id="@+id/tvListHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="长按删除"
+            android:textAppearance="?attr/textAppearanceLabelMedium"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:visibility="gone" />
+    </LinearLayout>
 
     <FrameLayout
         android:layout_width="match_parent"

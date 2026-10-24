@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 入口页列表的一行：地图名 + 修改时间/大小。点击由 ListView 处理。
+<!-- 入口页列表的一行：地图名 + 修改时间/大小。点击打开、长按删除。
      外层 FrameLayout 的 padding 用来做行距 —— ListView 不认 item 根节点的 margin。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
