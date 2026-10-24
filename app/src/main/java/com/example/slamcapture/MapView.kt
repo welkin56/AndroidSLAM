@@ -491,7 +491,7 @@ class MapView @JvmOverloads constructor(
         val s = snap ?: return
 
         if (!fullBleed) {
-            val r = 6f * density
+            val r = 16f * density
             bgRect.set(0f, 0f, width.toFloat(), height.toFloat())
             canvas.drawRoundRect(bgRect, r, r, bgPaint)
             canvas.drawRoundRect(bgRect, r, r, edgePaint)

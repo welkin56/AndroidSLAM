@@ -132,7 +132,15 @@ class PreviewView @JvmOverloads constructor(
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textSize = this@PreviewView.textSize
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        fontFeatureSettings = "tnum"   // 等宽数字，读数变化时不左右跳
     }
+
+    /** 读数底衬：画面亮暗不定，纯白字会糊掉。 */
+    private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xB3000000.toInt()
+    }
+    private val pillRect = RectF()
 
     // ---- 多点折线，青色。与十字的白色、吸附圈的琥珀色区分 ----
 
@@ -161,6 +169,7 @@ class PreviewView @JvmOverloads constructor(
     private val segTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textSize = 13f * resources.displayMetrics.scaledDensity
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        fontFeatureSettings = "tnum"
     }
 
     /** [toScreen] 的复用输出；同时需要两个点时使用不同实例。 */
@@ -177,15 +186,19 @@ class PreviewView @JvmOverloads constructor(
         out.set(dst.right - py * scale, dst.top + px * scale)
     }
 
-    /** 黑描边加白填充，保证亮暗背景都可见。 */
-    private fun drawOutlinedText(canvas: Canvas, text: String, x: Float, y: Float, p: Paint) {
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = 3f * density
-        p.color = Color.BLACK
-        canvas.drawText(text, x, y, p)
+    /** 圆角深色底 + 白字；画面亮暗都能读。cx、baseline 是文字中心与基线。 */
+    private fun drawPillText(canvas: Canvas, text: String, cx: Float, baseline: Float, p: Paint) {
         p.style = Paint.Style.FILL
         p.color = Color.WHITE
-        canvas.drawText(text, x, y, p)
+        val tw = p.measureText(text)
+        val padH = 10f * density
+        val padV = 5f * density
+        val fm = p.fontMetrics
+        val h = fm.descent - fm.ascent + 2 * padV
+        val top = baseline + fm.ascent - padV
+        pillRect.set(cx - tw / 2f - padH, top, cx + tw / 2f + padH, top + h)
+        canvas.drawRoundRect(pillRect, h / 2f, h / 2f, pillPaint)
+        canvas.drawText(text, cx - tw / 2f, baseline, p)
     }
 
     /**
@@ -286,8 +299,7 @@ class PreviewView @JvmOverloads constructor(
             MeasureState.FAIR -> "≈ %.2f m（不太准）".format(ov.distM)
             MeasureState.GOOD -> "%.2f m".format(ov.distM)
         }
-        drawOutlinedText(canvas, label, cx - textPaint.measureText(label) / 2f,
-                         cy + r + textSize, textPaint)
+        drawPillText(canvas, label, cx, cy + r + textSize + 6f * density, textPaint)
     }
 
     /** 绘制一段折线及其中点的长度标签。 */
@@ -295,8 +307,9 @@ class PreviewView @JvmOverloads constructor(
         toScreen(s.x0, s.y0, ptA)
         toScreen(s.x1, s.y1, ptB)
         canvas.drawLine(ptA.x, ptA.y, ptB.x, ptB.y, line)
-        drawOutlinedText(canvas, s.label,
-                         (ptA.x + ptB.x) / 2f - segTextPaint.measureText(s.label) / 2f,
-                         (ptA.y + ptB.y) / 2f, segTextPaint)
+        drawPillText(canvas, s.label,
+                     (ptA.x + ptB.x) / 2f,
+                     (ptA.y + ptB.y) / 2f + segTextPaint.textSize * 0.35f,
+                     segTextPaint)
     }
 }

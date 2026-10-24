@@ -3,7 +3,6 @@ package com.example.slamcapture
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -13,20 +12,23 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.GravityCompat
 import androidx.drawerlayout.widget.DrawerLayout
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.color.MaterialColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.slider.Slider
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.R as MaterialR
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -102,14 +104,11 @@ class MainActivity : AppCompatActivity() {
         /** 点云上限，与 slam_engine.cpp 的 kMapPointsMax 对应；使用固定缓冲。 */
         private const val kMapPointsMax = 5000
 
-        /** 厚度滑块刻度数，在 0..100 上线性映射到米。 */
-        private const val kRangeSeekMax = 100
-
         /** 按住缩放键时的连发间隔。 */
         private const val kZoomRepeatMs = 95L
 
-        private val DARK_TEXT = Color.parseColor("#DE000000")
-        private val RED = Color.parseColor("#C62828")
+        /** 切片厚度滑块的步长，必须与布局里的 android:stepSize 一致。 */
+        private const val kRangeStep = 0.05f
 
         /** 加点时吸附到已有点的半径（图像像素）。 */
         private const val kPointSnapPx = 20f
@@ -133,6 +132,37 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStatus: TextView
     private lateinit var preview: PreviewView
     private lateinit var drawer: DrawerLayout
+
+    // ---------------- 状态区 ----------------
+
+    private lateinit var chipTrack: TextView
+    private lateinit var chipPoints: TextView
+    private lateinit var chipRecord: TextView
+    private lateinit var chipMap: TextView
+    private lateinit var bannerWrap: LinearLayout
+    private lateinit var progress: com.google.android.material.progressindicator.LinearProgressIndicator
+    private lateinit var tvDiag: TextView
+
+    /** 主按钮的默认配色，离开「运行中」时还原。 */
+    private var btnSlamTint: ColorStateList? = null
+    private var btnSlamTextColor: Int = 0
+
+    /** 一次性错误提示；下一次操作时清除。 */
+    private var uiMessage: String? = null
+
+    /** 短暂停留的成功提示，过期后自动收起。 */
+    private var transientMsg: String? = null
+    private var transientUntil = 0L
+    private val transientClear = Runnable {
+        if (SystemClock.elapsedRealtime() >= transientUntil) {
+            transientMsg = null
+            render()
+        }
+    }
+
+    /** 跟踪提示的粘滞窗口：OK 与「不稳」交替时不至于每 250 ms 闪一次。 */
+    private var trkMsg: String? = null
+    private var trkMsgUntil = 0L
 
     private val uiHandler = Handler(Looper.getMainLooper())
 
@@ -295,7 +325,7 @@ class MainActivity : AppCompatActivity() {
     /** 小地图容器；开关直接控制其可见性。 */
     private lateinit var mapWrap: FrameLayout
     private lateinit var swMap: SwitchCompat
-    private lateinit var sbMapRange: SeekBar
+    private lateinit var sbMapRange: Slider
     private lateinit var tvMapRange: TextView
     private lateinit var btnMapZoomIn: Button
     private lateinit var btnMapZoomOut: Button
@@ -412,12 +442,28 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        applySystemBarAppearance()
 
         btnSlam = findViewById(R.id.btnSlam)
         swRecord = findViewById(R.id.swRecord)
         swMeasure = findViewById(R.id.swMeasure)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
+        chipTrack = findViewById(R.id.chipTrack)
+        chipPoints = findViewById(R.id.chipPoints)
+        chipRecord = findViewById(R.id.chipRecord)
+        chipMap = findViewById(R.id.chipMap)
+        bannerWrap = findViewById(R.id.bannerWrap)
+        progress = findViewById(R.id.progress)
+        tvDiag = findViewById(R.id.tvDiag)
+        btnSlamTint = btnSlam.backgroundTintList
+        btnSlamTextColor = btnSlam.currentTextColor
+
+        findViewById<View>(R.id.drawerDiagHeader).setOnClickListener {
+            val open = tvDiag.visibility != View.VISIBLE
+            tvDiag.visibility = if (open) View.VISIBLE else View.GONE
+            findViewById<ImageView>(R.id.drawerDiagChevron).rotation = if (open) 180f else 0f
+        }
         mapView = findViewById(R.id.mapView)
         mapWrap = findViewById(R.id.mapWrap)
         swMap = findViewById(R.id.swMap)
@@ -480,9 +526,8 @@ class MainActivity : AppCompatActivity() {
 
         // 小地图开关和切片厚度，同样在注册监听前恢复。
         swMap.isChecked = pref.getBoolean(PREF_MAP, true)
-        sbMapRange.max = kRangeSeekMax
-        sbMapRange.progress = rangeToSeek(pref.getFloat(PREF_MAP_RANGE, MapView.SLICE_DEFAULT))
-        applyMapRange(sbMapRange.progress)
+        sbMapRange.value = snapRange(pref.getFloat(PREF_MAP_RANGE, MapView.SLICE_DEFAULT))
+        applyMapRange(sbMapRange.value)
 
         swMap.setOnCheckedChangeListener { _, checked ->
             pref.edit().putBoolean(PREF_MAP, checked).apply()
@@ -491,16 +536,11 @@ class MainActivity : AppCompatActivity() {
         // 先按当前开关同步一次：C++ 那边默认是开的，而用户可能记成了关。
         applyMapVisible(swMap.isChecked)
 
-        sbMapRange.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            // 拖动时立即生效；仅用户操作时写入偏好。
-            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                applyMapRange(progress)
-                if (fromUser) pref.edit().putFloat(PREF_MAP_RANGE, seekToRange(progress)).apply()
-            }
-
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) {}
-        })
+        // 拖动时立即生效；仅用户操作时写入偏好。
+        sbMapRange.addOnChangeListener { _, value, fromUser ->
+            applyMapRange(value)
+            if (fromUser) pref.edit().putFloat(PREF_MAP_RANGE, value).apply()
+        }
 
         // 缩放档位要记着：上次按到哪一档，这次进来还是哪一档。
         // -1 表示尚未保存，setZoomIndex 会忽略并使用默认档。
@@ -652,6 +692,8 @@ class MainActivity : AppCompatActivity() {
     // 没有取消准备：System 构造无法中途取消，也没有安全的销毁时机。
 
     private fun onButtonSlam() {
+        // 上一次的错误提示只留到下一次操作。
+        uiMessage = null
         // 运行中：结束本次会话
         if (slamRunning) {
             stopHardware("用户结束")
@@ -716,6 +758,8 @@ class MainActivity : AppCompatActivity() {
 
         SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
+        trkMsg = null
+        trkMsgUntil = 0L
 
         // 会话目录只建一次；本趟的轨迹和录像都放在它下面。
         //
@@ -854,8 +898,9 @@ class MainActivity : AppCompatActivity() {
         w.start()
         if (w.ioError != null) {
             Log.e(TAG, "建 session 文件失败：${w.ioError}")
-            tvStatus.text = "无法创建输出文件：${w.ioError}\n$dir"
+            uiMessage = "无法创建输出文件：${w.ioError}\n$dir"
             swRecord.isChecked = false   // 写不进去就别让开关骗人
+            render()
             return
         }
         writer = w
@@ -1097,9 +1142,15 @@ class MainActivity : AppCompatActivity() {
             slamState == SLAM_READY -> "启动 SLAM"
             else -> "准备 SLAM"
         }
-        btnSlam.backgroundTintList =
-            if (slamRunning) ColorStateList.valueOf(RED) else null
-        btnSlam.setTextColor(if (slamRunning) Color.WHITE else DARK_TEXT)
+        // 「运行中」用错误色提示这一下会结束会话；其余状态用主题默认填充色。
+        if (slamRunning) {
+            btnSlam.backgroundTintList =
+                ColorStateList.valueOf(materialColor(MaterialR.attr.colorError))
+            btnSlam.setTextColor(materialColor(MaterialR.attr.colorOnError))
+        } else {
+            btnSlam.backgroundTintList = btnSlamTint
+            btnSlam.setTextColor(btnSlamTextColor)
+        }
 
         // 两个开关始终可点，因为需要在启动前就能设置。
         swRecord.isEnabled = true
@@ -1129,26 +1180,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ---- 状态栏 ----
-        val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
-        // System 就绪后有两种情形，先算出来再放进 when 的 else 分支。
-        val afterReady = if (slamRunning) {
-            trackingLine()
-        } else {
-            "SLAM：已就绪（没在吃帧）\n\n点「启动 SLAM」开始 —— 相机和 IMU 这一刻才打开。"
-        }
-        val head = when (slamState) {
-            SLAM_IDLE ->
-                "SLAM：未准备（$mapLabel）\n\n点「准备 SLAM」构造 System，约 38 秒。"
-            SLAM_LOADING -> "SLAM：词袋加载中…（已 ${slamElapsedMs / 1000}s，本机约 38 秒）"
-            SLAM_FAILED ->
-                if (SlamBridge.nativeFailureCode() == 1)
-                    "SLAM：载图失败 —— 这张图读不了，回入口页换一张或新建"
-                else
-                    "SLAM：构造失败 —— 看 logcat（tag slam）"
-            else -> afterReady
-        }
-
         // 存图状态转成人话。文件名不用问 C++ —— 就是这一侧传过去的。
         when (SlamBridge.nativeSaveState()) {
             1, 2 -> saveMsg = "正在保存地图…"
@@ -1162,6 +1193,11 @@ class MainActivity : AppCompatActivity() {
                     // 文件夹内容变了（归档 / 合并重组）。脏标记放调用点：
                     // applyPendingSave 有好几条提前 return 的路径。
                     histDirty = true
+                    // 存完就停下 ticker 了，这条提示要自己安排一次收起。
+                    transientMsg = saveMsg
+                    transientUntil = SystemClock.elapsedRealtime() + 5000
+                    uiHandler.removeCallbacks(transientClear)
+                    uiHandler.postDelayed(transientClear, 5200)
                 }
             }
             4 -> {
@@ -1171,43 +1207,107 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val body = buildString {
+        // ---- 状态芯片 ----
+        val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
+        val trkLabel = when {
+            !slamRunning -> "未运行"
+            trkState == TRK_OK -> "跟踪中"
+            trkState == TRK_RECENTLY_LOST -> "跟踪不稳"
+            trkState == TRK_LOST -> "已丢失"
+            trkState == TRK_NOT_INITIALIZED -> "初始化中"
+            trkState == TRK_NO_IMAGES -> "等画面"
+            else -> "未就绪"
+        }
+        val trkColor = when {
+            !slamRunning -> materialColor(MaterialR.attr.colorOnSurfaceVariant)
+            trkState == TRK_OK -> materialColor(MaterialR.attr.colorPrimary)
+            trkState == TRK_LOST -> materialColor(MaterialR.attr.colorError)
+            trkState == TRK_RECENTLY_LOST || trkState == TRK_NOT_INITIALIZED ->
+                materialColor(MaterialR.attr.colorTertiary)
+            else -> materialColor(MaterialR.attr.colorOnSurfaceVariant)
+        }
+        chipTrack.text = "● $trkLabel"
+        chipTrack.setTextColor(trkColor)
+
+        chipPoints.visibility = if (slamRunning) View.VISIBLE else View.GONE
+        chipPoints.text = "轨迹 ${SlamBridge.nativeTrajSize()} 点"
+
+        val w = writer
+        if (recording && w != null) {
+            chipRecord.visibility = View.VISIBLE
+            chipRecord.text = "● 录制 ${w.framesWritten.get()}"
+        } else {
+            chipRecord.visibility = View.GONE
+        }
+
+        chipMap.text = mapLabel
+
+        // ---- 横幅：只放需要说明的事 ----
+        val now = SystemClock.elapsedRealtime()
+        val trkLine = if (slamRunning && trkState != TRK_OK) trackingLine() else null
+        if (trkLine != null) {
+            trkMsg = trkLine
+            trkMsgUntil = now + 2000
+        } else if (now >= trkMsgUntil) {
+            trkMsg = null
+        }
+        val banner = when {
+            uiMessage != null -> uiMessage
+            transientMsg != null && now < transientUntil -> transientMsg
+            wpMsg != null -> wpMsg
+            slamState == SLAM_LOADING ->
+                "词袋加载中…已 ${slamElapsedMs / 1000} 秒"
+            slamState == SLAM_FAILED ->
+                if (SlamBridge.nativeFailureCode() == 1) {
+                    "载图失败 —— 这张图读不了，回入口页换一张或新建"
+                } else {
+                    "构造失败 —— 看 logcat（tag slam）"
+                }
+            restoring -> restoreMsg ?: "正在载入地图…"
+            !slamRunning && slamState == SLAM_READY ->
+                "已就绪 · 点「启动 SLAM」打开相机和 IMU"
+            !slamRunning -> "点「准备 SLAM」构造 System"
+            trkLine != null -> trkLine
+            now < trkMsgUntil -> trkMsg
+            else -> null
+        }
+        // 查看器盖住预览时也收起：它有 elevation，不能只靠绘制顺序遮。
+        bannerWrap.visibility =
+            if (viewerOpen || banner == null) View.GONE else View.VISIBLE
+        tvStatus.text = banner ?: ""
+        progress.visibility =
+            if (slamState == SLAM_LOADING || restoring || saving) View.VISIBLE else View.GONE
+
+        // ---- 诊断面板：数字和路径都在这儿，平时收着 ----
+        tvDiag.text = buildString {
+            append("地图来源  $mapLabel\n")
             if (slamRunning && poseValid) {
-                append(
-                    "位置 m: %.3f, %.3f, %.3f".format(poseBuf[12], poseBuf[13], poseBuf[14])
-                )
+                append("位置  %.3f  %.3f  %.3f\n".format(poseBuf[12], poseBuf[13], poseBuf[14]))
             }
             if (slamRunning) {
-                if (isNotEmpty()) append("\n")
-                append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
+                append("轨迹  ${SlamBridge.nativeTrajSize()} 点")
                 val resets = SlamBridge.nativeResetCount()
-                if (resets > 0) append("　⚠️ 地图已重置 $resets 次")
-                // 只显示纹理，不显示距离和世界坐标，避免状态栏折行。
-                if (swMeasure.isChecked) {
-                    // 十字附近的特征点数；无读数时也有值，可用于说明测不到的原因。
-                    append("　纹理 %.0f".format(measureBuf[6]))
-                }
+                if (resets > 0) append(" · 重置 $resets 次")
+                append('\n')
+                // 十字附近的特征点数；无读数时也有值，可用于说明测不到的原因。
+                if (swMeasure.isChecked) append("纹理  %.0f\n".format(measureBuf[6]))
             }
-            val w = writer
             if (recording && w != null) {
-                append("\n录制中：相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条")
+                append("录制  相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条\n")
             }
             // 地图统计；恢复期间不读取，因为 atlas 正在重建。
             if (slamState == SLAM_READY && !restoring) {
                 SlamBridge.nativeAtlasStats(atlasBuf)
-                if (isNotEmpty()) append("\n")
-                append("地图 ${atlasBuf[0]} 张 / 关键帧 ${atlasBuf[1]} / 点云 ${atlasBuf[2]}")
-                // 路径点：有才显示，免得平时多占一行。
+                append("地图  ${atlasBuf[0]} 张 · KF ${atlasBuf[1]} · 点 ${atlasBuf[2]}")
                 val wpTotal = SlamBridge.nativeWaypointCount()
-                if (wpTotal > 0) append("　路径点 $wpTotal")
+                if (wpTotal > 0) append(" · 路径点 $wpTotal")
+                append('\n')
             }
-            // 词袋加载期间那条「正在载入地图…」只是排队，别和加载进度叠在一起。
-            if (slamState != SLAM_LOADING) restoreMsg?.let { append("\n$it") }
-            saveMsg?.let { append("\n$it") }
-            wpMsg?.let { append("\n$it") }
-            lastRunDir?.let { append("\n上一趟：${it.absolutePath}") }
-        }
-        tvStatus.text = if (body.isEmpty()) head else "$head\n\n$body"
+            restoreMsg?.let { append(it).append('\n') }
+            saveMsg?.let { append(it).append('\n') }
+            wpMsg?.let { append(it).append('\n') }
+            lastRunDir?.let { append("上一趟  ${it.absolutePath}") }
+        }.trimEnd()
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
         // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
@@ -1290,21 +1390,27 @@ class MainActivity : AppCompatActivity() {
 
     /** 添加路径点：先询问名字，再发送请求。 */
     private fun askAddWaypoint() {
-        val input = EditText(this).apply {
-            // 使用下一个 id 而不是条数，避免删除后重名。
-            setText("路径点 ${SlamBridge.nativeNextWaypointId()}")
-            setSelectAllOnFocus(true)
-            setPadding(56, 0, 56, 0)
+        // 使用下一个 id 而不是条数，避免删除后重名。
+        textInputDialog("添加路径点", "路径点 ${SlamBridge.nativeNextWaypointId()}") { name ->
+            val n = name.ifEmpty { "路径点" }
+            Log.i(TAG, "加路径点「$n」")
+            SlamBridge.nativeRequestAddWaypoint(n)
+            wpStateSeen = 1
+            uiQueueTicker()
         }
-        AlertDialog.Builder(this)
-            .setTitle("添加路径点")
-            .setView(input)
-            .setPositiveButton("添加") { _, _ ->
-                val name = input.text.toString().trim().ifEmpty { "路径点" }
-                Log.i(TAG, "加路径点「$name」")
-                SlamBridge.nativeRequestAddWaypoint(name)
-                wpStateSeen = 1
-                uiQueueTicker()
+    }
+
+    /** 单行文字输入弹窗；空输入交给调用方决定怎么兜底。 */
+    private fun textInputDialog(title: String, initial: String, onOk: (String) -> Unit) {
+        val v = layoutInflater.inflate(R.layout.dialog_text_input, null)
+        val input = v.findViewById<TextInputEditText>(R.id.input)
+        input.setText(initial)
+        input.setSelection(initial.length)
+        MaterialAlertDialogBuilder(this)
+            .setTitle(title)
+            .setView(v)
+            .setPositiveButton("确定") { _, _ ->
+                onOk(input.text?.toString()?.trim().orEmpty())
             }
             .setNegativeButton("取消", null)
             .show()
@@ -1314,7 +1420,7 @@ class MainActivity : AppCompatActivity() {
     private fun showWaypointManager() {
         val total = SlamBridge.nativeWaypointCount()
         if (total == 0) {
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setTitle("路径点")
                 .setMessage("还没有路径点。\n\n在 SLAM 跑起来之后，走到想记的地方点「添加路径点」。")
                 .setPositiveButton("好", null)
@@ -1338,12 +1444,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("路径点（$n）")
             .setItems(labels) { _, which ->
                 val id = meta[which * 4].toInt()
                 val name = names[which] ?: "路径点"
-                AlertDialog.Builder(this)
+                MaterialAlertDialogBuilder(this)
                     .setTitle(name)
                     .setItems(arrayOf("重命名", "删除")) { _, pick ->
                         when (pick) {
@@ -1362,22 +1468,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun askRenameWaypoint(id: Int, old: String) {
-        val input = EditText(this).apply {
-            setText(old)
-            setSelectAllOnFocus(true)
-            setPadding(56, 0, 56, 0)
+        textInputDialog("重命名", old) { name ->
+            SlamBridge.nativeRenameWaypoint(id, name.ifEmpty { old })
+            refreshWaypoints()
+            render()
         }
-        AlertDialog.Builder(this)
-            .setTitle("重命名")
-            .setView(input)
-            .setPositiveButton("确定") { _, _ ->
-                val name = input.text.toString().trim().ifEmpty { old }
-                SlamBridge.nativeRenameWaypoint(id, name)
-                refreshWaypoints()
-                render()
-            }
-            .setNegativeButton("取消", null)
-            .show()
     }
 
     // ---------------- 2D 地图小窗 ----------------
@@ -1489,7 +1584,7 @@ class MainActivity : AppCompatActivity() {
         refreshHistory()
         val entries = histEntries
         if (entries.isEmpty()) {
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setTitle("历史轨迹")
                 .setMessage(
                     "这张图还没有已保存的轨迹。\n\n" +
@@ -1510,7 +1605,7 @@ class MainActivity : AppCompatActivity() {
                 if (e.file.absolutePath in histHidden) append(" · 已隐藏")
             }
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("历史轨迹（${entries.size}）")
             .setItems(labels) { _, which -> showTraceActions(entries[which]) }
             .setNegativeButton("关闭", null)
@@ -1519,7 +1614,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showTraceActions(e: TraceEntry) {
         val hidden = e.file.absolutePath in histHidden
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(e.file.name)
             .setItems(arrayOf(if (hidden) "显示" else "隐藏", "删除")) { _, pick ->
                 if (pick == 0) setTraceHidden(e.file, !hidden) else askDeleteTrace(e.file)
@@ -1537,7 +1632,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun askDeleteTrace(f: File) {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("删除这条轨迹？")
             .setMessage(
                 "${f.name}\n\n" +
@@ -1574,7 +1669,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             slamState == SLAM_LOADING -> {
-                viewerDialog("词库加载中（约 38 秒），等就绪后再看。")
+                viewerDialog("词库加载中，等就绪后再看。")
                 return
             }
             slamState == SLAM_FAILED -> {
@@ -1588,7 +1683,7 @@ class MainActivity : AppCompatActivity() {
         rowBottom.visibility = View.GONE
         rowMeasure.visibility = View.GONE
         viewerWrap.visibility = View.VISIBLE
-        viewerMapView.setSliceRange(seekToRange(sbMapRange.progress))
+        viewerMapView.setSliceRange(sbMapRange.value)
         applyViewerSlice()
         updateViewerSliceLabel()
 
@@ -1833,7 +1928,7 @@ class MainActivity : AppCompatActivity() {
                 "${viewerTraceCounts[m.id] ?: 0} 条轨迹$tag"
         }.toTypedArray()
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("查看哪张图")
             .setItems(labels) { _, which -> selectViewerMap(viewerMaps[which].id) }
             .setNegativeButton("取消", null)
@@ -1910,7 +2005,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun viewerDialog(msg: String) {
-        AlertDialog.Builder(this).setMessage(msg).setPositiveButton("好", null).show()
+        MaterialAlertDialogBuilder(this).setMessage(msg).setPositiveButton("好", null).show()
     }
 
     // ---------------- 小地图的开关和切片厚度 ----------------
@@ -1933,18 +2028,15 @@ class MainActivity : AppCompatActivity() {
         refreshMap()
     }
 
-    /** 滑块刻度转换为切片厚度（米，全宽）。 */
-    private fun seekToRange(p: Int): Float =
-        MapView.SLICE_MIN + (MapView.SLICE_MAX - MapView.SLICE_MIN) * p / kRangeSeekMax
+    /** 对齐到滑块的步长；Slider 拒绝非对齐的 value。 */
+    private fun snapRange(m: Float): Float {
+        val i = ((m - MapView.SLICE_MIN) / kRangeStep).roundToInt()
+        return (MapView.SLICE_MIN + i * kRangeStep).coerceIn(MapView.SLICE_MIN, MapView.SLICE_MAX)
+    }
 
-    private fun rangeToSeek(m: Float): Int =
-        ((m - MapView.SLICE_MIN) / (MapView.SLICE_MAX - MapView.SLICE_MIN) * kRangeSeekMax)
-            .roundToInt().coerceIn(0, kRangeSeekMax)
-
-    private fun applyMapRange(progress: Int) {
-        val m = seekToRange(progress)
+    private fun applyMapRange(m: Float) {
         mapView.setSliceRange(m)
-        tvMapRange.text = "地图高度范围　%.1f m".format(m)
+        tvMapRange.text = "地图高度范围　%.2f m".format(m)
     }
 
     // ---------------- 缩放键 ----------------
@@ -1992,6 +2084,9 @@ class MainActivity : AppCompatActivity() {
      * 跟踪状态文字。
      * 惯性初始化需要运动，静止时无法完成，提示中需要说明这一点。
      */
+    /** 取主题色；动态取色之后静态资源不再等于实际颜色，必须走 attr。 */
+    private fun materialColor(attr: Int): Int = MaterialColors.getColor(btnSlam, attr)
+
     private fun trackingLine(): String = when (trkState) {
         TRK_OK -> "● 跟踪中（OK）"
         TRK_RECENTLY_LOST -> "… 跟踪不稳，放慢动作"
@@ -2016,7 +2111,8 @@ class MainActivity : AppCompatActivity() {
             // 把刚才那一下就接着做完。
             onButtonSlam()
         } else {
-            tvStatus.text = "相机权限被拒绝。\n请到 设置 → 应用 → SlamCapture → 权限 里手动开启。"
+            uiMessage = "相机权限被拒绝。\n请到 设置 → 应用 → SlamCapture → 权限 里手动开启。"
+            render()
         }
     }
 
@@ -2047,7 +2143,8 @@ class MainActivity : AppCompatActivity() {
             mapFile?.let { dst.appendText("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }
         } catch (e: IOException) {
             Log.e(TAG, "释放 $SETTINGS_NAME 失败", e)
-            tvStatus.text = "打不开 assets/$SETTINGS_NAME：$e"
+            uiMessage = "打不开 assets/$SETTINGS_NAME：$e"
+            render()
             return null
         }
         return dst.takeIf { it.length() > 0 && it.canRead() }?.absolutePath
@@ -2060,7 +2157,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun refuse(what: String, f: File, hint: () -> String): String? {
         Log.e(TAG, "找不到$what：${f.absolutePath}")
-        tvStatus.text = "找不到$what：\n${f.absolutePath}\n\n${hint()}"
+        uiMessage = "找不到$what：\n${f.absolutePath}\n\n${hint()}"
+        render()
         return null
     }
 
@@ -2141,7 +2239,7 @@ class MainActivity : AppCompatActivity() {
             if (resets > 0) append("地图被重置 $resets 次 —— 轨迹只保留了最后一段\n")
             append("\n${base.parentFile?.absolutePath ?: base.absolutePath}")
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("保存这一趟？")
             .setMessage(msg)
             .setPositiveButton("保存") { _, _ -> keepRun(base) }
@@ -2169,12 +2267,12 @@ class MainActivity : AppCompatActivity() {
 
         // 只有「另存为」用得上。不勾就只拷轨迹（几毫秒），
         // 勾了连录像一起拷 —— 那是原始数据，一段可能几百 MB。
-        val copyRec = CheckBox(this).apply {
+        val copyRec = MaterialCheckBox(this).apply {
             text = "另存时连录像一起拷"
             setPadding(56, 0, 56, 0)
         }
 
-        val b = AlertDialog.Builder(this)
+        val b = MaterialAlertDialogBuilder(this)
             .setTitle("保存地图？")
             .setMessage(
                 buildString {
@@ -2288,7 +2386,7 @@ class MainActivity : AppCompatActivity() {
             discardAll(base)
             return
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("这一趟录了 $segs 段会话")
             .setMessage(
                 "要保留吗？\n\n" +

@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="?android:attr/colorBackground"
     android:orientation="vertical">
 
     <!-- 黑底既是 letterbox 的黑边，也是"没有画面时露出来的东西"。
@@ -15,45 +17,57 @@
         android:layout_weight="1"
         android:background="#000000" />
 
-    <TextView
-        android:id="@+id/tvStatus"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:padding="8dp"
-        android:fontFamily="monospace"
-        android:textSize="12sp"
-        android:text="点「开始准备」打开相机和 IMU。" />
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="10dp"
+        android:layout_marginEnd="12dp"
+        android:background="@drawable/bg_banner"
+        android:orientation="vertical"
+        android:padding="12dp">
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:lineSpacingExtra="2dp"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?attr/colorOnSurface"
+            android:text="点「开始准备」打开相机和 IMU。" />
+    </LinearLayout>
 
     <!-- 两个按钮放最下面，好按；左边"退一层"，右边"进一步"。 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:paddingStart="8dp"
-        android:paddingEnd="8dp"
-        android:paddingBottom="8dp">
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="12dp">
 
-        <!-- textColor 必须显式给：主题（Theme.AppCompat.NoActionBar 的按钮）默认是
-             白字，而 render() 在中性态会把 backgroundTintList 置 null 让底变成白色——
-             白底白字就看不见了。中性态用深字，着色态（绿/红）由 render() 切回白字。 -->
         <Button
             android:id="@+id/btnA"
+            style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
             android:layout_weight="1"
-            android:layout_marginEnd="4dp"
+            android:layout_marginEnd="8dp"
             android:text="开始准备"
-            android:textColor="#DE000000" />
+            android:textSize="14sp"
+            app:cornerRadius="16dp" />
 
         <Button
             android:id="@+id/btnB"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
             android:layout_weight="1"
-            android:layout_marginStart="4dp"
             android:enabled="false"
             android:text="开始录制"
-            android:textColor="#DE000000" />
+            android:textSize="14sp"
+            app:cornerRadius="16dp" />
     </LinearLayout>
 
 </LinearLayout>

@@ -2,9 +2,11 @@ package com.example.slamcapture
 
 import android.content.Intent
 import android.os.Bundle
+import android.text.format.Formatter
 import android.util.Log
 import android.view.View
-import android.widget.ArrayAdapter
+import android.view.ViewGroup
+import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.ListView
 import android.widget.TextView
@@ -34,6 +36,7 @@ class EntryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_entry)
+        applySystemBarAppearance()
 
         findViewById<Button>(R.id.btnNewMap).setOnClickListener {
             Log.i(TAG, "选了「新建地图」")
@@ -69,12 +72,33 @@ class EntryActivity : AppCompatActivity() {
         } else {
             empty.visibility = View.GONE
             list.visibility = View.VISIBLE
-            list.adapter =
-                ArrayAdapter(this, android.R.layout.simple_list_item_1, maps.map(::describe))
-            list.setOnItemClickListener { _, _, pos, _ ->
-                Log.i(TAG, "选了地图：${maps[pos].absolutePath}")
-                open(maps[pos].absolutePath)
+            list.adapter = MapAdapter(maps)
+        }
+    }
+
+    /** 一行：名字 + 修改时间与大小。文件名与目录名重复时只显示目录名。 */
+    private inner class MapAdapter(private val items: List<File>) : BaseAdapter() {
+        override fun getCount() = items.size
+        override fun getItem(position: Int) = items[position]
+        override fun getItemId(position: Int) = items[position].absolutePath.hashCode().toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val v = convertView ?: layoutInflater.inflate(R.layout.item_map, parent, false)
+            val f = items[position]
+            val dir = f.parentFile?.name ?: ""
+            val base = f.name.removeSuffix(EXT)
+            v.findViewById<TextView>(R.id.tvMapTitle).text =
+                if (base == dir) dir else "$dir / $base"
+            val when_ = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+                .format(Date(f.lastModified()))
+            val size = Formatter.formatShortFileSize(this@EntryActivity, f.length())
+            v.findViewById<TextView>(R.id.tvMapSubtitle).text = "$when_ · $size"
+            // 点击交给卡片：ListView 的 listSelector 是矩形，会盖住圆角。
+            v.findViewById<View>(R.id.mapCard).setOnClickListener {
+                Log.i(TAG, "选了地图：${f.absolutePath}")
+                open(f.absolutePath)
             }
+            return v
         }
     }
 
@@ -92,14 +116,6 @@ class EntryActivity : AppCompatActivity() {
     }
 
     private fun mapsDir(): File = File(getExternalFilesDir(null) ?: filesDir, MAPS_DIR)
-
-    private fun describe(f: File): String {
-        val when_ = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(f.lastModified()))
-        val dir = f.parentFile?.name ?: ""
-        val base = f.name.removeSuffix(EXT)
-        // 目录里有多个 .osa 时才显示文件名，否则文件名与目录名重复。
-        return if (base == dir) "$dir\n$when_" else "$dir / $base\n$when_"
-    }
 
     /**
      * @param mapFile 已保存地图的绝对路径；null 表示新建地图。

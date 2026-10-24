@@ -1,10 +1,8 @@
 package com.example.slamcapture
 
 import android.Manifest
-import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -13,9 +11,13 @@ import android.os.SystemClock
 import android.util.Log
 import android.widget.Button
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.android.material.color.MaterialColors
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.R as MaterialR
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -46,11 +48,6 @@ class CaptureActivity : AppCompatActivity() {
         const val TICK_MS = 250L
 
         private const val REQ_CAMERA = 1
-        private val RED = Color.parseColor("#C62828")
-        private val GREEN = Color.parseColor("#2E7D32")
-
-        /** 中性态（白底）下的按钮文字颜色。 */
-        private val DARK_TEXT = Color.parseColor("#DE000000")
     }
 
     private enum class Phase { IDLE, ARMED, RECORDING }
@@ -102,6 +99,13 @@ class CaptureActivity : AppCompatActivity() {
 
     private var dialog: AlertDialog? = null
 
+    /** 主按钮的默认配色，回到 IDLE 时还原。 */
+    private var btnBTint: ColorStateList? = null
+    private var btnBTextColor: Int = 0
+
+    /** 一次性错误提示；下一次准备时清除。 */
+    private var uiMessage: String? = null
+
     // ---------------- 帧出口 ----------------
 
     /**
@@ -128,11 +132,14 @@ class CaptureActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_capture)
+        applySystemBarAppearance()
 
         btnA = findViewById(R.id.btnA)
         btnB = findViewById(R.id.btnB)
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
+        btnBTint = btnB.backgroundTintList
+        btnBTextColor = btnB.currentTextColor
 
         // 相机线程与 Activity 同生命周期，start/stop 按队列顺序执行。
         val ct = HandlerThread("camera").also { it.start() }
@@ -195,6 +202,7 @@ class CaptureActivity : AppCompatActivity() {
      */
     private fun beginPrepare() {
         if (phase != Phase.IDLE) return
+        uiMessage = null
 
         // 无权限时不做任何修改；授权回调会再次调用本函数。
         if (!hasCameraPermission()) {
@@ -230,6 +238,7 @@ class CaptureActivity : AppCompatActivity() {
      */
     private fun beginRecording() {
         if (phase != Phase.ARMED) return
+        uiMessage = null
 
         camGaveUp = !cam.ready
         imuGaveUp = imu?.ready != true
@@ -245,7 +254,8 @@ class CaptureActivity : AppCompatActivity() {
         w.start()
         if (w.ioError != null) {
             Log.e(TAG, "建 session 文件失败：${w.ioError}")
-            tvStatus.text = "无法创建输出文件：${w.ioError}\n$dir"
+            uiMessage = "无法创建输出文件：${w.ioError}\n$dir"
+            render()
             return
         }
 
@@ -302,7 +312,7 @@ class CaptureActivity : AppCompatActivity() {
     private fun confirmDiscard() {
         if (phase != Phase.RECORDING) return
         val frames = writer?.framesWritten?.get() ?: 0L
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle("放弃这一段？")
             .setMessage("已经落盘的 $frames 帧会被删掉。\n相机和 IMU 继续保持热状态。")
             .setPositiveButton("删掉") { _, _ ->
@@ -355,6 +365,8 @@ class CaptureActivity : AppCompatActivity() {
         }
     }
 
+    private fun color(attr: Int): Int = MaterialColors.getColor(btnA, attr)
+
     /** 刷新按钮和状态栏；显示内容由 [phase] 推导。 */
     private fun render() {
         val p = phase
@@ -363,46 +375,44 @@ class CaptureActivity : AppCompatActivity() {
         val imuOk = imu?.ready == true
 
         // ---- 按钮 ----
-        // 文字色和背景成对设置，中性态用深色字，着色态用白色字。
+        // 背景和文字色成对设置：就绪用主色，强制开始用错误色，停止用次容器色。
         when (p) {
             Phase.IDLE -> {
                 btnA.text = "开始准备"
-                btnA.backgroundTintList = null
-                btnA.setTextColor(DARK_TEXT)
                 btnB.text = "开始录制"
                 btnB.isEnabled = false
-                btnB.backgroundTintList = null
-                btnB.setTextColor(DARK_TEXT)
+                btnB.backgroundTintList = btnBTint
+                btnB.setTextColor(btnBTextColor)
             }
             Phase.ARMED -> {
                 btnA.text = "取消准备"
-                btnA.backgroundTintList = null
-                btnA.setTextColor(DARK_TEXT)
-                // 进入准备后按钮立即可用；就绪前显示为红色。
+                // 进入准备后按钮立即可用；就绪前用错误色提示这是强制开始。
                 btnB.isEnabled = true
                 if (camOk && imuOk) {
                     btnB.text = "开始录制"
-                    btnB.backgroundTintList = ColorStateList.valueOf(GREEN)
+                    btnB.backgroundTintList =
+                        ColorStateList.valueOf(color(MaterialR.attr.colorPrimary))
+                    btnB.setTextColor(color(MaterialR.attr.colorOnPrimary))
                 } else {
                     btnB.text = "强制开始"
-                    btnB.backgroundTintList = ColorStateList.valueOf(RED)
+                    btnB.backgroundTintList =
+                        ColorStateList.valueOf(color(MaterialR.attr.colorError))
+                    btnB.setTextColor(color(MaterialR.attr.colorOnError))
                 }
-                btnB.setTextColor(Color.WHITE)
             }
             Phase.RECORDING -> {
                 btnA.text = "取消录制"
-                btnA.backgroundTintList = null
-                btnA.setTextColor(DARK_TEXT)
                 btnB.text = "停止录制"
                 btnB.isEnabled = true
                 // 停止不是危险操作；取消录制另有确认弹窗。
-                btnB.backgroundTintList = null
-                btnB.setTextColor(DARK_TEXT)
+                btnB.backgroundTintList =
+                    ColorStateList.valueOf(color(MaterialR.attr.colorSecondaryContainer))
+                btnB.setTextColor(color(MaterialR.attr.colorOnSecondaryContainer))
             }
         }
 
         // ---- 状态栏 ----
-        val head = when (p) {
+        val head = uiMessage ?: when (p) {
             Phase.IDLE -> "点「开始准备」打开相机和 IMU。"
             Phase.ARMED -> when {
                 camOk && imuOk -> "● 就绪，可以开始录制"
@@ -442,7 +452,8 @@ class CaptureActivity : AppCompatActivity() {
             // 权限对话框不会触发 onStop，这里继续完成开始准备。
             beginPrepare()
         } else {
-            tvStatus.text = "相机权限被拒绝。\n请到 设置 → 应用 → SlamCapture → 权限 里手动开启。"
+            uiMessage = "相机权限被拒绝。\n请到 设置 → 应用 → SlamCapture → 权限 里手动开启。"
+            render()
         }
     }
 

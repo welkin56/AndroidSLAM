@@ -12,9 +12,10 @@
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
     <application
+        android:name=".SlamApp"
         android:allowBackup="false"
         android:label="@string/app_name"
-        android:theme="@style/Theme.AppCompat.NoActionBar">
+        android:theme="@style/Theme.SlamCapture">
 
         <!-- 入口页。冷启动落在这儿，选完地图才进 MainActivity。
              它自己**不是** singleTop —— 没有理由拦重复启动，而且它只做记账。 -->

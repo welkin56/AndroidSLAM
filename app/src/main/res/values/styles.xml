@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="TextAppearance.SlamCapture.Chip" parent="TextAppearance.Material3.LabelLarge">
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <!-- 地图上的 +/−：小尺寸、图标居中、不强制 48dp 触摸外框。 -->
+    <style name="Widget.SlamCapture.ZoomButton" parent="Widget.Material3.Button.OutlinedButton">
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="android:insetLeft">0dp</item>
+        <item name="android:insetRight">0dp</item>
+        <item name="android:padding">0dp</item>
+        <item name="android:textSize">0sp</item>
+        <item name="cornerRadius">12dp</item>
+        <item name="iconPadding">0dp</item>
+        <item name="iconGravity">textStart</item>
+        <item name="ensureMinTouchTargetSize">false</item>
+    </style>
+
+    <!-- 测距那一排：比默认按钮矮一点，给画面让出高度。 -->
+    <style name="Widget.SlamCapture.MeasureButton" parent="Widget.Material3.Button.TonalButton">
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">44dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="android:textSize">13sp</item>
+        <item name="cornerRadius">12dp</item>
+    </style>
+
+</resources>

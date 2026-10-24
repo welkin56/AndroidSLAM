@@ -6,58 +6,114 @@
   所以分开摆，不混成一个列表。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="16dp">
+    android:background="?android:attr/colorBackground"
+    android:orientation="vertical">
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="16dp"
-        android:text="选一张地图"
-        android:textSize="20sp"
-        android:textStyle="bold" />
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:paddingTop="28dp"
+        android:text="SlamCapture"
+        android:textAppearance="?attr/textAppearanceHeadlineMedium"
+        android:textColor="?attr/colorOnSurface" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:paddingTop="2dp"
+        android:text="选择地图来源，或新建一张"
+        android:textAppearance="?attr/textAppearanceBodyMedium"
+        android:textColor="?attr/colorOnSurfaceVariant" />
 
     <Button
         android:id="@+id/btnNewMap"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="＋ 新建地图"
-        android:textColor="#DE000000" />
+        android:layout_height="54dp"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="24dp"
+        android:layout_marginEnd="20dp"
+        android:text="新建地图"
+        android:textSize="15sp"
+        app:cornerRadius="16dp"
+        app:icon="@drawable/ic_add"
+        app:iconGravity="textStart"
+        app:iconSize="20dp"
+        app:iconTint="?attr/colorOnPrimary" />
 
-    <!-- 列表空的时候露出来的东西。M8 之前恒为这一态：保存还没做，磁盘上不会有 .osa。 -->
     <TextView
-        android:id="@+id/tvEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="24dp"
+        android:layout_marginBottom="8dp"
+        android:text="已保存的地图"
+        android:textAppearance="?attr/textAppearanceLabelLarge"
+        android:textColor="?attr/colorPrimary" />
+
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1"
-        android:gravity="center"
-        android:text="还没有保存的图\n\n（保存功能是 M8 的事）"
-        android:textColor="#99000000"
-        android:visibility="gone" />
+        android:layout_weight="1">
 
-    <ListView
-        android:id="@+id/mapList"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:layout_marginTop="8dp" />
+        <!-- 列表空的时候露出来的东西。 -->
+        <TextView
+            android:id="@+id/tvEmpty"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:drawableTop="@drawable/ic_map"
+            android:drawablePadding="16dp"
+            android:drawableTint="?attr/colorOnSurfaceVariant"
+            android:gravity="center"
+            android:paddingStart="40dp"
+            android:paddingEnd="40dp"
+            android:text="还没有保存的地图\n\n跑一趟并保存后，地图会出现在这里"
+            android:textAppearance="?attr/textAppearanceBodyMedium"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:visibility="gone" />
 
-    <!-- 录制模式和上面的「选地图」是**两条不同的轴** —— 它不碰地图，直接进采集页。
-         所以隔开摆，不混进那个列表。 -->
-    <View
+        <ListView
+            android:id="@+id/mapList"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:divider="@null"
+            android:listSelector="@android:color/transparent"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="8dp"
+            android:scrollbars="none" />
+    </FrameLayout>
+
+    <!-- 录制模式和上面的「选地图」是两条不同的轴 —— 它不碰地图，直接进采集页。 -->
+    <com.google.android.material.divider.MaterialDivider
         android:layout_width="match_parent"
-        android:layout_height="1dp"
-        android:layout_marginTop="12dp"
-        android:background="#22000000" />
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginEnd="20dp" />
 
     <Button
         android:id="@+id/btnRecordMode"
+        style="@style/Widget.Material3.Button.TonalButton"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_height="52dp"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="14dp"
+        android:layout_marginEnd="20dp"
+        android:layout_marginBottom="20dp"
         android:text="录制模式"
-        android:textColor="#DE000000" />
+        android:textSize="15sp"
+        app:cornerRadius="16dp"
+        app:icon="@drawable/ic_record"
+        app:iconGravity="textStart"
+        app:iconSize="20dp"
+        app:iconTint="?attr/colorOnSecondaryContainer" />
 
 </LinearLayout>

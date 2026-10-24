@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Material 3 色板，种子为青色 #00696C。深色见 values-night/colors.xml。
+     Android 12+ 会由 DynamicColors 覆盖为壁纸取色，这里只作为低版本和系统动态色关闭时的兜底。 -->
+<resources>
+    <color name="md_primary">#00696C</color>
+    <color name="md_on_primary">#FFFFFF</color>
+    <color name="md_primary_container">#9CF1F4</color>
+    <color name="md_on_primary_container">#002021</color>
+
+    <color name="md_secondary">#4A6363</color>
+    <color name="md_on_secondary">#FFFFFF</color>
+    <color name="md_secondary_container">#CCE7E7</color>
+    <color name="md_on_secondary_container">#051F20</color>
+
+    <color name="md_tertiary">#4B607C</color>
+    <color name="md_on_tertiary">#FFFFFF</color>
+    <color name="md_tertiary_container">#D3E4FF</color>
+    <color name="md_on_tertiary_container">#041C35</color>
+
+    <color name="md_error">#BA1A1A</color>
+    <color name="md_on_error">#FFFFFF</color>
+    <color name="md_error_container">#FFDAD6</color>
+    <color name="md_on_error_container">#410002</color>
+
+    <color name="md_background">#F5FAFA</color>
+    <color name="md_on_background">#171D1D</color>
+    <color name="md_surface">#F5FAFA</color>
+    <color name="md_on_surface">#171D1D</color>
+    <color name="md_surface_variant">#DAE4E4</color>
+    <color name="md_on_surface_variant">#3F4949</color>
+    <color name="md_outline">#6F7979</color>
+    <color name="md_outline_variant">#BEC9C9</color>
+
+    <color name="md_surface_dim">#D5DBDB</color>
+    <color name="md_surface_bright">#F5FAFA</color>
+    <color name="md_surface_container_lowest">#FFFFFF</color>
+    <color name="md_surface_container_low">#EFF5F5</color>
+    <color name="md_surface_container">#E9EFEF</color>
+    <color name="md_surface_container_high">#E3E9E9</color>
+    <color name="md_surface_container_highest">#DDE4E4</color>
+</resources>
