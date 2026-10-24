@@ -1308,6 +1308,21 @@ int lastMerges(float* out, int cap) {
     return n;
 }
 
+long long trajectoryMapId() {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? -1 : sys->GetTrajectoryMapId();
+}
+
+int mapList(long long* ids, int* kfs, int* mps, int cap) {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 0 : sys->GetMapList(ids, kfs, mps, cap);
+}
+
+int mapCloud(long long mapId, float* out, int cap) {
+    ORB_SLAM3::System* sys = engine().sys.load();
+    return sys == nullptr ? 0 : sys->GetMapCloud(mapId, out, cap);
+}
+
 int displayTransforms(float* out, int cap) {
     if (out == nullptr || cap < 9) return 0;
     ORB_SLAM3::System* sys = engine().sys.load();

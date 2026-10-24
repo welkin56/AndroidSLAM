@@ -1434,6 +1434,71 @@ void System::GetAtlasStats(int* maps, int* kfs, int* mps)
     }
 }
 
+int System::GetMapList(long long* ids, int* kfs, int* mps, int cap)
+{
+    if (ids == nullptr || kfs == nullptr || mps == nullptr || cap <= 0 || mpAtlas == nullptr)
+        return 0;
+
+    // `GetAllMaps()` 已经按 id 排好序；只给**有关键帧**的图（空图没什么好看）。
+    int n = 0;
+    for (Map* pMap : mpAtlas->GetAllMaps())
+    {
+        if (pMap == nullptr)
+            continue;
+        if (n >= cap)
+            break;
+
+        const int nKF = static_cast<int>(pMap->KeyFramesInMap());
+        if (nKF <= 0)
+            continue;
+
+        ids[n] = static_cast<long long>(pMap->GetId());
+        kfs[n] = nKF;
+        mps[n] = static_cast<int>(pMap->MapPointsInMap());
+        ++n;
+    }
+    return n;
+}
+
+int System::GetMapCloud(long long mapId, float* out, int cap)
+{
+    if (out == nullptr || cap < 3 || mpAtlas == nullptr)
+        return 0;
+
+    Map* pTarget = nullptr;
+    for (Map* pMap : mpAtlas->GetAllMaps())
+    {
+        if (pMap != nullptr && static_cast<long long>(pMap->GetId()) == mapId)
+        {
+            pTarget = pMap;
+            break;
+        }
+    }
+    if (pTarget == nullptr)
+        return 0;
+
+    const std::vector<MapPoint*> vpMPs = pTarget->GetAllMapPoints();
+    const int maxPts = cap / 3;
+    if (maxPts <= 0 || vpMPs.empty())
+        return 0;
+
+    // 和 `slam_engine.cpp` 的点云快照同一个抽稀规则：stride 覆盖全程，不是截断。
+    const size_t stride = std::max<size_t>(1, (vpMPs.size() + maxPts - 1) / maxPts);
+    int n = 0;
+    for (size_t i = 0; i < vpMPs.size() && n < maxPts; i += stride)
+    {
+        MapPoint* pMP = vpMPs[i];
+        if (pMP == nullptr || pMP->isBad())
+            continue;
+        const Eigen::Vector3f w = pMP->GetWorldPos();
+        out[3 * n] = w.x();
+        out[3 * n + 1] = w.y();
+        out[3 * n + 2] = w.z();
+        ++n;
+    }
+    return n;
+}
+
 void System::SaveTrajectoryEuRoC(const string &filename, Map* pMap)
 {
 

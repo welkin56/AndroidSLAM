@@ -125,6 +125,24 @@ object SlamBridge {
      */
     external fun nativeAtlasStats(out: IntArray)
 
+    /**
+     * atlas 里**有关键帧**的图（按 id 升序）。三组出参一一对应，返回写了几张。
+     * 数组装不下就少给 —— 看到返回 == 数组长度就扩容重来（同 `nativeGetWaypoints`）。
+     */
+    external fun nativeMapList(ids: LongArray, kfs: IntArray, mps: IntArray): Int
+
+    /**
+     * **任意一张图**的点云（该图自己的坐标系）。`out` 收 `3n` 个 float，返回点数。
+     * **stride 抽稀到 `out.size / 3`**，不是截断。只在选图 / 刷新时调。
+     */
+    external fun nativeMapCloud(mapId: Long, out: FloatArray): Int
+
+    /**
+     * 当前轨迹**此刻**属于哪张图（-1 = 没有）。和 [nativeLastTrajMapId] 不同：
+     * 这个跑着的时候也是实时值，那个是 `stop()` 的快照。
+     */
+    external fun nativeTrajectoryMapId(): Long
+
     /** 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。 */
     external fun nativeFailureCode(): Int
 

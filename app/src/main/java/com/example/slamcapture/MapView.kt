@@ -9,6 +9,8 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.util.AttributeSet
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import kotlin.math.abs
 
@@ -103,6 +105,18 @@ class MapView @JvmOverloads constructor(
     private var cx = 0f
     private var cy = 0f
 
+    /**
+     * 查看器模式：`false` 时**不**跟当前位置改中心 / 切片，改由 `fitToBounds` 和拖动决定。
+     * 小地图保持 `true`，行为不变。
+     */
+    private var autoCenter = true
+
+    /** 查看器模式：连续 `mPerDp`（双指/按钮按比例缩放）；小地图仍走档位表。 */
+    private var continuousZoom = false
+
+    /** 全屏查看器：不画圆角底板/描边（那是画中画的样式）。 */
+    private var fullBleed = false
+
     /** 切片厚度（米，全宽）。抽屉里的滑块。 */
     private var sliceRange = SLICE_DEFAULT
 
@@ -116,6 +130,52 @@ class MapView @JvmOverloads constructor(
      * 上限在 C++ 那侧（`kMapPointsMax`），这儿不去写一个和它对着的魔法数字。
      */
     private var cloudScratch = FloatArray(0)
+
+    // ---------------- 查看器手势（拖动 / 双指缩放）----------------
+    //
+    // 只有 `autoCenter == false` 时消费触摸；小地图不接手势（点小窗等于点预览）。
+    // 不做双击、不做惯性 —— 拖动跟手就够了。
+
+    /** 上一次的拖动锚点（指针平均位置）。 */
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+
+    /** 本次算出来的指针平均位置，`lastTouch*` 的比较对象。 */
+    private var dragFocusX = 0f
+    private var dragFocusY = 0f
+
+    /** 捏合时上一次的焦点（`ScaleGestureDetector` 那侧的锚）。 */
+    private var lastFocusX = 0f
+    private var lastFocusY = 0f
+
+    private val scaleDetector = ScaleGestureDetector(context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                lastFocusX = detector.focusX
+                lastFocusY = detector.focusY
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val focusX = detector.focusX
+                val focusY = detector.focusY
+                val old = mPerDp
+                val next = (old / detector.scaleFactor)
+                    .coerceIn(ZOOM_M_PER_DP.first(), ZOOM_M_PER_DP.last())
+                val oldPpm = 1f / (old * density)
+                val newPpm = 1f / (next * density)
+                // 两指焦点下的世界点保持不动（焦点自己挪了就顺带平移）。
+                val wx = cx + (lastFocusX - width / 2f) / oldPpm
+                val wy = cy - (lastFocusY - height / 2f) / oldPpm
+                mPerDp = next
+                cx = wx - (focusX - width / 2f) / newPpm
+                cy = wy + (focusY - height / 2f) / newPpm
+                lastFocusX = focusX
+                lastFocusY = focusY
+                invalidate()
+                return true
+            }
+        })
 
     // ---------------- 画笔 ----------------
 
@@ -257,18 +317,144 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 放大一档（看到的世界变小）。到头了就什么也不做。 */
+    /** 放大一档（看到的世界变小）。到头了就什么也不做。连续模式下按 ×1.5。 */
     fun zoomIn() {
+        if (continuousZoom) {
+            mPerDp = (mPerDp / 1.5f).coerceAtLeast(ZOOM_M_PER_DP.first())
+            invalidate()
+            return
+        }
         if (zoomIdx == 0) return
         mPerDp = ZOOM_M_PER_DP[--zoomIdx]
         invalidate()
     }
 
-    /** 缩小一档（看到的世界变大）。到头了就什么也不做。 */
+    /** 缩小一档（看到的世界变大）。到头了就什么也不做。连续模式下按 ×1.5。 */
     fun zoomOut() {
+        if (continuousZoom) {
+            mPerDp = (mPerDp * 1.5f).coerceAtMost(ZOOM_M_PER_DP.last())
+            invalidate()
+            return
+        }
         if (zoomIdx >= ZOOM_M_PER_DP.size - 1) return
         mPerDp = ZOOM_M_PER_DP[++zoomIdx]
         invalidate()
+    }
+
+    /** 查看器模式：关掉「跟当前位置」。小地图保持默认的 true。 */
+    fun setAutoCenter(on: Boolean) {
+        autoCenter = on
+    }
+
+    /** 查看器模式：连续比例缩放（双指捏合 / 按钮 ×1.5）；小地图仍走档位表。 */
+    fun setContinuousZoom(on: Boolean) {
+        continuousZoom = on
+    }
+
+    /** 当前切片中心（世界 z）。查看器把它同步成小地图的值。 */
+    fun sliceCenter(): Float = zS
+
+    /** 查看器直接指定切片中心（不跟自己这侧的快照走）。 */
+    fun setSliceCenter(z: Float) {
+        zS = z
+        zReady = true
+        invalidate()
+    }
+
+    /**
+     * 把当前高度喂给切片中心的低通，返回低通后的值。
+     *
+     * 查看器开着时小地图不重绘（被盖住了），但「切片:高度」模式仍要跟着人走 ——
+     * 由查看器把 `poseBuf[14]` 喂进来，共用同一套 `Z_SNAP` / `Z_LOWPASS`。
+     */
+    fun trackSliceCenter(z: Float): Float {
+        updateSliceCenter(z)
+        return zS
+    }
+
+    /** 当前切片厚度（米，全宽）。打开查看器时继承。 */
+    fun sliceRange(): Float = sliceRange
+
+    /** 全屏查看器：跳过圆角底板和描边。 */
+    fun setFullBleed(on: Boolean) {
+        fullBleed = on
+    }
+
+    /**
+     * 把视图缩放到刚好装下这个世界包围盒（查看器选图 / 按「适应」时用）。
+     *
+     * 连续比例：`mPerDp` 直接算，不找档位；夹到档位表的首尾。留 10% 余量。
+     */
+    fun fitToBounds(minX: Float, minY: Float, maxX: Float, maxY: Float) {
+        if (width <= 0 || height <= 0) return
+        val w = (maxX - minX).coerceAtLeast(1e-3f)
+        val h = (maxY - minY).coerceAtLeast(1e-3f)
+        val need = maxOf(
+            w * 1.1f / (width / density),
+            h * 1.1f / (height / density)
+        )
+        mPerDp = need.coerceIn(ZOOM_M_PER_DP.first(), ZOOM_M_PER_DP.last())
+        cx = (minX + maxX) * 0.5f
+        cy = (minY + maxY) * 0.5f
+        invalidate()
+    }
+
+    /**
+     * 查看器的拖动 / 双指缩放。**小地图不消费触摸**（`autoCenter == true` 直接返回 false），
+     * 所以点小窗空白处仍然等于点预览。
+     */
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (autoCenter) return false
+
+        scaleDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // 手指数变了：锚点换成新的平均位置，免得跳一下。
+                updateDragFocus(event, -1)
+                lastTouchX = dragFocusX
+                lastTouchY = dragFocusY
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // ⚠️ 必须排除抬起的那根。抬起的是 index 0 时 getX(0) 是它自己的位置，
+                //    剩下那根一动，位移就从它算起 —— 整幅图瞬移过去。
+                updateDragFocus(event, event.actionIndex)
+                lastTouchX = dragFocusX
+                lastTouchY = dragFocusY
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!scaleDetector.isInProgress) {
+                    // 两指时跟中点：捏合开始那一刻探测器的锚也是焦点，两边对得上。
+                    updateDragFocus(event, -1)
+                    val dx = dragFocusX - lastTouchX
+                    val dy = dragFocusY - lastTouchY
+                    cx -= dx / pxPerMeter
+                    cy += dy / pxPerMeter
+                    lastTouchX = dragFocusX
+                    lastTouchY = dragFocusY
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> Unit
+        }
+        return true
+    }
+
+    /** 把当前指针的平均位置写进 `dragFocusX/Y`。`skip` = 要排除的指针下标（-1 全算）。 */
+    private fun updateDragFocus(event: MotionEvent, skip: Int) {
+        var sx = 0f
+        var sy = 0f
+        var n = 0
+        for (i in 0 until event.pointerCount) {
+            if (i == skip) continue
+            sx += event.getX(i)
+            sy += event.getY(i)
+            n++
+        }
+        if (n > 0) {
+            dragFocusX = sx / n
+            dragFocusY = sy / n
+        }
     }
 
     /** 当前缩放档位（`ZOOM_M_PER_DP` 的下标）。给持久化用。 */
@@ -337,10 +523,12 @@ class MapView @JvmOverloads constructor(
         super.onDraw(canvas)
         val s = snap ?: return
 
-        val r = 6f * density
-        bgRect.set(0f, 0f, width.toFloat(), height.toFloat())
-        canvas.drawRoundRect(bgRect, r, r, bgPaint)
-        canvas.drawRoundRect(bgRect, r, r, edgePaint)
+        if (!fullBleed) {
+            val r = 6f * density
+            bgRect.set(0f, 0f, width.toFloat(), height.toFloat())
+            canvas.drawRoundRect(bgRect, r, r, bgPaint)
+            canvas.drawRoundRect(bgRect, r, r, edgePaint)
+        }
 
         if (s.hint != null) {
             drawOutlinedText(canvas, s.hint, width / 2f, height / 2f + textPaint.textSize / 3f)
@@ -348,7 +536,8 @@ class MapView @JvmOverloads constructor(
         }
 
         // 中心跟着当前位置。没有位姿时**冻住上一次的**，别跳回原点。
-        if (s.hasCur) {
+        // 查看器（`autoCenter == false`）不跟：它由 fit / 拖动决定中心，切片中心由外部同步。
+        if (s.hasCur && autoCenter) {
             cx = s.curX
             cy = s.curY
             updateSliceCenter(s.curZ)

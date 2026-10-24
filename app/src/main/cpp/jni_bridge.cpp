@@ -6,6 +6,7 @@
 
 #include <android/log.h>
 
+#include <algorithm>
 #include <string>
 #include <cstring>
 #include <vector>
@@ -603,5 +604,60 @@ Java_com_example_slamcapture_SlamBridge_nativeReadTrajFile(
         return static_cast<jint>(n);
     } catch (...) {
         return 0;
+    }
+}
+
+// 三组出参一一对应；返回写了几张（只含 KF>0 的图）。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeMapList(
+    JNIEnv* env, jobject /*thiz*/, jlongArray ids, jintArray kfs, jintArray mps) {
+    try {
+        if (ids == nullptr || kfs == nullptr || mps == nullptr) return 0;
+        const jsize len = std::min(env->GetArrayLength(ids),
+                                   std::min(env->GetArrayLength(kfs), env->GetArrayLength(mps)));
+        if (len <= 0) return 0;
+
+        // `jlong` 在 Android 上是 `long`，引擎那边是 `long long`；转一次再回写。
+        std::vector<long long> idBuf(static_cast<size_t>(len));
+        std::vector<int> kfBuf(static_cast<size_t>(len));
+        std::vector<int> mpBuf(static_cast<size_t>(len));
+        const int n = slam::mapList(idBuf.data(), kfBuf.data(), mpBuf.data(),
+                                    static_cast<int>(len));
+        if (n <= 0) return 0;
+
+        std::vector<jlong> outIds(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) outIds[i] = static_cast<jlong>(idBuf[static_cast<size_t>(i)]);
+        env->SetLongArrayRegion(ids, 0, n, outIds.data());
+        env->SetIntArrayRegion(kfs, 0, n, kfBuf.data());
+        env->SetIntArrayRegion(mps, 0, n, mpBuf.data());
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// out 收 3n 个 float；返回点数。
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeMapCloud(
+    JNIEnv* env, jobject /*thiz*/, jlong mapId, jfloatArray out) {
+    try {
+        if (out == nullptr) return 0;
+        jfloat* o = env->GetFloatArrayElements(out, nullptr);
+        if (o == nullptr) return 0;
+        const int n = slam::mapCloud(static_cast<long long>(mapId), o,
+                                     env->GetArrayLength(out));
+        env->ReleaseFloatArrayElements(out, o, 0);
+        return static_cast<jint>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeTrajectoryMapId(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return static_cast<jlong>(slam::trajectoryMapId());
+    } catch (...) {
+        return -1;
     }
 }

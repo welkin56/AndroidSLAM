@@ -19,6 +19,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
@@ -101,6 +102,8 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_HISTORY = "historyOn"
         /** 逐条隐藏的历史轨迹：绝对路径集合。 */
         private const val PREF_HIST_HIDDEN = "historyHidden"
+        /** 查看器的切片中心：false = 跟小地图当前高度，true = 点云 z 中位数。 */
+        private const val PREF_VIEWER_SLICE = "viewerSliceMedian"
 
         /** 历史轨迹每条最多画这么多点（文件可能几万行，stride 抽稀）。 */
         private const val kHistoryMaxPts = 2000
@@ -399,6 +402,52 @@ class MainActivity : AppCompatActivity() {
     /** `map-<id>/traj-*.txt` + 那个文件夹到当前坐标系的累计变换（9 个 float）。 */
     private class TraceEntry(val file: File, val mapId: Long, val tf: FloatArray)
 
+    // ---------------- 地图查看器（全屏 2D）----------------
+
+    private lateinit var viewerWrap: FrameLayout
+    private lateinit var viewerMapView: MapView
+    private lateinit var tvViewerMap: TextView
+    private lateinit var btnViewerSlice: Button
+    private lateinit var btnMapViewer: Button
+    private lateinit var rowStatus: LinearLayout
+    private lateinit var rowBottom: LinearLayout
+
+    /** 查看器开着。ticker 靠它继续跑（停着 SLAM 也要刷列表/位姿）。 */
+    private var viewerOpen = false
+
+    /** 当前查看的图 id；-1 = 还没选。 */
+    private var viewerMapId = -1L
+
+    /** atlas 里 KF>0 的图。 */
+    private data class MapInfo(val id: Long, val kfs: Int, val mps: Int)
+    private var viewerMaps: List<MapInfo> = emptyList()
+
+    /** 每张图有几条已归档轨迹（标题/列表显示用）。 */
+    private var viewerTraceCounts: Map<Long, Int> = emptyMap()
+
+    /** 选中图的点云（3n，该图自己的坐标系），一次性快照。 */
+    private var viewerCloud = FloatArray(0)
+    private var viewerCloudN = 0
+    private val viewerCloudBuf = FloatArray(3 * kMapPointsMax)
+
+    /** 选中图的历史轨迹（每条 3n，单位变换 —— 文件本来就在这张图的系里）。 */
+    private var viewerTraces: List<FloatArray> = emptyList()
+    private val viewerTraceBuf = FloatArray(3 * kHistoryMaxPts)
+
+    /** 点云 z 的中位数（「切片:中位数」模式）。 */
+    private var viewerMedianZ = 0f
+
+    /** 切片中心模式：false = 小地图当前高度，true = 点云中位数。 */
+    private var viewerSliceMedian = false
+
+    /** 地图列表的复用缓冲（看到写满就扩容）。 */
+    private var viewerMapIds = LongArray(32)
+    private var viewerMapKfs = IntArray(32)
+    private var viewerMapMps = IntArray(32)
+
+    /** 上次刷新地图列表的时刻（每 ~2 秒一次）。 */
+    private var viewerListAt = 0L
+
     // ---------------- 生命周期 ----------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -422,6 +471,13 @@ class MainActivity : AppCompatActivity() {
         btnWpManage = findViewById(R.id.btnWpManage)
         swHistory = findViewById(R.id.swHistory)
         btnHistoryManage = findViewById(R.id.btnHistoryManage)
+        viewerWrap = findViewById(R.id.viewerWrap)
+        viewerMapView = findViewById(R.id.viewerMapView)
+        tvViewerMap = findViewById(R.id.tvViewerMap)
+        btnViewerSlice = findViewById(R.id.btnViewerSlice)
+        btnMapViewer = findViewById(R.id.btnMapViewer)
+        rowStatus = findViewById(R.id.rowStatus)
+        rowBottom = findViewById(R.id.rowBottom)
         drawer = findViewById(R.id.drawer)
         rowMeasure = findViewById(R.id.rowMeasure)
         btnAddPoint = findViewById(R.id.btnAddPoint)
@@ -542,6 +598,45 @@ class MainActivity : AppCompatActivity() {
             render()
         }
         btnHistoryManage.setOnClickListener { showHistoryManager() }
+
+        // 地图查看器：全屏第二块 MapView。它不跟当前位置，拖动/捏合自己管。
+        viewerMapView.setAutoCenter(false)
+        viewerMapView.setContinuousZoom(true)
+        viewerMapView.setFullBleed(true)
+        viewerSliceMedian = pref.getBoolean(PREF_VIEWER_SLICE, false)
+        updateViewerSliceLabel()
+        btnMapViewer.setOnClickListener {
+            drawer.closeDrawer(GravityCompat.END)
+            openMapViewer()
+        }
+        tvViewerMap.setOnClickListener { showMapListDialog() }
+        findViewById<Button>(R.id.btnViewerCurrent).setOnClickListener { jumpToCurrentMap() }
+        findViewById<Button>(R.id.btnViewerRefresh).setOnClickListener { reloadViewerMap() }
+        findViewById<Button>(R.id.btnViewerFit).setOnClickListener { fitViewer() }
+        findViewById<Button>(R.id.btnViewerClose).setOnClickListener { closeMapViewer() }
+        findViewById<Button>(R.id.btnViewerZoomIn).setOnClickListener { viewerMapView.zoomIn() }
+        findViewById<Button>(R.id.btnViewerZoomOut).setOnClickListener { viewerMapView.zoomOut() }
+        btnViewerSlice.setOnClickListener {
+            viewerSliceMedian = !viewerSliceMedian
+            pref.edit().putBoolean(PREF_VIEWER_SLICE, viewerSliceMedian).apply()
+            updateViewerSliceLabel()
+            applyViewerSlice()
+        }
+
+        // 查看器开着时 Back 先收起它；抽屉开着就先关抽屉（保持原来的手感）。
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    drawer.isDrawerOpen(GravityCompat.END) -> drawer.closeDrawer(GravityCompat.END)
+                    viewerOpen -> closeMapViewer()
+                    else -> {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                        isEnabled = true
+                    }
+                }
+            }
+        })
 
         // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
@@ -892,7 +987,7 @@ class MainActivity : AppCompatActivity() {
             // **最后一轮刷新被自己吃掉了。**
             render()
 
-            if (slamState == SLAM_LOADING || slamRunning || saving || restoring) {
+            if (slamState == SLAM_LOADING || slamRunning || saving || restoring || viewerOpen) {
                 uiHandler.postDelayed(this, TICK_MS)
             }
         }
@@ -1117,7 +1212,9 @@ class MainActivity : AppCompatActivity() {
         swMeasure.isEnabled = true
 
         // ---- 多点折线。**绑在测距开关上**：关着就整行消失 ----
-        rowMeasure.visibility = if (swMeasure.isChecked) View.VISIBLE else View.GONE
+        // 查看器全屏时这一行也要藏起来（render 每拍都会跑，不加这个闸会被它弹回来）。
+        rowMeasure.visibility =
+            if (!viewerOpen && swMeasure.isChecked) View.VISIBLE else View.GONE
         // 「加点」没有效读数时**灰着**。按了没反应，用户分不清是坏了还是没对准（STAGE6 §2.7）；
         // 灰着 + 十字旁边那句「对准有纹理的地方」已经说清为什么。
         btnAddPoint.isEnabled = swMeasure.isChecked && measureState.hasReading
@@ -1237,6 +1334,7 @@ class MainActivity : AppCompatActivity() {
             refreshMap()
             refreshWaypoints()
         }
+        if (viewerOpen) refreshMapViewer()
     }
 
     // ---------------- 路径点 ----------------
@@ -1251,36 +1349,64 @@ class MainActivity : AppCompatActivity() {
      * 只把**有效且在当前图**的交给 [MapView]：别的图在另一个坐标系里，画上去必然错位。
      */
     private fun refreshWaypoints() {
-        if (!swWaypoints.isChecked) {
+        // 小地图关着、查看器也没开：不用读。
+        if (!swWaypoints.isChecked && !viewerOpen) {
             mapView.clearWaypoints()
             return
         }
 
-        // 和 `readPinned` 一个契约：装不下就少给，看到写满就扩容重来。
+        // **开关关着但查看器开着时也要读** —— 查看器要用同一份列表，
+        // 它按 `meta.mapId` 筛自己那张图。读的代价只有几条。
+        readWaypointList()
+
+        if (!swWaypoints.isChecked) {
+            mapView.clearWaypoints()
+        } else {
+            // 小地图：只画「有效 + 在当前图」的；别的图在另一个坐标系里。
+            val xs = FloatArray(wpN * 2)
+            val ns = arrayOfNulls<String>(wpN)
+            var k = 0
+            for (i in 0 until wpN) {
+                val flags = wpMeta[i * 4 + 3]
+                if ((flags and kFlagWpValid) == 0L || (flags and kFlagWpCurrent) == 0L) continue
+                xs[k * 2] = wpPos[i * 3]
+                xs[k * 2 + 1] = wpPos[i * 3 + 1]
+                ns[k] = wpNames[i]
+                k++
+            }
+            mapView.setWaypoints(xs, k, ns)
+        }
+
+        // 查看器：画**选中那张图**里的有效路标点（不要求 current —— 历史图看的正是它自己）。
+        if (viewerOpen) {
+            val xs = FloatArray(wpN * 2)
+            val ns = arrayOfNulls<String>(wpN)
+            var k = 0
+            for (i in 0 until wpN) {
+                val flags = wpMeta[i * 4 + 3]
+                if ((flags and kFlagWpValid) == 0L) continue
+                if (wpMeta[i * 4 + 1] != viewerMapId) continue
+                xs[k * 2] = wpPos[i * 3]
+                xs[k * 2 + 1] = wpPos[i * 3 + 1]
+                ns[k] = wpNames[i]
+                k++
+            }
+            viewerMapView.setWaypoints(xs, k, ns)
+        }
+    }
+
+    /** 读一次路径点进 `wp*` 缓冲。装不下就扩容重读（和 `readPinned` 同一个契约）。 */
+    private fun readWaypointList() {
         while (true) {
             val n = SlamBridge.nativeGetWaypoints(wpPos, wpMeta, wpNames)
             if (n < wpPos.size / 3 && n < wpMeta.size / 4 && n < wpNames.size) {
                 wpN = n
-                break
+                return
             }
             wpPos = FloatArray(wpPos.size * 2)
             wpMeta = LongArray(wpMeta.size * 2)
             wpNames = arrayOfNulls(wpNames.size * 2)
         }
-
-        // 挑出「有效 + 在当前图」的，压成 `MapView` 要的那种扁平数组。
-        val xs = FloatArray(wpN * 2)
-        val ns = arrayOfNulls<String>(wpN)
-        var k = 0
-        for (i in 0 until wpN) {
-            val flags = wpMeta[i * 4 + 3]
-            if ((flags and kFlagWpValid) == 0L || (flags and kFlagWpCurrent) == 0L) continue
-            xs[k * 2] = wpPos[i * 3]
-            xs[k * 2 + 1] = wpPos[i * 3 + 1]
-            ns[k] = wpNames[i]
-            k++
-        }
-        mapView.setWaypoints(xs, k, ns)
     }
 
     /** 加路径点：先问名字，再发请求。**名字可以当场改**。 */
@@ -1387,7 +1513,8 @@ class MainActivity : AppCompatActivity() {
      * 藏起来时白付不起，见 [applyMapVisible]。
      */
     private fun refreshMap() {
-        if (mapWrap.visibility != View.VISIBLE) return
+        // 查看器盖住了小窗：不读、不画，省一倍锁和绘制。
+        if (mapWrap.visibility != View.VISIBLE || viewerOpen) return
 
         val n = SlamBridge.nativeGetTrajectory(trajBuf)
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
@@ -1568,6 +1695,356 @@ class MainActivity : AppCompatActivity() {
             ?.groupValues?.get(1)?.toInt() ?: -1
     } catch (e: Exception) {
         -1
+    }
+
+    // ---------------- 地图查看器 ----------------
+
+    private fun openMapViewer() {
+        if (viewerOpen) return
+        when {
+            restoring -> { viewerDialog("正在载入地图…"); return }
+            slamState == SLAM_IDLE -> {
+                viewerDialog("先点「准备 SLAM」，构造出 atlas 之后才能看地图。")
+                return
+            }
+            slamState == SLAM_LOADING -> {
+                viewerDialog("词库加载中（约 38 秒），等就绪后再看。")
+                return
+            }
+            slamState == SLAM_FAILED -> {
+                viewerDialog("SLAM 构造失败，没有可看的 atlas。")
+                return
+            }
+        }
+
+        viewerOpen = true
+        rowStatus.visibility = View.GONE
+        rowBottom.visibility = View.GONE
+        rowMeasure.visibility = View.GONE
+        viewerWrap.visibility = View.VISIBLE
+        viewerMapView.setSliceRange(seekToRange(sbMapRange.progress))
+        applyViewerSlice()
+        updateViewerSliceLabel()
+
+        refreshViewerList()
+        if (viewerMaps.isEmpty()) {
+            setViewerHint("atlas 里还没有图")
+            tvViewerMap.text = "地图 · atlas 里还没有图"
+        } else {
+            selectViewerMap(preferredViewerMapId())
+        }
+        viewerListAt = SystemClock.elapsedRealtime()
+        uiQueueTicker()
+        render()
+    }
+
+    private fun closeMapViewer() {
+        if (!viewerOpen) return
+        viewerOpen = false
+        viewerWrap.visibility = View.GONE
+        rowStatus.visibility = View.VISIBLE
+        rowBottom.visibility = View.VISIBLE
+        // `rowMeasure` 由 render 按「实时测距」开关恢复。
+        render()
+    }
+
+    /** 查看器开着时每拍调一次：刷新列表 / 位置 / 切片；点云只在选图/刷新时读。 */
+    private fun refreshMapViewer() {
+        if (restoring) {
+            setViewerHint("正在载入地图…")
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (now - viewerListAt >= 2000L) {
+            viewerListAt = now
+            refreshViewerList()
+        }
+
+        if (viewerMaps.isEmpty()) {
+            val msg = when (slamState) {
+                SLAM_IDLE -> "先准备 SLAM"
+                SLAM_LOADING -> "词库加载中…"
+                SLAM_FAILED -> "构造失败"
+                else -> "atlas 里还没有图"
+            }
+            setViewerHint(msg)
+            tvViewerMap.text = "地图 · $msg"
+            return
+        }
+
+        // 选中的图被合并/换图弄没了：切到当前图（没有就切到最大 id）。
+        if (viewerMaps.none { it.id == viewerMapId }) {
+            val id = preferredViewerMapId()
+            if (id >= 0) selectViewerMap(id)
+            return
+        }
+
+        val trajId = SlamBridge.nativeTrajectoryMapId()
+        val onCurrent = viewerMapId == trajId
+        val n = if (onCurrent) SlamBridge.nativeGetTrajectory(trajBuf) else 0
+        val trackingNow = slamRunning && poseValid && trkState == TRK_OK
+        val hasCur = onCurrent && trackingNow
+
+        // 高度模式：小地图被盖住不重绘，这里把当前高度喂给它那套低通；
+        // 看别的图时也照样跟着人走（「按小地图当前高度」的口径）。
+        val heightZ = if (trackingNow) mapView.trackSliceCenter(poseBuf[14])
+                      else mapView.sliceCenter()
+        viewerMapView.setSliceCenter(if (viewerSliceMedian) viewerMedianZ else heightZ)
+
+        var dx = 0f
+        var dy = 0f
+        if (hasCur) {
+            val fx = poseBuf[8]
+            val fy = poseBuf[9]
+            val len = Math.hypot(fx.toDouble(), fy.toDouble()).toFloat()
+            if (len > 1e-6f) {
+                dx = fx / len
+                dy = fy / len
+            }
+        }
+
+        val hasData = viewerCloudN > 0 || viewerTraces.isNotEmpty() || n > 0
+        val hint = if (hasData) null else "这张图没有可显示的数据"
+        viewerMapView.submit(MapView.Snapshot(
+            trajBuf, n,
+            if (hasCur) poseBuf[12] else 0f,
+            if (hasCur) poseBuf[13] else 0f,
+            if (hasCur) poseBuf[14] else 0f,
+            hasCur, hint, dx, dy,
+            viewerCloud, viewerCloudN))
+        updateViewerTitle(trajId)
+    }
+
+    /** 重读 atlas 的地图列表（每 ~2 秒一次）。 */
+    private fun refreshViewerList() {
+        if (restoring || slamState != SLAM_READY) {
+            if (viewerMaps.isNotEmpty()) {
+                viewerMaps = emptyList()
+                viewerTraceCounts = emptyMap()
+            }
+            return
+        }
+
+        // 看到写满就扩容重来 —— 和 `nativeGetWaypoints` 同一个契约。
+        var n: Int
+        while (true) {
+            n = SlamBridge.nativeMapList(viewerMapIds, viewerMapKfs, viewerMapMps)
+            if (n < viewerMapIds.size) break
+            viewerMapIds = LongArray(viewerMapIds.size * 2)
+            viewerMapKfs = IntArray(viewerMapKfs.size * 2)
+            viewerMapMps = IntArray(viewerMapMps.size * 2)
+        }
+
+        val list = ArrayList<MapInfo>(n)
+        for (i in 0 until n) {
+            list += MapInfo(viewerMapIds[i], viewerMapKfs[i], viewerMapMps[i])
+        }
+        val oldIds = viewerMaps.map { it.id }
+        viewerMaps = list
+        // 轨迹条数：每次刷新重算（目录里只有几个文件）。
+        viewerTraceCounts = list.associate { m ->
+            m.id to (sessionDir?.let { TrajectoryStore.tracesFor(it, m.id).size } ?: 0)
+        }
+        if (oldIds != list.map { it.id }) {
+            Log.i(TAG, "[VIEW] atlas 图列表：" + list.joinToString { "#${it.id}(${it.kfs}KF)" })
+        }
+    }
+
+    private fun preferredViewerMapId(): Long {
+        val traj = SlamBridge.nativeTrajectoryMapId()
+        return viewerMaps.firstOrNull { it.id == traj }?.id
+            ?: viewerMaps.lastOrNull()?.id
+            ?: -1L
+    }
+
+    private fun selectViewerMap(id: Long) {
+        if (!viewerOpen) return
+        viewerMapId = id
+        loadViewerCloud(id)
+        loadViewerTraces(id)
+        viewerMapView.setHistory(viewerTraces)
+        // 路标点也先刷一遍：下面的 fit 要用新图的点算 bbox。
+        refreshWaypoints()
+        applyViewerSlice()
+        updateViewerTitle(SlamBridge.nativeTrajectoryMapId())
+        // 刚切过去可能还没布局完（width=0），等一拍再 fit。
+        viewerMapView.post {
+            if (viewerOpen && viewerMapId == id) fitViewer()
+        }
+    }
+
+    private fun loadViewerCloud(id: Long) {
+        val t0 = SystemClock.elapsedRealtime()
+        val n = SlamBridge.nativeMapCloud(id, viewerCloudBuf)
+        viewerCloudN = n
+        viewerCloud = if (n > 0) viewerCloudBuf.copyOf(n * 3) else FloatArray(0)
+        viewerMedianZ = medianZ(viewerCloud, viewerCloudN)
+        val dt = SystemClock.elapsedRealtime() - t0
+        Log.i(TAG, "[VIEW] 图 #$id 点云 $n 点，${dt}ms")
+        if (dt > 20) Log.w(TAG, "[VIEW] 点云枚举花了 ${dt}ms（主线程）")
+    }
+
+    /** 读这张图自己的轨迹：`map-<id>/` 里的文件本来就在这张图的系里，用单位变换。 */
+    private fun loadViewerTraces(id: Long) {
+        val session = sessionDir
+        val list = ArrayList<FloatArray>()
+        if (session != null) {
+            for (f in TrajectoryStore.tracesFor(session, id)) {
+                val n = SlamBridge.nativeReadTrajFile(
+                    f.absolutePath,
+                    1f, 0f, 0f, 0f, 1f,
+                    0f, 0f, 0f,
+                    viewerTraceBuf)
+                if (n > 0) list += viewerTraceBuf.copyOf(n * 3)
+            }
+        }
+        viewerTraces = list
+    }
+
+    private fun medianZ(pts: FloatArray, n: Int): Float {
+        if (n <= 0) return 0f
+        val z = FloatArray(n)
+        for (i in 0 until n) z[i] = pts[i * 3 + 2]
+        z.sort()
+        return z[n / 2]
+    }
+
+    /** 把选中图缩放到刚好装下：点云 + 轨迹 + 路标点（+ 当前位置，如果就在这张图上）。 */
+    private fun fitViewer() {
+        if (!viewerOpen) return
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        var any = false
+
+        fun add(x: Float, y: Float) {
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+            any = true
+        }
+
+        val c = viewerCloud
+        for (i in 0 until viewerCloudN) add(c[3 * i], c[3 * i + 1])
+        for (t in viewerTraces) {
+            for (i in 0 until t.size / 3) add(t[3 * i], t[3 * i + 1])
+        }
+        for (i in 0 until wpN) {
+            val flags = wpMeta[i * 4 + 3]
+            if ((flags and kFlagWpValid) == 0L) continue
+            if (wpMeta[i * 4 + 1] != viewerMapId) continue
+            add(wpPos[i * 3], wpPos[i * 3 + 1])
+        }
+        val trajId = SlamBridge.nativeTrajectoryMapId()
+        if (viewerMapId == trajId && slamRunning && poseValid) add(poseBuf[12], poseBuf[13])
+
+        if (any) viewerMapView.fitToBounds(minX, minY, maxX, maxY)
+        else viewerMapView.fitToBounds(-5f, -5f, 5f, 5f)
+    }
+
+    private fun showMapListDialog() {
+        if (restoring) {
+            viewerDialog("正在载入地图…")
+            return
+        }
+        refreshViewerList()
+        if (viewerMaps.isEmpty()) {
+            viewerDialog("atlas 里还没有图")
+            return
+        }
+
+        val trajId = SlamBridge.nativeTrajectoryMapId()
+        val labels = viewerMaps.map { m ->
+            val tag = when {
+                m.id == trajId && slamRunning -> " · 当前"
+                m.id == trajId -> " · 上次"
+                else -> ""
+            }
+            "图 #${m.id} · ${m.kfs} KF · ${m.mps} 点 · " +
+                "${viewerTraceCounts[m.id] ?: 0} 条轨迹$tag"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("查看哪张图")
+            .setItems(labels) { _, which -> selectViewerMap(viewerMaps[which].id) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun jumpToCurrentMap() {
+        if (restoring) {
+            viewerDialog("正在载入地图…")
+            return
+        }
+        val id = SlamBridge.nativeTrajectoryMapId()
+        if (id < 0) {
+            viewerDialog("现在没有当前图")
+            return
+        }
+        refreshViewerList()
+        if (viewerMaps.none { it.id == id }) {
+            viewerDialog("当前图 #$id 还没有关键帧")
+            return
+        }
+        selectViewerMap(id)
+    }
+
+    /** 「刷新」：重读列表和选中图的点云/轨迹，但不动当前的平移/缩放。 */
+    private fun reloadViewerMap() {
+        if (!viewerOpen || viewerMapId < 0) return
+        if (restoring) {
+            viewerDialog("正在载入地图…")
+            return
+        }
+        refreshViewerList()
+        if (viewerMaps.none { it.id == viewerMapId }) {
+            val id = preferredViewerMapId()
+            if (id >= 0) selectViewerMap(id)
+            return
+        }
+        loadViewerCloud(viewerMapId)
+        loadViewerTraces(viewerMapId)
+        viewerMapView.setHistory(viewerTraces)
+        applyViewerSlice()
+        updateViewerTitle(SlamBridge.nativeTrajectoryMapId())
+    }
+
+    private fun updateViewerTitle(trajId: Long) {
+        val m = viewerMaps.firstOrNull { it.id == viewerMapId }
+        if (m == null) {
+            tvViewerMap.text = "地图"
+            return
+        }
+        val tag = when {
+            m.id == trajId && slamRunning -> " · 当前位置"
+            m.id == trajId -> " · 上次位置"
+            trajId >= 0 -> " · 当前位姿在图 #$trajId"
+            else -> ""
+        }
+        tvViewerMap.text = "图 #${m.id} · ${m.kfs} KF · ${m.mps} 点 · " +
+            "${viewerTraceCounts[m.id] ?: 0} 条轨迹$tag"
+    }
+
+    private fun updateViewerSliceLabel() {
+        btnViewerSlice.text = if (viewerSliceMedian) "切片:中位数" else "切片:高度"
+    }
+
+    /** 非每拍场景（打开 / 切图 / 切模式）：按当前模式把切片中心同步给查看器。 */
+    private fun applyViewerSlice() {
+        viewerMapView.setSliceCenter(
+            if (viewerSliceMedian) viewerMedianZ else mapView.sliceCenter())
+    }
+
+    private fun setViewerHint(msg: String) {
+        viewerMapView.submit(MapView.Snapshot(
+            FloatArray(0), 0, 0f, 0f, 0f, false, msg, 0f, 0f, FloatArray(0), 0))
+    }
+
+    private fun viewerDialog(msg: String) {
+        AlertDialog.Builder(this).setMessage(msg).setPositiveButton("好", null).show()
     }
 
     // ---------------- 小地图的开关和切片厚度 ----------------

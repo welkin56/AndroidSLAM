@@ -252,6 +252,26 @@ long long lastTrajMapId();
 int lastMerges(float* out, int cap);
 
 /**
+ * 当前轨迹**此刻**属于哪张图（**主线程调**）。-1 = 没有。
+ *
+ * 和 [lastTrajMapId] 的区别：这个是实时值，跑着的时候也能问（拿 `mMutexTraj`）；
+ * 那个是 `stop()` 的快照。地图查看器用它判「当前位置画在哪张图上」。
+ */
+long long trajectoryMapId();
+
+/**
+ * atlas 里有关键帧的图（**主线程调**，按 id 升序）。三条出参一一对应，返回写了几张。
+ * 0 关键帧的空图不返回。
+ */
+int mapList(long long* ids, int* kfs, int* mps, int cap);
+
+/**
+ * 任意一张图的点云（**主线程调**），该图自己的坐标系。
+ * `out` 收 `3n` 个 float，stride 抽稀到 `cap/3` 点。只在选图/刷新时调。
+ */
+int mapCloud(long long mapId, float* out, int cap);
+
+/**
  * 界面显示用的「文件夹 id → 当前坐标系」变换（**主线程调**）。
  *
  * 每条 9 个 float：`id s qx qy qz qw tx ty tz`，**第一条固定是 displayMapId**。

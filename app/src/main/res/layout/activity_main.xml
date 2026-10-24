@@ -21,6 +21,7 @@
         android:orientation="vertical">
 
         <LinearLayout
+            android:id="@+id/rowStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal">
@@ -111,6 +112,128 @@
                         android:textSize="16sp" />
                 </LinearLayout>
             </FrameLayout>
+
+            <!-- 地图查看器：全屏的 2D 地图（默认藏）。
+                 一张图一个坐标系 —— 一次只看一张，切图用顶部的地图列表。
+                 地图上支持单指拖动、双指捏合；不做双击。 -->
+            <FrameLayout
+                android:id="@+id/viewerWrap"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#FF101418"
+                android:visibility="gone">
+
+                <com.example.slamcapture.MapView
+                    android:id="@+id/viewerMapView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="top"
+                    android:background="#CC000000"
+                    android:orientation="vertical"
+                    android:padding="6dp">
+
+                    <TextView
+                        android:id="@+id/tvViewerMap"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:padding="4dp"
+                        android:text="地图"
+                        android:textColor="#FFFFFFFF"
+                        android:textSize="15sp"
+                        android:textStyle="bold" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <Button
+                            android:id="@+id/btnViewerCurrent"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:minWidth="0dp"
+                            android:text="当前"
+                            android:textColor="#FFFFFFFF" />
+
+                        <Button
+                            android:id="@+id/btnViewerRefresh"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:minWidth="0dp"
+                            android:text="刷新"
+                            android:textColor="#FFFFFFFF" />
+
+                        <Button
+                            android:id="@+id/btnViewerFit"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:minWidth="0dp"
+                            android:text="适应"
+                            android:textColor="#FFFFFFFF" />
+
+                        <Button
+                            android:id="@+id/btnViewerSlice"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:minWidth="0dp"
+                            android:text="切片:高度"
+                            android:textColor="#FFFFFFFF"
+                            android:textSize="12sp" />
+
+                        <Button
+                            android:id="@+id/btnViewerClose"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:minWidth="0dp"
+                            android:text="关闭"
+                            android:textColor="#FFFFFFFF" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="bottom|end"
+                    android:layout_margin="10dp"
+                    android:orientation="vertical">
+
+                    <Button
+                        android:id="@+id/btnViewerZoomIn"
+                        android:layout_width="44dp"
+                        android:layout_height="38dp"
+                        android:layout_marginBottom="4dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        android:text="+"
+                        android:textColor="#FFFFFFFF"
+                        android:textSize="16sp" />
+
+                    <Button
+                        android:id="@+id/btnViewerZoomOut"
+                        android:layout_width="44dp"
+                        android:layout_height="38dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        android:text="−"
+                        android:textColor="#FFFFFFFF"
+                        android:textSize="16sp" />
+                </LinearLayout>
+            </FrameLayout>
         </FrameLayout>
 
         <!-- 多点折线测距。**绑死在「实时测距」开关上** —— 关着就 GONE。
@@ -167,6 +290,7 @@
 
         <!-- 放最下面，好按。 -->
         <LinearLayout
+            android:id="@+id/rowBottom"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -184,14 +308,19 @@
     </LinearLayout>
 
     <!-- 抽屉：从右边出来。
-         ⚠️ 先只有一条占位 —— 空抽屉比一个灰按钮更让人困惑（点开了什么都没有）。 -->
-    <LinearLayout
+         条目多了，包一层 ScrollView —— 小屏上「地图查看」在底部也要够得着。 -->
+    <ScrollView
         android:layout_width="240dp"
         android:layout_height="match_parent"
         android:layout_gravity="end"
-        android:orientation="vertical"
         android:background="#FFFFFF"
-        android:padding="16dp">
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
 
         <TextView
             android:layout_width="match_parent"
@@ -302,6 +431,24 @@
             android:text="管理历史轨迹"
             android:textColor="@color/measure_button_text" />
 
-    </LinearLayout>
+        <!-- 地图查看器：全屏 2D 地图，atlas 里有几张图就能切几遍（一张图一个坐标系）。 -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#22000000" />
+
+        <Button
+            android:id="@+id/btnMapViewer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:text="地图查看"
+            android:textColor="@color/measure_button_text" />
+
+        </LinearLayout>
+
+    </ScrollView>
 
 </androidx.drawerlayout.widget.DrawerLayout>

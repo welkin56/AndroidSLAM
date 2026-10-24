@@ -167,6 +167,20 @@ public:
     void GetAtlasStats(int* maps, int* kfs, int* mps);
 
     /**
+     * add：atlas 里**有关键帧**的图（按 id 升序）。三条出参一一对应，返回实际写了几张。
+     * 给 2D 地图查看器的选图列表用；0 关键帧的空图不返回。
+     */
+    int GetMapList(long long* ids, int* kfs, int* mps, int cap);
+
+    /**
+     * add：**任意一张图**的点云（该图自己的坐标系），stride 抽稀到 `cap/3` 个点，
+     * 写 `3n` 个 `x y z`。找不到这张图返回 0。
+     *
+     * 会拿 `mMutexMap` 拷一份指针表 —— 只给「选图 / 刷新」这种低频动作调，别每帧调。
+     */
+    int GetMapCloud(long long mapId, float* out, int cap);
+
+    /**
      * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
      *
      * `cap` = `out` 能装多少 float ⟹ 最多写 `cap/8` 个点。
