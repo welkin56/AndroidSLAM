@@ -24,13 +24,12 @@ namespace ORB_SLAM3
 
 MapDrawer::MapDrawer(Atlas* pAtlas, const string &/*strSettingPath*/, Settings* /*settings*/):mpAtlas(pAtlas)
 {
-    // 原版在这里解析 yaml 的 Viewer 段：关键帧大小、点大小、视点位置……全是 Pangolin 的绘图参数。
+    // 原版在此读取 Viewer 绘图参数，安卓上不再需要。
 }
 
 void MapDrawer::SetCurrentCameraPose(const Sophus::SE3f &/*Tcw*/)
 {
-    // 原版把 Tcw.inverse() 锁进 mCameraPose，供 Viewer 取出来画相机位置。
-    // 没有 Viewer 之后这个值没人读，于是连求逆和加锁都省掉 —— 它在 Tracking 里是每帧都调的。
+    // 原版在此保存相机位姿供 Viewer 使用；没有 Viewer 后无需计算。
 }
 
 } //namespace ORB_SLAM

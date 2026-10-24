@@ -34,8 +34,7 @@
 #include <set>
 #include <limits>
 
-// 改自上游：原本在 MSVC 和其他编译器之间二选一，非 MSVC 走 <tr1/unordered_map>。
-// TR1 是 C++11 之前的 GCC 专有头，libc++（安卓 NDK）里没有 —— 改用 C++11 标准库的。
+// 修改自上游：统一使用 C++11 的 <unordered_map>，不再使用 TR1 头文件。
 #include <unordered_map>
 
 namespace g2o {

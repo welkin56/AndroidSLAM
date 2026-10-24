@@ -1,4 +1,4 @@
-// 见 md5.h。教科书版 MD5，没做任何优化 —— 它只在存/载地图时被调一次。
+// 见 md5.h。标准 MD5 实现，未做优化；只在存/载地图时调用。
 #include "md5.h"
 
 #include <string.h>
@@ -94,7 +94,7 @@ extern "C" int MD5_Update(MD5_CTX *c, const void *data, size_t len) {
 }
 
 extern "C" int MD5_Final(unsigned char *md, MD5_CTX *c) {
-    const uint64_t bits = c->len * 8;   // 先记下来：下面补位会继续动 c->len
+    const uint64_t bits = c->len * 8;   // 先记下 bit 数，下面补位会继续修改 c->len
 
     const uint8_t one = 0x80;
     MD5_Update(c, &one, 1);

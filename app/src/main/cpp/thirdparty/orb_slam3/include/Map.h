@@ -95,8 +95,8 @@ public:
 
     KeyFrame* GetOriginKF();
 
-    // add：本图里 mnId 最大的关键帧。**只在图集合里找** —— 排队等 LocalMapping 的 KF
-    // 会被 `LocalMapping::Release()` delete，拿它做锚点会悬空。
+    // add：返回本图 mnId 最大的关键帧，只搜索已加入图的关键帧。
+    // LocalMapping 队列中的关键帧可能被 Release() 删除。
     KeyFrame* GetLatestKeyFrame();
 
     void SetCurrentMap();
@@ -136,7 +136,7 @@ public:
     void PreSave(std::set<GeometricCamera*> &spCams);
     void PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc/*, map<long unsigned int, KeyFrame*>& mpKeyFrameId*/, map<unsigned int, GeometricCamera*> &mpCams);
 
-    /** add：载入前自检 —— 这张图的备份引用是不是都落在自己身上。 */
+    /** add：载入前自检：本图的备份引用必须都落在本图内。 */
     bool CheckBackupConsistency();
 
     void printReprojectionError(list<KeyFrame*> &lpLocalWindowKFs, KeyFrame* mpCurrentKF, string &name, string &name_folder);
@@ -194,7 +194,7 @@ protected:
 
 
     // View of the map in aerial sight (for the AtlasViewer)
-    unsigned char* mThumbnail;   // 原为 GLubyte*：定义来自 pangolin 带进来的 GL 头，剥掉之后没了
+    unsigned char* mThumbnail;   // 原为 GLubyte*，该类型来自已移除的 Pangolin 头文件
 
     bool mIsInUse;
     bool mHasTumbnail;

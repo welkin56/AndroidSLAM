@@ -193,7 +193,7 @@ void MapPoint::EraseObservation(KeyFrame* pKF)
 
             if(mpRefKF==pKF)
             {
-                // 擦到空的时候 `begin()` 就是 `end()`，解引用它是未定义行为。
+                // 容器为空时 begin() 等于 end()，不能解引用。
                 mpRefKF = mObservations.empty()
                         ? static_cast<KeyFrame*>(NULL)
                         : mObservations.begin()->first;
@@ -587,9 +587,8 @@ void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
     mBackupObservationsId1.clear();
     mBackupObservationsId2.clear();
     // Save the id and position in each KF who view it
-    // ⚠️ 不能边遍历 `mObservations` 边 `EraseObservation()` —— erase 会让当前迭代器失效，
-    //    下一次 `++it` 就是 use-after-free（真机崩在 `__tree_next_iter`）。
-    //    先把要删的挑出来，循环结束再删。
+    // 不能在遍历 mObservations 时调用 EraseObservation()，否则迭代器失效。
+    // 先收集待删除项，循环结束后统一删除。
     vector<KeyFrame*> vpStale;
     for(std::map<KeyFrame*,std::tuple<int,int> >::const_iterator it = mObservations.begin(), end = mObservations.end(); it != end; ++it)
     {
@@ -608,8 +607,7 @@ void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
         EraseObservation(pKFi);
 
     // Save the id of the reference KF
-    // ⚠️ 先归零：参考帧不在 `spKF` 里时，旧值可能是**构造时的垃圾**（这个字段的构造函数
-    //    原先没初始化），写进文件后载入时就是一个不存在的 id。
+    // 先设为 -1：参考帧不在 spKF 中时，避免把未初始化的值写入文件。
     mBackupRefKFId = static_cast<long unsigned int>(-1);
     if(mpRefKF && spKF.find(mpRefKF) != spKF.end())
     {
@@ -648,7 +646,7 @@ void MapPoint::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsi
     mBackupObservationsId1.clear();
     mBackupObservationsId2.clear();
 
-    // 自检应该已经挡住了；万一没有，至少给一个活着的观测帧，别留 null。
+    // 自检通常已拦住这种情况；这里兜底选一个有效观测帧，避免保留空指针。
     if(!mpRefKF && !mObservations.empty())
         mpRefKF = mObservations.begin()->first;
 }

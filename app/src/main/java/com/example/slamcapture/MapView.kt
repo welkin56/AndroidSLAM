@@ -15,22 +15,15 @@ import android.view.View
 import kotlin.math.abs
 
 /**
- * 2D 地图**画中画**：浮在预览右上角的小窗，画**地图点云的一层横切** + 走过的轨迹
- * （白色是本趟、蓝色是这张图以前各趟）+ 当前位置。
+ * 2D 地图画中画：显示地图点云的一层横切、轨迹（白色为本次，蓝色为此前各次）
+ * 以及当前位置。
  *
- * 坐标系：**世界 XY 平面俯视**（Mono-Inertial 重力对齐 ⟹ **Z 是竖直**，所以地面就是 XY）。
- * 屏幕 x 取世界 x、屏幕 y 取世界 **-y**（屏幕 y 向下）。
+ * 坐标系为世界 XY 平面俯视；Mono-Inertial 下 Z 是竖直方向，屏幕 y 取世界 -y。
  *
- * ------------------------------------------------------------------
- * ⚠️ **比例固定，只有按 `+` / `−` 才变**（[zoomIdx]），中心跟着当前位置。
- *    不做自动 fit：那会让画面每帧自己缩放/平移，看着像「它为什么突然放大了」；
- *    而且地图点里几个远处的离群点就能把 bbox 撑爆、把轨迹压成一小团。
- * ------------------------------------------------------------------
- * ⚠️ **world→view 的变换只有 [worldToView] 一处** —— 和 [PreviewView.toScreen] 同一条纪律。
- *    散在多处的话，点会互相错位，而看起来像「SLAM 不准」。
- * ------------------------------------------------------------------
+ * 比例只在按 + / - 时改变，中心跟随当前位置，不做自动 fit。
+ * 世界到视图的变换只在 [worldToView] 中实现。
  *
- * 线程：**全在主线程**。[submit] 由 ticker 调，[onDraw] 由系统调。快照不可变、整引用交换。
+ * 所有方法在主线程调用，快照不可变、整体替换引用。
  */
 class MapView @JvmOverloads constructor(
     context: Context,
@@ -38,22 +31,19 @@ class MapView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     /**
-     * 一刻的画面内容。**不可变**，主线程整体换引用。
-     *
-     * `traj` / `pts` 都是**自己的一份拷贝**（调用方的缓冲下一拍就复用），提交完之后
-     * 那边随便改不影响这儿。
-     *
-     * `hint` 非空时只显示那句话（没东西可画）—— **不能沉默**，空窗也要说清为什么空。
+     * 一帧的画面内容，不可变，整体替换引用。
+     * traj 和 pts 各自复制一份，调用方的缓冲之后修改不会影响这里。
+     * hint 非空时只显示提示文字。
      */
     class Snapshot(traj: FloatArray, val trajN: Int,
                    val curX: Float, val curY: Float, val curZ: Float, val hasCur: Boolean,
                    val hint: String?,
                    val dirX: Float = 0f, val dirY: Float = 0f,
                    pts: FloatArray = EMPTY, val ptsN: Int = 0) {
-        /** 自己留一份 —— 调用方那个缓冲下一拍就复用了。 */
+        /** 保留一份拷贝，调用方的缓冲之后会复用。 */
         val traj: FloatArray = traj.copyOf()
 
-        /** 同上，但**只拷用到的部分**（容量由 C++ 那侧的上限决定，实际常只有几千）。 */
+        /** 只复制实际使用的部分。 */
         val pts: FloatArray = if (ptsN > 0) pts.copyOf(ptsN * 3) else EMPTY
     }
 
@@ -61,90 +51,80 @@ class MapView @JvmOverloads constructor(
         private val EMPTY = FloatArray(0)
 
         /**
-         * 缩放档位，**米 / dp**（相邻约 ×1.5）。乘 `density` 才是米 / 像素。
-         *
-         * 一头一尾就是放大 / 缩小的底线：140dp 的小窗从**约 0.25 m** 一直看到 **140 m**。
-         * 最里那几档是给「凑近看墙角 / 看轨迹拐弯」用的 —— 那里点云会很稀，那是稀疏地图的本相。
+         * 缩放档位，单位米/dp（相邻约 1.5 倍）；乘以 density 得到米/像素。
+         * 首尾分别为放大和缩小的下限。
          */
         private val ZOOM_M_PER_DP = listOf(
             0.0018f, 0.0027f, 0.004f, 0.006f, 0.009f, 0.013f, 0.02f, 0.03f,
             0.05f, 0.075f, 0.1f, 0.15f, 0.25f, 0.4f, 0.65f, 1.0f)
 
-        /** 默认档 = `0.1 m/dp`（一屏约 14 m，室内正好）。**从表里找**，免得改表时下标对不上。 */
+        /** 默认档 0.1 m/dp；从表中查下标，避免改表后错位。 */
         private val ZOOM_DEFAULT = ZOOM_M_PER_DP.indexOf(0.1f)
 
-        /** 切片厚度的范围（**全宽**，米）。抽屉里那个滑块。 */
+        /** 切片厚度范围（全宽，米）。 */
         const val SLICE_MIN = 0.2f
         const val SLICE_MAX = 4.0f
         const val SLICE_DEFAULT = 1.0f
 
-        /** 切片中心的高度变化超过这么多，就**直接对齐**而不是慢慢滑（起步/重置/重定位）。 */
+        /** 切片中心高度变化超过此值时直接对齐，不进行平滑。 */
         private const val Z_SNAP = 1.5f
 
-        /** 切片中心的低通系数（每拍挪剩余的 15%，4Hz 下 τ ≈ 1.6 s）。 */
+        /** 切片中心低通系数，每次移动剩余偏差的 15%。 */
         private const val Z_LOWPASS = 0.15f
     }
 
-    /** 当前显示的快照。主线程写、主线程读。 */
+    /** 当前快照，主线程读写。 */
     @Volatile
     private var snap: Snapshot? = null
 
     private val density = resources.displayMetrics.density
 
-    // ---------------- 视图状态（**不随快照走**）----------------
+    // ---------------- 视图状态，不随快照变化 ----------------
 
     private var zoomIdx = ZOOM_DEFAULT
 
-    /** 一个 dp 是多少米。**比例的唯一来源**。 */
+    /** 每 dp 对应的米数，是比例的唯一来源。 */
     private var mPerDp = ZOOM_M_PER_DP[zoomIdx]
 
-    /** 一个世界米是多少像素。**唯一的变换参数之一**。 */
+    /** 每世界米对应的像素数。 */
     private val pxPerMeter: Float get() = 1f / (mPerDp * density)
 
-    /** 视图中心（世界坐标）。**跟着当前位置走**；没有位姿时冻结。 */
+    /** 视图中心的世界坐标；跟随当前位置，无位姿时冻结。 */
     private var cx = 0f
     private var cy = 0f
 
-    /**
-     * 查看器模式：`false` 时**不**跟当前位置改中心 / 切片，改由 `fitToBounds` 和拖动决定。
-     * 小地图保持 `true`，行为不变。
-     */
+    /** 查看器模式：false 时不跟随当前位置，改由 fitToBounds 和拖动决定。 */
     private var autoCenter = true
 
-    /** 查看器模式：连续 `mPerDp`（双指/按钮按比例缩放）；小地图仍走档位表。 */
+    /** 查看器模式：使用连续缩放；小地图仍使用档位表。 */
     private var continuousZoom = false
 
-    /** 全屏查看器：不画圆角底板/描边（那是画中画的样式）。 */
+    /** 全屏查看器：不绘制圆角底板和描边。 */
     private var fullBleed = false
 
-    /** 切片厚度（米，全宽）。抽屉里的滑块。 */
+    /** 切片厚度（米，全宽）。 */
     private var sliceRange = SLICE_DEFAULT
 
-    /** 切片中心的**低通**结果（世界 z）。⚠️ 不用当前高度直接当中心 —— 手抖会让
-     *  切片边缘的点反复进出，一片点在那儿闪。 */
+    /** 切片中心的低通结果（世界 z），避免手抖导致边缘点反复进出。 */
     private var zS = 0f
     private var zReady = false
 
-    /**
-     * 点云画布缓冲（每点两个屏幕坐标），复用。**按需要长大** ——
-     * 上限在 C++ 那侧（`kMapPointsMax`），这儿不去写一个和它对着的魔法数字。
-     */
+    /** 点云画布缓冲，每点两个屏幕坐标；按需要增长。 */
     private var cloudScratch = FloatArray(0)
 
-    // ---------------- 查看器手势（拖动 / 双指缩放）----------------
+    // ---------------- 查看器手势：拖动和双指缩放 ----------------
     //
-    // 只有 `autoCenter == false` 时消费触摸；小地图不接手势（点小窗等于点预览）。
-    // 不做双击、不做惯性 —— 拖动跟手就够了。
+    // 只有 autoCenter 为 false 时消费触摸；小地图不接收手势。
 
-    /** 上一次的拖动锚点（指针平均位置）。 */
+    /** 上一次拖动的锚点（指针平均位置）。 */
     private var lastTouchX = 0f
     private var lastTouchY = 0f
 
-    /** 本次算出来的指针平均位置，`lastTouch*` 的比较对象。 */
+    /** 本次计算出的指针平均位置，与 lastTouch 比较。 */
     private var dragFocusX = 0f
     private var dragFocusY = 0f
 
-    /** 捏合时上一次的焦点（`ScaleGestureDetector` 那侧的锚）。 */
+    /** 捏合过程中上一次的焦点。 */
     private var lastFocusX = 0f
     private var lastFocusY = 0f
 
@@ -164,7 +144,7 @@ class MapView @JvmOverloads constructor(
                     .coerceIn(ZOOM_M_PER_DP.first(), ZOOM_M_PER_DP.last())
                 val oldPpm = 1f / (old * density)
                 val newPpm = 1f / (next * density)
-                // 两指焦点下的世界点保持不动（焦点自己挪了就顺带平移）。
+                // 保持两指焦点下的世界点不动；焦点移动时同时平移。
                 val wx = cx + (lastFocusX - width / 2f) / oldPpm
                 val wy = cy - (lastFocusY - height / 2f) / oldPpm
                 mPerDp = next
@@ -180,8 +160,8 @@ class MapView @JvmOverloads constructor(
     // ---------------- 画笔 ----------------
 
     /**
-     * 点云。**单色** —— 白给了轨迹、琥珀给了当前位置、青给了测量，点云要第四个色。
-     * `drawPoints` 拿 `strokeWidth` 当点的直径，`Cap.ROUND` 才是圆点（默认 BUTT 是方块）。
+     * 点云画笔，使用单一颜色。
+     * drawPoints 以 strokeWidth 作为点直径，需要 Cap.ROUND 才是圆点。
      */
     private val cloudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -190,7 +170,7 @@ class MapView @JvmOverloads constructor(
         color = 0xB0CFD8DC.toInt()
     }
 
-    /** 轨迹线。**不用青色** —— 那是测量那边标记/折线的颜色，同屏会混。 */
+    /** 轨迹线。避免使用青色，以免与测量折线混淆。 */
     private val trajPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
@@ -199,7 +179,7 @@ class MapView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
     }
 
-    /** 历史轨迹：蓝色、比实时那条细，压在白线下面。 */
+    /** 历史轨迹：蓝色，比实时轨迹细。 */
     private val histPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.4f * density
@@ -208,7 +188,7 @@ class MapView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
     }
 
-    /** 当前位置：琥珀实心 + 白描边（琥珀 = 「系统标的那个点」，和十字旁边的吸附圈一个语系）。 */
+    /** 当前位置：琥珀色实心加白色描边。 */
     private val curFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = 0xFFFFC107.toInt()
@@ -224,7 +204,7 @@ class MapView @JvmOverloads constructor(
         color = 0x66000000
     }
 
-    /** 路径点。**绿色** —— 和点云/轨迹/当前位置/测量都不同色。 */
+    /** 路径点，绿色。 */
     private val wpFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = 0xFF66BB6A.toInt()
@@ -246,7 +226,7 @@ class MapView @JvmOverloads constructor(
         color = 0x33FFFFFF
     }
 
-    /** 提示文字。和小窗一样宽，所以字号压到能塞下几个汉字。 */
+    /** 提示文字画笔。 */
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textSize = 12f * resources.displayMetrics.scaledDensity
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -257,28 +237,26 @@ class MapView @JvmOverloads constructor(
     private val path = Path()
     private val pt = PointF()
 
-    // ---------------- 路径点（**独立于 Snapshot**）----------------
+    // ---------------- 路径点，独立于 Snapshot ----------------
     //
-    // 4 Hz 的快照每拍都重造，路径点却是「偶尔变一次」—— 所以单独一组字段，
-    // 由 revision 驱动：[setWaypoints] 只在真的变了的时候被调。
-    /** 世界坐标 `x y`（每点两个）。 */
+    // 快照每帧重建，路径点只是偶尔变化，因此单独保存，由 revision 驱动更新。
+
+    /** 世界坐标 x y，每点两个。 */
     private var wpXY = FloatArray(0)
     private var wpName = arrayOfNulls<String>(0)
     private var wpN = 0
 
     // ---------------- 外部命令（主线程）----------------
 
-    /** 换一帧内容。**主线程**。 */
+    /** 替换一帧内容，主线程。 */
     fun submit(s: Snapshot) {
         snap = s
         invalidate()
     }
 
     /**
-     * 换一组路径点（**主线程**）。`xy` 每点两个世界坐标，`names[i]` 是第 i 个的名字。
-     *
-     * 只放**有效且在当前图**的那些 —— 别的图在另一个坐标系里，画上去必然错位。
-     * 调用方按 revision 判断要不要重建，所以这里不做比较。
+     * 替换路径点，主线程调用。xy 每点两个世界坐标，names[i] 是第 i 个的名字。
+     * 只传入有效且位于当前图的点；调用方按 revision 决定何时重建。
      */
     fun setWaypoints(xy: FloatArray, n: Int, names: Array<String?>) {
         if (wpXY.size < n * 2) wpXY = FloatArray(n * 2)
@@ -289,35 +267,34 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 清空路径点图层（**主线程**）。关掉显示开关时用。 */
+    /** 清空路径点图层，主线程调用。 */
     fun clearWaypoints() {
         if (wpN == 0) return
         wpN = 0
         invalidate()
     }
 
-    // ---------------- 历史轨迹（**独立于 Snapshot**）----------------
+    // ---------------- 历史轨迹，独立于 Snapshot ----------------
     //
-    // 同一张图以前各趟的轨迹，已经从磁盘读成**当前图坐标系**里的世界坐标。
-    // 只在换了一组文件 / 变换时才调，每拍只是重画。
+    // 同一张图此前各趟的轨迹，已换算到当前图坐标系。
 
-    /** 每条 `3n` 个 float（world x y z）。调用方每次新建数组，这里直接持有。 */
+    /** 每条轨迹 3n 个 float（世界坐标 x y z），由本视图持有。 */
     private var hist: List<FloatArray> = emptyList()
 
-    /** 换一组历史轨迹（**主线程**）。数组归本视图所有，调用方之后别再改。 */
+    /** 替换历史轨迹，主线程调用。数组归本视图所有。 */
     fun setHistory(traces: List<FloatArray>) {
         hist = traces
         invalidate()
     }
 
-    /** 清空历史轨迹层（**主线程**）。关掉开关 / 没有可画的时用。 */
+    /** 清空历史轨迹层，主线程调用。 */
     fun clearHistory() {
         if (hist.isEmpty()) return
         hist = emptyList()
         invalidate()
     }
 
-    /** 放大一档（看到的世界变小）。到头了就什么也不做。连续模式下按 ×1.5。 */
+    /** 放大一档；连续模式下按 1.5 倍。 */
     fun zoomIn() {
         if (continuousZoom) {
             mPerDp = (mPerDp / 1.5f).coerceAtLeast(ZOOM_M_PER_DP.first())
@@ -329,7 +306,7 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 缩小一档（看到的世界变大）。到头了就什么也不做。连续模式下按 ×1.5。 */
+    /** 缩小一档；连续模式下按 1.5 倍。 */
     fun zoomOut() {
         if (continuousZoom) {
             mPerDp = (mPerDp * 1.5f).coerceAtMost(ZOOM_M_PER_DP.last())
@@ -341,38 +318,33 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 查看器模式：关掉「跟当前位置」。小地图保持默认的 true。 */
+    /** 查看器模式：关闭跟随当前位置。 */
     fun setAutoCenter(on: Boolean) {
         autoCenter = on
     }
 
-    /** 查看器模式：连续比例缩放（双指捏合 / 按钮 ×1.5）；小地图仍走档位表。 */
+    /** 查看器模式：启用连续缩放。 */
     fun setContinuousZoom(on: Boolean) {
         continuousZoom = on
     }
 
-    /** 当前切片中心（世界 z）。查看器把它同步成小地图的值。 */
+    /** 当前切片中心的世界 z。 */
     fun sliceCenter(): Float = zS
 
-    /** 查看器直接指定切片中心（不跟自己这侧的快照走）。 */
+    /** 由查看器直接指定切片中心。 */
     fun setSliceCenter(z: Float) {
         zS = z
         zReady = true
         invalidate()
     }
 
-    /**
-     * 把当前高度喂给切片中心的低通，返回低通后的值。
-     *
-     * 查看器开着时小地图不重绘（被盖住了），但「切片:高度」模式仍要跟着人走 ——
-     * 由查看器把 `poseBuf[14]` 喂进来，共用同一套 `Z_SNAP` / `Z_LOWPASS`。
-     */
+    /** 将当前高度送入切片中心低通，返回低通后的值。 */
     fun trackSliceCenter(z: Float): Float {
         updateSliceCenter(z)
         return zS
     }
 
-    /** 当前切片厚度（米，全宽）。打开查看器时继承。 */
+    /** 当前切片厚度（米，全宽）。 */
     fun sliceRange(): Float = sliceRange
 
     /** 全屏查看器：跳过圆角底板和描边。 */
@@ -381,9 +353,8 @@ class MapView @JvmOverloads constructor(
     }
 
     /**
-     * 把视图缩放到刚好装下这个世界包围盒（查看器选图 / 按「适应」时用）。
-     *
-     * 连续比例：`mPerDp` 直接算，不找档位；夹到档位表的首尾。留 10% 余量。
+     * 缩放视图以装下指定世界包围盒，并保留 10% 余量。
+     * 使用连续比例，结果限制在档位表范围内。
      */
     fun fitToBounds(minX: Float, minY: Float, maxX: Float, maxY: Float) {
         if (width <= 0 || height <= 0) return
@@ -400,8 +371,8 @@ class MapView @JvmOverloads constructor(
     }
 
     /**
-     * 查看器的拖动 / 双指缩放。**小地图不消费触摸**（`autoCenter == true` 直接返回 false），
-     * 所以点小窗空白处仍然等于点预览。
+     * 查看器的拖动和双指缩放。
+     * 小地图（autoCenter 为 true）不消费触摸。
      */
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (autoCenter) return false
@@ -410,21 +381,20 @@ class MapView @JvmOverloads constructor(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // 手指数变了：锚点换成新的平均位置，免得跳一下。
+                // 手指数变化时更新锚点，避免画面跳动。
                 updateDragFocus(event, -1)
                 lastTouchX = dragFocusX
                 lastTouchY = dragFocusY
             }
             MotionEvent.ACTION_POINTER_UP -> {
-                // ⚠️ 必须排除抬起的那根。抬起的是 index 0 时 getX(0) 是它自己的位置，
-                //    剩下那根一动，位移就从它算起 —— 整幅图瞬移过去。
+                // 必须排除抬起的手指，否则位移会从错误位置计算。
                 updateDragFocus(event, event.actionIndex)
                 lastTouchX = dragFocusX
                 lastTouchY = dragFocusY
             }
             MotionEvent.ACTION_MOVE -> {
                 if (!scaleDetector.isInProgress) {
-                    // 两指时跟中点：捏合开始那一刻探测器的锚也是焦点，两边对得上。
+                    // 双指时跟随中点，与 ScaleGestureDetector 的焦点一致。
                     updateDragFocus(event, -1)
                     val dx = dragFocusX - lastTouchX
                     val dy = dragFocusY - lastTouchY
@@ -440,7 +410,7 @@ class MapView @JvmOverloads constructor(
         return true
     }
 
-    /** 把当前指针的平均位置写进 `dragFocusX/Y`。`skip` = 要排除的指针下标（-1 全算）。 */
+    /** 将当前指针平均位置写入 dragFocusX/Y；skip 为要排除的指针下标，-1 表示全部参与。 */
     private fun updateDragFocus(event: MotionEvent, skip: Int) {
         var sx = 0f
         var sy = 0f
@@ -457,10 +427,10 @@ class MapView @JvmOverloads constructor(
         }
     }
 
-    /** 当前缩放档位（`ZOOM_M_PER_DP` 的下标）。给持久化用。 */
+    /** 当前缩放档位下标，用于持久化。 */
     fun zoomIndex(): Int = zoomIdx
 
-    /** 恢复缩放档位。**越界的直接忽略**（`-1` = 还没存过）。 */
+    /** 恢复缩放档位；越界值（如 -1）忽略。 */
     fun setZoomIndex(i: Int) {
         if (i < 0 || i >= ZOOM_M_PER_DP.size || i == zoomIdx) return
         zoomIdx = i
@@ -468,7 +438,7 @@ class MapView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 切片厚度（**米，全宽**）。抽屉那个滑块调它，值已经被那边夹过，这儿再夹一次兜底。 */
+    /** 设置切片厚度（米，全宽），越界值会被夹取。 */
     fun setSliceRange(m: Float) {
         sliceRange = m.coerceIn(SLICE_MIN, SLICE_MAX)
         invalidate()
@@ -477,15 +447,14 @@ class MapView @JvmOverloads constructor(
     // ---------------- 画 ----------------
 
     /**
-     * 世界 → 小窗内的屏幕坐标。**唯一的变换**。
-     *
-     * 屏幕 y 向下、世界 y 向上 ⟹ 第二项取负号。
+     * 世界坐标到视图屏幕坐标的唯一变换。
+     * 屏幕 y 向下、世界 y 向上，因此第二项取负号。
      */
     private fun worldToView(x: Float, y: Float, out: PointF) {
         out.set(width / 2f + (x - cx) * pxPerMeter, height / 2f - (y - cy) * pxPerMeter)
     }
 
-    /** 推进切片中心。⚠️ 大跳变（起步/重置/重定位换了世界系）**直接对齐**，不然会一路滑过来。 */
+    /** 推进切片中心；大跳变时直接对齐，避免缓慢滑动。 */
     private fun updateSliceCenter(z: Float) {
         if (!zReady || abs(z - zS) > Z_SNAP) zS = z
         else zS += (z - zS) * Z_LOWPASS
@@ -493,14 +462,12 @@ class MapView @JvmOverloads constructor(
     }
 
     /**
-     * 点云：**只画当前高度附近这一带**，于是画面上剩下的就是墙和家具的横切轮廓。
-     *
-     * 一遍过 —— 同层且在窗口内的点直接转屏幕坐标写进 scratch，最后一次 `drawPoints`。
-     * 切片是单色的，所以**不需要按颜色分桶**。
+     * 只绘制当前高度附近的点，形成墙和家具的横切轮廓。
+     * 单次遍历写入 scratch，最后统一 drawPoints。
      */
     private fun drawCloud(canvas: Canvas, s: Snapshot) {
         if (s.ptsN <= 0) return
-        // 按这次的点数长，长过就不再缩 ⟹ 稳定之后零分配。装得下所有点，写的时候不用再判越界。
+        // 按需增长，之后不再缩小，稳定后零分配。
         if (cloudScratch.size < s.ptsN * 2) cloudScratch = FloatArray(s.ptsN * 2)
 
         val lo = zS - sliceRange * 0.5f
@@ -535,8 +502,8 @@ class MapView @JvmOverloads constructor(
             return
         }
 
-        // 中心跟着当前位置。没有位姿时**冻住上一次的**，别跳回原点。
-        // 查看器（`autoCenter == false`）不跟：它由 fit / 拖动决定中心，切片中心由外部同步。
+        // 中心跟随当前位置，无位姿时保持上一次的值。
+        // 查看器不跟随，由 fit 和拖动决定中心。
         if (s.hasCur && autoCenter) {
             cx = s.curX
             cy = s.curY
@@ -546,8 +513,7 @@ class MapView @JvmOverloads constructor(
         drawCloud(canvas, s)
         drawHistory(canvas)
 
-        // ⚠️ `Path` 是**累积**的 —— 不 reset 的话每一帧都往里再加一条折线，
-        //    画面上会越描越粗、而且旧轨迹永远擦不掉。
+        // Path 会累积，必须 reset，否则每帧都会重复添加轨迹。
         path.reset()
         if (s.trajN >= 2) {
             for (i in 0 until s.trajN) {
@@ -557,20 +523,19 @@ class MapView @JvmOverloads constructor(
             canvas.drawPath(path, trajPaint)
         }
 
-        // 路径点画在轨迹之后、当前位置之前 —— 「我在哪」永远压最上层。
+        // 路径点在轨迹之后、当前位置之前绘制。
         drawWaypoints(canvas)
 
         if (s.hasCur) {
             worldToView(s.curX, s.curY, pt)
-            // 朝向三角：贴在点外面，尖端指相机光轴在地面上的投影方向。
-            // (0,0) 只在**真的正下方**出现（那时方位角无定义）⟹ 不画。
-            // ⚠️ 屏幕 y 向下、世界 y 向上 ⟹ 第二项取负，和 [worldToView] 同一个约定。
+            // 朝向三角：尖端指向相机光轴在地面上的投影方向。
+            // (0,0) 表示正下方，此时不画；屏幕 y 与世界 y 方向相反。
             if (s.dirX != 0f || s.dirY != 0f) {
                 val sx = s.dirX
                 val sy = -s.dirY
                 val tip = 10f * density
                 val half = 4.5f * density
-                path.reset()   // 复用轨迹那条 —— 轨迹已经画完了，reset 掉再用
+                path.reset()   // 复用轨迹的 Path
                 path.moveTo(pt.x + sx * tip, pt.y + sy * tip)
                 path.lineTo(pt.x - sy * half, pt.y + sx * half)
                 path.lineTo(pt.x + sy * half, pt.y - sx * half)
@@ -583,10 +548,7 @@ class MapView @JvmOverloads constructor(
         }
     }
 
-    /**
-     * 历史轨迹：所有条共用一个 `Path`（每条一个子路径），一次画完。
-     * 和实时轨迹一样只取 XY —— 小窗是**世界俯视**。
-     */
+    /** 历史轨迹共用一个 Path，每条一个子路径，只取 XY。 */
     private fun drawHistory(canvas: Canvas) {
         if (hist.isEmpty()) return
         path.reset()
@@ -603,12 +565,7 @@ class MapView @JvmOverloads constructor(
         if (any) canvas.drawPath(path, histPaint)
     }
 
-    /**
-     * 路径点：绿色菱形 + 名字。
-     *
-     * 只画视口里的 —— 缩小到最外那档时，地图外的点全画一遍没意义。
-     * 名字放不下（互相压）时不画文字，菱形本身还在。
-     */
+    /** 绘制路径点：绿色菱形和名字，只绘制视口内的点。 */
     private fun drawWaypoints(canvas: Canvas) {
         if (wpN <= 0) return
         val half = 3.2f * density
@@ -632,7 +589,7 @@ class MapView @JvmOverloads constructor(
         }
     }
 
-    /** 黑描边 + 白填充画两遍 —— 亮暗背景上都看得清。同 [PreviewView] 那套。 */
+    /** 黑描边加白填充，保证亮暗背景都可见。 */
     private fun drawOutlinedText(canvas: Canvas, text: String, x: Float, y: Float,
                                  paint: Paint = textPaint) {
         val oldStyle = paint.style

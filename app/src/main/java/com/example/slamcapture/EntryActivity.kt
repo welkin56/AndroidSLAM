@@ -15,15 +15,11 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 入口页：选定「地图从哪来」，然后进主界面。
+ * 入口页：选择地图来源后进入主界面。
  *
- * **这一页只记选择，不加载任何东西**（APP_DESIGN §2.1）—— 词袋、atlas、相机一个都不碰，
- * 所以它可以瞬间返回、改主意。真正的载图发生在第一次「启动 SLAM」，
- * 因为 `LoadAtlas` 在 `System` 的构造函数里，构造就发生在启动那一刻（§2.2）。
- *
- * 启动主界面时**不 finish()** —— Back 要能回到这儿改主意。
- *
- * 选中的东西一路传到 [SlamBridge.nativeInit] 的第三个参数（`null` = 新建地图）。
+ * 这一页只记录选择，不加载词袋、atlas 或相机。真正载图发生在第一次启动 SLAM 时。
+ * 启动主界面时不 finish()，以便按返回键回来重新选择。
+ * 选择结果传给 [SlamBridge.nativeInit] 的第三个参数，null 表示新建地图。
  */
 class EntryActivity : AppCompatActivity() {
 
@@ -44,22 +40,18 @@ class EntryActivity : AppCompatActivity() {
             open(null)
         }
 
-        // 录制模式和「选地图」是两条不同的轴：它不碰地图，直接进采集页。
-        // 两个模式互斥（各开各的相机），见 APP_DESIGN §6 / §7.1。
+        // 录制模式不涉及地图，直接进入采集页；两个模式各开各的相机。
         findViewById<Button>(R.id.btnRecordMode).setOnClickListener {
             Log.i(TAG, "进录制模式")
             startActivity(Intent(this, CaptureActivity::class.java))
         }
 
-        // 列表不在这儿扫 —— 见 onStart 的注释。onStart 在 onCreate 之后必定会跑。
+        // 列表在 onStart 中扫描。
     }
 
     /**
-     * 扫列表**放在这里而不是 [onCreate]**。
-     *
-     * 因为启主界面时**不 `finish()`**（Back 要能回来），这个 Activity 只会被 stop、
-     * 不会被销毁 —— 于是 `onCreate` **只跑一次**，从主界面退回来时列表是**陈旧的**。
-     * 将来存了一张图再退回来，新图不会出现。放 `onStart` 就没这个问题。
+     * 列表在每次回到本页时重扫。
+     * 启动主界面时不 finish()，本 Activity 只会被 stop，onCreate 不会再次执行。
      */
     override fun onStart() {
         super.onStart()
@@ -87,16 +79,10 @@ class EntryActivity : AppCompatActivity() {
     }
 
     /**
-     * 扫 [mapsDir] 下的 `.osa`。目录不存在（一次都没存过）时 `listFiles` 返回 null。
+     * 扫描 maps/<图目录>/<名字>.osa。
      *
-     * ⚠️ 这里**只能显示文件层面的东西**（名字、时间）。「这张图有多少关键帧」显示不了 ——
-     * 那要新增 JNI 查询接口，而 STAGE5 §6 的接口表里没有。
-     */
-    /**
-     * 扫 `maps/<图目录>/<名字>.osa`。
-     *
-     * 一张地图一个目录：里面还住着这张图的 `run-N/`（轨迹）。一个目录里可能有多份
-     * `.osa` —— 每次「另存」都新写一份，不覆盖。
+     * 一张地图对应一个目录，其中还包含该图的轨迹。一个目录里可能有多份 .osa，
+     * 每次另存都会新写一份，不覆盖。只能显示文件层面的信息（名字、时间）。
      */
     private fun listMaps(): List<File> {
         val dirs = mapsDir().listFiles { f -> f.isDirectory } ?: return emptyList()
@@ -111,13 +97,12 @@ class EntryActivity : AppCompatActivity() {
         val when_ = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(f.lastModified()))
         val dir = f.parentFile?.name ?: ""
         val base = f.name.removeSuffix(EXT)
-        // 一个目录里有多份 .osa 时才把文件名也显出来，不然和目录名重复。
+        // 目录里有多个 .osa 时才显示文件名，否则文件名与目录名重复。
         return if (base == dir) "$dir\n$when_" else "$dir / $base\n$when_"
     }
 
     /**
-     * @param mapFile 已保存地图的绝对路径；**null = 新建地图**。
-     *   「新建」和「载入旧图」是同一个参数的两个取值，不是两种模式（APP_DESIGN §2.4）。
+     * @param mapFile 已保存地图的绝对路径；null 表示新建地图。
      */
     private fun open(mapFile: String?) {
         startActivity(

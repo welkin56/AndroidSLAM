@@ -1833,8 +1833,7 @@ void LoopClosing::MergeLocal2()
         float s_on = mSold_new.scale();
         Sophus::SE3f T_on(mSold_new.rotation().cast<float>(), mSold_new.translation().cast<float>());
 
-        // 合并前后的身份：之后 frame 会变（`ApplyScaledRotation` 把当前图搬到对方的系里），
-        // 而 map id 不变。这一行是排查「轨迹属于哪个坐标系」的唯一线索。
+        // 记录合并前后的图 id 和规模；ApplyScaledRotation 会改变坐标系但保留 map id。
         cout << "[MAP] 合并：图 " << pCurrentMap->GetId() << "（KF " << pCurrentMap->KeyFramesInMap()
              << "）→ 图 " << pMergeMap->GetId() << "（KF " << pMergeMap->KeyFramesInMap()
              << "），scale " << s_on << endl;
@@ -1855,8 +1854,7 @@ void LoopClosing::MergeLocal2()
         mpAtlas->GetCurrentMap()->ApplyScaledRotation(T_on,s_on,bScaleVel);
         mpTracker->UpdateFrameIMU(s_on,mpCurrentKF->GetImuBias(),mpTracker->GetLastKeyFrame());
 
-        // 磁盘上的轨迹跟着坐标系走：存图成功后按这条链重组文件夹。
-        // 放在变换**之后**：显示侧一看到链就会去变换文件夹，那时 map 必须已经搬完。
+        // 记录合并变换，供磁盘轨迹重组使用；必须在 ApplyScaledRotation 之后记录。
         mpAtlas->RecordMerge(pCurrentMap->GetId(), pMergeMap->GetId(), T_on, s_on);
 
         std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
@@ -2255,9 +2253,7 @@ void LoopClosing::ResetIfRequested()
         mbResetRequested=false;
         mbResetActiveMapRequested = false;
 
-        // 地图整个换了 ⟹ 半途的候选缓存指向的 KF 已经不在任何活着的图里。
-        // 不清这几个计数，下一个 KF 会走 `mnLoopNumCoincidences > 0` 那条分支，
-        // 拿旧 KF 的位姿去算 Sim3。
+        // 地图已更换，候选缓存中的关键帧不再有效，这些计数必须清零。
         mnLoopNumCoincidences = 0;
         mnMergeNumCoincidences = 0;
         mnLoopNumNotFound = 0;

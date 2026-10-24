@@ -205,9 +205,8 @@ KeyFrame* Map::GetLatestKeyFrame()
 {
     unique_lock<mutex> lock(mMutexMap);
     KeyFrame* pLatest = static_cast<KeyFrame*>(NULL);
-    // 这里 **不能** 调 `pKF->isBad()`：它拿 `mMutexConnections`，而 `SetBadFlag()`
-    // 是 `mMutexConnections → mMutexMap`（锁内调 `EraseKeyFrame`）⟹ 锁序反转。
-    // 也不需要：被标坏时那个 KF 已经从 `mspKeyFrames` 里移除了。
+    // 不能调用 pKF->isBad()：它会获取 mMutexConnections，导致锁序反转。
+    // 被标记为坏的关键帧已经从此容器中移除，无需再检查。
     for(set<KeyFrame*>::iterator sit = mspKeyFrames.begin(), send = mspKeyFrames.end(); sit != send; ++sit)
     {
         KeyFrame* pKF = *sit;
@@ -397,9 +396,7 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
         }
     }
 
-    // ⚠️ 过滤集只放**真的会写进文件**的 KF（`mvpBackupKeyFrames` 跳过 isBad 的）。
-    //    直接用 `mspKeyFrames` 的话，万一里面还留着一个坏帧，保存下来的连接 id
-    //    就指向一个不存在的帧 —— 载入时 `PostLoad` 往连接表里塞 nullptr，下一句就崩。
+    // 过滤集只包含会写入文件的关键帧。若保留坏帧，保存的连接 id 会指向不存在的帧。
     std::set<KeyFrame*> spKFs;
     for(KeyFrame* pKFi : mspKeyFrames)
         if(pKFi && !pKFi->isBad())
@@ -462,7 +459,7 @@ bool Map::CheckBackupConsistency()
         if (!pMP)
             continue;
         const long unsigned int id = pMP->GetBackupRefKFId();
-        // `-1` = 存的时候就没有参考帧（`PostLoad` 会退到第一个观测帧）。
+        // -1 表示保存时没有参考帧，PostLoad 会退到第一个观测帧。
         if (id != static_cast<long unsigned int>(-1) && sIds.find(id) == sIds.end())
             return false;
     }

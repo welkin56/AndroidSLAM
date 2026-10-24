@@ -20,29 +20,16 @@ import java.io.File
 import java.util.concurrent.Executors
 
 /**
- * 编排层。它**拥有**「什么时候开始落盘」这个判断，因为那是跨模块的：
- * 相机稳不稳、IMU 出没出数，两个模块各自只报告自己的事实，答案只能在这里合。
+ * 编排层：判断何时开始落盘。相机是否稳定、IMU 是否出数由各模块报告，在这里汇总。
  *
- * ------------------------------------------------------------------
  * 状态机：
  *
- *     IDLE ──[开始准备]──► ARMED ⇄ RECORDING
- *       ▲                   │
- *       └───[取消准备]───────┘
+ *     IDLE --[开始准备]--> ARMED <-> RECORDING
+ *       ^                   |
+ *       +---[取消准备]-------+
  *
- * **「准备」是两条线的开关**：[beginPrepare] 注册 IMU 并打开相机（含对焦初始化），
- * [teardown] 两样都关掉。IDLE 时两样硬件都不占。代价是「取消准备 → 开始准备」要
- * 重付约 3.3 s 的传感器冷启动——接受，因为那是偶发路径，而常见路径上的每一次
- * 「停止录制」都不额外付任何东西。
- *
- * **「停止录制」回 ARMED 而不是 IDLE**：标定是「同一套机位连着录好几段」。回到
- * ARMED 意味着下一段按下就是录（相机还开着、对焦还锁着、IMU 还热着）。这正是
- * 「此时仍在采集 imu 和相机，只是不进行记录」。
- * ------------------------------------------------------------------
- *
- * 门控的策略**不是定时器，是用户**。「等多久就不等了」从 `postDelayed` 变成了
- * 「按下那个红色按钮」，所以这里再没有超时任务，[camGaveUp]/[imuGaveUp] 只在主线程、
- * 按钮回调里置位一次。
+ * beginPrepare 注册 IMU 并打开相机，teardown 关闭两者。停止录制后回到 ARMED，
+ * 相机、对焦和 IMU 保持就绪，下一段可以直接开始。
  */
 class CaptureActivity : AppCompatActivity() {
 
@@ -50,11 +37,8 @@ class CaptureActivity : AppCompatActivity() {
         const val TAG = "CaptureActivity"
 
         /**
-         * 开始录制后先白等这么久再落帧：让 IMU 先写进去一小段。
-         *
-         * **这是"IMU 领先相机"的全部保证**——相机帧在这之前一律丢弃，所以不管 IMU
-         * 什么时候开始写，它都领先。对比的是 `Image.getTimestamp()`（曝光起始时刻），
-         * 和 `SensorEvent.timestamp` 是同一个 CLOCK_BOOTTIME 基准，不需要任何换算。
+         * 开始录制后延迟这么久再落相机帧，让 IMU 先写入一段。
+         * 时间戳与 SensorEvent.timestamp 使用同一个 CLOCK_BOOTTIME 基准。
          */
         const val PREROLL_NS = 300_000_000L
 
@@ -65,10 +49,7 @@ class CaptureActivity : AppCompatActivity() {
         private val RED = Color.parseColor("#C62828")
         private val GREEN = Color.parseColor("#2E7D32")
 
-        /**
-         * 中性态（backgroundTintList = null → 白底）的按钮文字。
-         * 主题默认给按钮的是白字，白底上直接看不见——文字色必须和背景一起推出来。
-         */
+        /** 中性态（白底）下的按钮文字颜色。 */
         private val DARK_TEXT = Color.parseColor("#DE000000")
     }
 
@@ -81,43 +62,37 @@ class CaptureActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
 
-    /** 删目录用。10 分钟 30 fps 是约 1.8 万个 PNG，主线程删必然 ANR。 */
+    /** 后台删除目录，避免主线程 ANR。 */
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private lateinit var camThread: HandlerThread
 
     /**
-     * 相机对象**全程只有一个**，`onCreate` 建、`onDestroy` 才随线程一起走。
-     *
-     * 这决定了它持有的 Handler 也必须是长命的：如果 handler 线程跟着录制起落，
-     * 相机会握着一个绑在已死 Looper 上的 Handler，`postDelayed` 会**静默**不执行。
+     * 相机对象在 onCreate 创建，onDestroy 时随线程销毁。
+     * Handler 必须与其同生命周期，否则 postDelayed 会静默失效。
      */
     private lateinit var cam: CameraCapture
 
-    // ---------------- 编排层的状态。相机模块不碰这些，它只报告自己的事实（cam.ready）。----------
+    // ---------------- 编排层状态。相机模块只报告 cam.ready，不读取这些字段 ----------------
 
     @Volatile
     private var phase = Phase.IDLE
 
-    /** 落盘目标。**只在 RECORDING 非 null。** 相机线程会读它，所以必须 volatile。 */
+    /** 落盘目标，只在 RECORDING 时非 null；相机线程读取，需要 volatile。 */
     @Volatile
     private var writer: SessionWriter? = null
 
-    /** 早于这个时刻的相机帧不落盘（预热）。 */
+    /** 早于此时刻的相机帧不落盘。 */
     @Volatile
     private var framesFromTsNs = 0L
 
-    /** IMU 收集器。**一次「准备」一个**，[teardown] 时丢掉。 */
+    /** IMU 收集器，每次准备新建一个，teardown 时释放。 */
     private var imu: ImuCollector? = null
     private var imuThread: HandlerThread? = null
 
     /**
-     * 兜底策略：这一段的就绪判据没成立，而用户还是按了按钮。
-     *
-     * **注意这两个不是"就绪"，是"强行开始"。** 它们只在 [beginRecording] 里、主线程上
-     * 置位一次，不在别处。老代码把它们和就绪混成一个标志
-     * （`markImuReady("等 IMU 超时")` 会在 IMU **没出数**时把 `imuReady` 置 true），
-     * 状态就在说谎——那正是竞态的温床。
+     * 就绪判据未成立但用户仍按下开始时的标记。
+     * 只在 [beginRecording] 中设置一次，用于识别强制开始。
      */
     private var camGaveUp = false
     private var imuGaveUp = false
@@ -130,21 +105,17 @@ class CaptureActivity : AppCompatActivity() {
     // ---------------- 帧出口 ----------------
 
     /**
-     * 每帧的出口。**跑在相机线程上**，实现里不能有阻塞操作。
-     *
-     * 两路各自有一道显式闸，都不靠时序：落盘的闸是 [phase] + [writer] + [framesFromTsNs]，
-     * 预览的闸在 [PreviewView] 里。
+     * 每帧出口，运行在相机线程上，不能阻塞。
+     * 落盘和预览各有独立的显式检查。
      */
     private fun onCameraFrame(gray: ByteArray, tsNs: Long) {
         val w = writer
-        // 先读 writer 再读 phase，和拆除时的写序相反，所以 SessionWriter.offerFrame
-        // 里那道 running 检查是必需的。
+        // 先读 writer 再读 phase，因此 SessionWriter.offerFrame 中的 running 检查是必需的。
         if (phase == Phase.RECORDING && w != null && tsNs >= framesFromTsNs) {
             w.offerFrame(SessionWriter.FrameItem(tsNs, gray, CameraCapture.W, CameraCapture.H))
         }
 
-        // 预览**任何时候都给**。糊帧对预览是有用的信息——那正是准备时该看的东西。
-        // 单独 try：预览出岔子不能把采集帧吃掉。
+        // 预览始终接收帧；单独 try，避免预览异常影响采集。
         try {
             preview.offer(gray, tsNs)
         } catch (e: Throwable) {
@@ -163,8 +134,7 @@ class CaptureActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tvStatus)
         preview = findViewById(R.id.preview)
 
-        // 相机线程和相机对象都活得和 Activity 一样久，这样 start/stop 只是一条
-        // 队列上的两个消息，顺序天然确定（前后台快速来回不会互相踩）。
+        // 相机线程与 Activity 同生命周期，start/stop 按队列顺序执行。
         val ct = HandlerThread("camera").also { it.start() }
         camThread = ct
         cam = CameraCapture(this, Handler(ct.looper))
@@ -177,8 +147,7 @@ class CaptureActivity : AppCompatActivity() {
     }
 
     /**
-     * **这里什么都不做。** 相机和传感器都由「开始准备」打开，不由前台状态打开——
-     * 让它们在 IDLE 也活着就是空耗电。切回来时要重新点一次「开始准备」。
+     * 相机和传感器由「开始准备」打开，不在前台状态切换时自动启动。
      */
     override fun onStart() {
         super.onStart()
@@ -186,8 +155,7 @@ class CaptureActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // 切后台就拆。后台采集会被系统限制帧率，数据不可信。
-        // 正在录的话文件一律保住——录到一半也是真数据。
+        // 切后台时拆除硬件；正在录制的文件保留。
         teardown("切后台")
     }
 
@@ -196,13 +164,13 @@ class CaptureActivity : AppCompatActivity() {
         teardown("退出")
         cam.onFrame = null
         uiHandler.removeCallbacksAndMessages(null)
-        camThread.quitSafely()   // quitSafely 会把已经排队的 stop() 跑完
+        camThread.quitSafely()   // 执行完已排队的 stop()
         ioExecutor.shutdown()
     }
 
     // ---------------- 两个按钮 ----------------
 
-    /** A 按钮 = 「退一层」。两级的代价和层级成正比。 */
+    /** A 按钮：退一层。 */
     private fun onButtonA() {
         when (phase) {
             Phase.IDLE -> beginPrepare()
@@ -213,7 +181,7 @@ class CaptureActivity : AppCompatActivity() {
 
     private fun onButtonB() {
         when (phase) {
-            Phase.IDLE -> Unit              // 按钮本来就是灰的，点不进来
+            Phase.IDLE -> Unit              // 按钮不可用
             Phase.ARMED -> beginRecording()
             Phase.RECORDING -> stopRecording(discard = false)
         }
@@ -222,21 +190,19 @@ class CaptureActivity : AppCompatActivity() {
     // ---------------- 准备 ----------------
 
     /**
-     * IDLE → ARMED：**同时打开两条线**，IMU 注册 + 相机（含对焦初始化）。
-     *
-     * 所有入口统一先查一遍 [phase]：授权回调、按钮都可能重复触发。
+     * IDLE 到 ARMED：注册 IMU 并打开相机（含对焦初始化）。
+     * 多个入口共用，先检查 [phase]。
      */
     private fun beginPrepare() {
         if (phase != Phase.IDLE) return
 
-        // 没有权限时**什么都别动**，包括 phase。授权回调里会重新走一遍这个函数。
+        // 无权限时不做任何修改；授权回调会再次调用本函数。
         if (!hasCameraPermission()) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             return
         }
 
-        // IMU 先起步。本机传感器从 registerListener 到出数要 3 秒多，这段时间
-        // 正好用来调机位、等对焦——两条线的等待完全重叠。
+        // 先启动 IMU；传感器预热期间可同时调整机位和等待对焦。
         val t = HandlerThread("imu").also { it.start() }
         val c = ImuCollector(this)
         imuThread = t
@@ -259,10 +225,8 @@ class CaptureActivity : AppCompatActivity() {
     // ---------------- 录制 ----------------
 
     /**
-     * ARMED → RECORDING。
-     *
-     * **两个就绪判据都只为"识别出这是强制开始"而存在**——它们不制造保证，只是让
-     * 降级这件事被记下来。真正的保证是 [framesFromTsNs]：相机帧被硬按住 300 ms。
+     * ARMED 到 RECORDING。
+     * 两个就绪判据只用于识别强制开始；IMU 领先由 [framesFromTsNs] 保证。
      */
     private fun beginRecording() {
         if (phase != Phase.ARMED) return
@@ -271,8 +235,7 @@ class CaptureActivity : AppCompatActivity() {
         imuGaveUp = imu?.ready != true
         if (camGaveUp) Log.w(TAG, "强制开始：对焦未收敛，将带着连续对焦落盘")
         if (imuGaveUp) {
-            // 这条 ERROR 是「IMU 没出数」唯一的线索。删掉它就会出现
-            // 「UI 显示录制中、cam0 一帧没有、没有任何报错」这种查不出来的状态。
+            // IMU 未出数的唯一提示，不要删除。
             Log.e(TAG, "强制开始：IMU 未出数——这一段的前若干秒相机帧将没有 IMU 覆盖")
         }
 
@@ -289,9 +252,7 @@ class CaptureActivity : AppCompatActivity() {
         writer = w
         imu?.attach(w)   // 从这一刻起 IMU 行开始落盘
 
-        // 预热：相机帧要等到 +300ms 才开始落。
-        // **IMU 都没出数就别等了**——预热存在的唯一理由就是让 IMU 领先，没有 IMU
-        // 可领先的时候那 300 ms 是纯浪费，还会白白丢掉这一段开头能用的画面。
+        // IMU 尚未出数时不需要预热，直接落相机帧。
         framesFromTsNs = SystemClock.elapsedRealtimeNanos() + if (imuGaveUp) 0L else PREROLL_NS
 
         phase = Phase.RECORDING
@@ -301,10 +262,7 @@ class CaptureActivity : AppCompatActivity() {
     }
 
     /**
-     * RECORDING → ARMED。
-     *
-     * **不碰相机、不碰传感器注册、不碰对焦。** 这正是「停下来之后还能立刻录下一段」
-     * 的原因：下一段按下就是录，IMU 还是热的，不用再等 3.3 秒。
+     * RECORDING 到 ARMED。不关闭相机、传感器注册或对焦，下一段可以立即开始。
      */
     private fun stopRecording(discard: Boolean) {
         if (phase != Phase.RECORDING) return
@@ -322,8 +280,7 @@ class CaptureActivity : AppCompatActivity() {
         }
 
         if (w.framesWritten.get() == 0L) {
-            // 宁可留下证据也不要静默删掉——「二次录制永远不落帧」那类 bug
-            // 就是这么被淹掉的。
+            // 保留目录便于排查一帧都没写入的情况。
             Log.e(TAG, "这一段一帧都没落盘（时间戳对不上或写盘失败），目录保留：" + w.sessionDir)
         }
         Log.i(TAG, "结束录制  相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条"
@@ -332,8 +289,7 @@ class CaptureActivity : AppCompatActivity() {
         if (!discard) {
             lastSessionDir = w.sessionDir
         } else if (w.threadAlive) {
-            // stop() 的 join 超时了，writer 线程还活着。这时删目录会和它的写并发，
-            // writeFrame 会一路 FileNotFoundException。宁可把目录留下。
+            // writer 线程仍在运行，删除会与写入并发，因此保留目录。
             Log.e(TAG, "writer 线程未退出，放弃删除：${w.sessionDir}")
             lastSessionDir = w.sessionDir
         } else {
@@ -361,11 +317,8 @@ class CaptureActivity : AppCompatActivity() {
     // ---------------- 拆除 ----------------
 
     /**
-     * 回到 IDLE。**幂等**，「取消准备」/ `onStop` / `onDestroy` 共用。
-     *
-     * 注意这里**没有**「先断生产者再关消费者」那种漂亮顺序可言：[cam.stop] 是 post 到
-     * 相机线程的（异步），其余全是主线程同步跑的。真正挡住迟到帧的是 [phase] 那道闸，
-     * 加上 `SessionWriter.offerFrame` 里的 `running` 检查。
+     * 回到 IDLE，幂等，由取消准备、onStop 和 onDestroy 共用。
+     * cam.stop 是异步的，迟到的帧由 [phase] 和 SessionWriter 的 running 检查拦住。
      */
     private fun teardown(reason: String) {
         if (phase == Phase.IDLE) return
@@ -382,7 +335,7 @@ class CaptureActivity : AppCompatActivity() {
 
         imu?.stop()
         imuThread?.quitSafely()
-        // 必须置 null：不置的话下次 ARMED 读到的是上一轮那个已经停掉的 collector。
+        // 必须置 null，否则下次 ARMED 会读到已停止的 collector。
         imu = null
         imuThread = null
 
@@ -402,7 +355,7 @@ class CaptureActivity : AppCompatActivity() {
         }
     }
 
-    /** 刷按钮和状态栏。**按钮的颜色和文字都是从 [phase] 推出来的**，不另存一份。 */
+    /** 刷新按钮和状态栏；显示内容由 [phase] 推导。 */
     private fun render() {
         val p = phase
         val w = writer
@@ -410,8 +363,7 @@ class CaptureActivity : AppCompatActivity() {
         val imuOk = imu?.ready == true
 
         // ---- 按钮 ----
-        // 文字色和背景**成对**设置：中性态（tint=null，白底）配深字，
-        // 着色态（绿/红）配白字。只改背景不改字，就会复现「白底白字看不见」。
+        // 文字色和背景成对设置，中性态用深色字，着色态用白色字。
         when (p) {
             Phase.IDLE -> {
                 btnA.text = "开始准备"
@@ -426,8 +378,7 @@ class CaptureActivity : AppCompatActivity() {
                 btnA.text = "取消准备"
                 btnA.backgroundTintList = null
                 btnA.setTextColor(DARK_TEXT)
-                // 一进准备就可用、就是红的。用户随时可以决定不等了——
-                // 不做"灰按钮等就绪"那种中间态，那会让人以为要等它自己变。
+                // 进入准备后按钮立即可用；就绪前显示为红色。
                 btnB.isEnabled = true
                 if (camOk && imuOk) {
                     btnB.text = "开始录制"
@@ -444,8 +395,7 @@ class CaptureActivity : AppCompatActivity() {
                 btnA.setTextColor(DARK_TEXT)
                 btnB.text = "停止录制"
                 btnB.isEnabled = true
-                // 停止不是危险操作，恢复默认外观；危险的是左边那个「取消录制」，
-                // 它自带一道确认弹窗。
+                // 停止不是危险操作；取消录制另有确认弹窗。
                 btnB.backgroundTintList = null
                 btnB.setTextColor(DARK_TEXT)
             }
@@ -462,7 +412,7 @@ class CaptureActivity : AppCompatActivity() {
             }
             Phase.RECORDING -> when {
                 SystemClock.elapsedRealtimeNanos() < framesFromTsNs -> "… IMU 预热"
-                // 权威事实：这一段到底写进去没有。事前那个 ready 判断不作数了，看文件。
+                // 以实际写入结果为准。
                 w?.firstImuTsNs == 0L -> "… 这一段 IMU 还没落盘（相机帧暂时对不上 IMU）"
                 w?.forced == true -> "● 录制中（强制开始）"
                 else -> "● 录制中"
@@ -489,8 +439,7 @@ class CaptureActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQ_CAMERA) return
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            // 运行时权限对话框**不触发 onStop**，所以按 A 时那一趟出去了就是出去了，
-            // 这里得把「开始准备」接着做完。
+            // 权限对话框不会触发 onStop，这里继续完成开始准备。
             beginPrepare()
         } else {
             tvStatus.text = "相机权限被拒绝。\n请到 设置 → 应用 → SlamCapture → 权限 里手动开启。"
@@ -500,8 +449,7 @@ class CaptureActivity : AppCompatActivity() {
     // ---------------- 文件 ----------------
 
     private fun newSessionDir(): File {
-        // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
-        // **绝不能**用 File(null, ...)——那会落到进程的 CWD，在 Android 上就是 "/"。
+        // 外部存储不可用时退到内部存储；不能把 null 传给 File 构造器。
         val base = getExternalFilesDir(null) ?: filesDir
         val dir = File(File(base, "sessions"), "session_${System.currentTimeMillis()}")
         dir.mkdirs()
@@ -509,10 +457,8 @@ class CaptureActivity : AppCompatActivity() {
     }
 
     /**
-     * 删掉一个 session 目录。
-     *
-     * 先 rename —— 那一瞬间目录名就告诉所有人"这个不算数了"，而且是原子操作；
-     * 真正删掉上万个 PNG 是后台的事。
+     * 删除一个 session 目录。
+     * 先原子重命名标记为删除，再在后台删除。
      */
     private fun discardDir(dir: File) {
         val parent = dir.parentFile ?: return

@@ -30,11 +30,8 @@ namespace ORB_SLAM3
 
 class Settings;
 
-// 原版用 Pangolin 把地图画进桌面窗口，整个类只有这一个职责。
-// 安卓上没有 Pangolin，所以削成空壳：只留 Tracking 每帧会调的那一个方法，
-// 其余（DrawMapPoints / DrawKeyFrames / DrawCurrentCamera / GetCurrentOpenGLCameraMatrix
-// / SetReferenceKeyFrame / newParameterLoader）连同 Pangolin 成员一起删掉 ——
-// 确认过它们只在 Viewer.cc 内部被调用。
+// 原版使用 Pangolin 绘制地图。安卓上移除 Pangolin 后只保留
+// Tracking 每帧调用的方法，其余仅被 Viewer 使用的接口一并删除。
 class MapDrawer
 {
 public:

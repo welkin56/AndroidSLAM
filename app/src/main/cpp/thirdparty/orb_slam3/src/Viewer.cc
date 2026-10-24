@@ -25,23 +25,20 @@ Viewer::Viewer(System* /*pSystem*/, FrameDrawer* /*pFrameDrawer*/, MapDrawer* /*
                Tracking* /*pTracking*/, const string &/*strSettingPath*/, Settings* /*settings*/):
     both(false)
 {
-    // 原版在这里解析 yaml 的 Viewer 段、建 Pangolin 窗口、算出绘图用的图像尺寸。
-    // bUseViewer=false 时（安卓这条线）根本不会构造到它。
+    // 原版在此解析 Viewer 配置并创建 Pangolin 窗口；安卓上 bUseViewer 为 false。
 }
 
 void Viewer::Run()
 {
-    // 空实现。原版是这个绘制线程：取地图、画点、画关键帧、imshow 当前帧。
+    // 空实现，原版为绘制线程主体。
 }
 
 void Viewer::RequestFinish() {}
 
 void Viewer::RequestStop() {}
 
-// 这两个恒为 true 是刻意的，不是省事 —— Tracking::Reset 里有
-//     mpViewer->RequestStop();  while(!mpViewer->isStopped()) usleep(3000);
-// 原版靠绘制线程把 mbStopped 翻成 true 才能退出这个循环。线程没了之后，
-// 只要这里返回一次 false，那里就是一个永远退不出来的死循环。
+// 必须恒返回 true：Tracking::Reset 会等待 isStopped() 为真，
+// 没有绘制线程时返回 false 会导致死循环。
 bool Viewer::isFinished() { return true; }
 
 bool Viewer::isStopped() { return true; }

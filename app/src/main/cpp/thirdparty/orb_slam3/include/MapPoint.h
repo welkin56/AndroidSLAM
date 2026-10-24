@@ -119,7 +119,7 @@ public:
 
     KeyFrame* GetReferenceKeyFrame();
 
-    /** add：`PreSave` 记下的参考关键帧 id（载入前自检用）。 */
+    /** add：PreSave 记录的参考关键帧 id，供载入前自检使用。 */
     long unsigned int GetBackupRefKFId() { return mBackupRefKFId; }
 
     std::map<KeyFrame*,std::tuple<int,int>> GetObservations();

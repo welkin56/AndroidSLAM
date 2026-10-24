@@ -25,7 +25,7 @@
 
 #include "DBoW2/FeatureVector.h"
 
-#include <stdint.h>   // 原为 <stdint-gcc.h>：GCC 内部头，clang/libc++ 里没有
+#include <stdint.h>   // 原为 <stdint-gcc.h>，clang/libc++ 中没有该头
 
 using namespace std;
 

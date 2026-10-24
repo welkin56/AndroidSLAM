@@ -36,35 +36,23 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * SLAM 主界面。**跑 SLAM 的那一屏。**
+ * SLAM 主界面。
  *
- * 排版和录制页**故意不同**：这里是「状态 → 画面 → 按钮」，录制页是「画面 → 状态 → 按钮」。
- * 原因：这一页你盯着的是「**现在能不能用**」（词袋加载完没有、跟踪丢没丢），画面反而是辅助。
+ * 相机和 IMU 由本页持有，与 [CaptureActivity] 各开各的。
  *
- * 相机和 IMU **这一页自己持有**，和 [CaptureActivity] 各开各的 —— 两个模式互斥，
- * 理由是对焦所有权和性能（APP_DESIGN §6.3）。
+ * 主按钮有三个阶段：
+ *   未准备 -> [准备 SLAM] -> 加载中（词袋约 38 秒）-> 就绪
+ *   就绪 -> [启动 SLAM] -> 运行中 -> [结束] -> 就绪
  *
- * 那个主按钮是**三段**（和录制页的两段式对齐）：
- *
- * ```
- * 未准备 ──[准备 SLAM]──► 加载中（词袋 38 s）──► 就绪
- *                                                │
- *                                      [启动 SLAM] ▼
- *                                              运行中 ──[结束]──► 就绪
- * ```
- *
- * **准备** = 构造 `System`（贵且慢，38 秒）；**启动** = 开相机 + IMU + 开始吃帧。
- * 分开的理由和录制页那个一样：**贵的那一步不该被反复付**。
- *
- * ⚠️ **没有「取消准备」** —— `System` 构造没法取消，而且造好之后也没有安全的销毁时机
- * （见 [onButtonSlam] 上面那段）。所以这个按钮是**单行道**。
+ * 准备阶段构造 System；启动阶段打开相机和 IMU 并开始吃帧。
+ * 没有取消准备：System 构造无法取消，也没有安全的销毁时机。
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
 
-        /** 入口页选中的已保存地图（绝对路径）。**没有这个 extra 就是「新建地图」**。 */
+        /** 入口页选中的已保存地图绝对路径；没有该 extra 表示新建地图。 */
         const val EXTRA_MAP_FILE = "map_file"
 
         private const val VOCAB_NAME = "ORBvoc.txt"
@@ -87,62 +75,54 @@ class MainActivity : AppCompatActivity() {
         private const val TICK_MS = 250L
         private const val REQ_CAMERA = 1
 
-        /** 预热时长：相机帧硬按住这么久，让 IMU 先写满。和录制模式同值。 */
+        /** 预热时长：延迟相机帧，让 IMU 先写入一段。 */
         private const val PREROLL_NS = 300_000_000L
 
-        /** 两个开关的**记忆**。抽屉里那两个，下次进来还是上次的状态。 */
+        /** 开关状态的持久化。 */
         private const val PREF = "slamapp"
         private const val PREF_RECORD = "record"
         private const val PREF_MEASURE = "measure"
         private const val PREF_MAP = "map"
         private const val PREF_MAP_RANGE = "mapRange"
-        /** 小地图缩放档位（`MapView.ZOOM_*` 的下标）。 */
+        /** 小地图缩放档位下标。 */
         private const val PREF_MAP_ZOOM = "mapZoom"
         private const val PREF_WAYPOINTS = "waypoints"
         private const val PREF_HISTORY = "historyOn"
-        /** 逐条隐藏的历史轨迹：绝对路径集合。 */
+        /** 隐藏的历史轨迹绝对路径集合。 */
         private const val PREF_HIST_HIDDEN = "historyHidden"
-        /** 查看器的切片中心：false = 跟小地图当前高度，true = 点云 z 中位数。 */
+        /** 查看器切片中心模式：false 跟随当前高度，true 使用点云 z 中位数。 */
         private const val PREF_VIEWER_SLICE = "viewerSliceMedian"
 
-        /** 历史轨迹每条最多画这么多点（文件可能几万行，stride 抽稀）。 */
+        /** 每条历史轨迹的最大绘制点数。 */
         private const val kHistoryMaxPts = 2000
 
-        /** `nativeDisplayTransforms` 的缓冲：够放一条很长的合并链。 */
+        /** nativeDisplayTransforms 的缓冲容量。 */
         private const val kDisplayTfMax = 32
 
-        /**
-         * 点云的**全量上限**，和 `slam_engine.cpp` 的 `kMapPointsMax` 一一对应。
-         * 那边超了会 stride 抽稀，所以这一侧是**固定缓冲、别扩容**（和 `trajBuf` 同款契约）。
-         */
+        /** 点云上限，与 slam_engine.cpp 的 kMapPointsMax 对应；使用固定缓冲。 */
         private const val kMapPointsMax = 5000
 
-        /** 厚度滑块的刻度数。`SeekBar` 只有整数，所以在 `0..100` 上线性映射到米。 */
+        /** 厚度滑块刻度数，在 0..100 上线性映射到米。 */
         private const val kRangeSeekMax = 100
 
-        /** 按住缩放键时，**每隔多久走一档**。大约一秒走十档。 */
+        /** 按住缩放键时的连发间隔。 */
         private const val kZoomRepeatMs = 95L
 
         private val DARK_TEXT = Color.parseColor("#DE000000")
         private val RED = Color.parseColor("#C62828")
 
-        /**
-         * 「加点」吸到**已有点**的半径（图像像素）。
-         *
-         * ⚠️ 和 `measure_center.cpp` 的 `kSnapRadiusPx` 同值纯属巧合，**是另一个常数**
-         * （那个吸地图点，这个吸标记点）。**手感参数，跑完再定。**
-         */
+        /** 加点时吸附到已有点的半径（图像像素）。 */
         private const val kPointSnapPx = 20f
 
-        /** 折线读回来的缓冲**至少留这么多点的余量**。见 [readPinned] 里那段。 */
+        /** 折线缓冲保留的最小点数余量。 */
         private const val kPinnedSlack = 8
 
-        /** `nativeGetPinned` 每点第 3 个 float 的位。**和 `slam_engine.cpp` 那侧一一对应。** */
+        /** nativeGetPinned 每点 flags 的位，与 slam_engine.cpp 对应。 */
         private const val kFlagFront = 1   // 在相机前方
         private const val kFlagClosed = 2  // 它之后「断开」了
-        private const val kFlagLow = 4     // 不太准（平面兜底/勉强）⟹ 画空心圈
+        private const val kFlagLow = 4     // 不太准，绘制空心圈
 
-        /** 路径点 flags 的位。**和 `System::GetWaypoints` 一一对应。** */
+        /** 路径点 flags 的位，与 System::GetWaypoints 对应。 */
         private const val kFlagWpValid = 1L
         private const val kFlagWpCurrent = 2L
     }
@@ -156,23 +136,21 @@ class MainActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
 
-    /** 两个开关的记忆。是本 App 唯一用 SharedPreferences 的地方。 */
+    /** 开关状态的持久化。 */
     private val pref by lazy { getSharedPreferences(PREF, MODE_PRIVATE) }
 
     // ---------------- 页面状态 ----------------
 
-    /** 入口页选中的已保存地图。**null = 新建地图**。不加 enum，它本身就是那个参数。 */
+    /** 入口页选中的已保存地图；null 表示新建地图。 */
     private var mapFile: String? = null
 
-    /** C++ 那边的 `System` 状态。**只在主线程写**。 */
+    /** C++ 侧 System 状态。只在主线程写。 */
     private var slamState = SLAM_IDLE
     private var slamElapsedMs = 0L
 
     /**
-     * 「正在吃帧」—— 相机和 IMU 开着、`nativeStart()` 调过了。
-     *
-     * 和 [slamState] 是**两件事**：`System` 造好之后一直活着（`slamState == SLAM_READY`），
-     * 而吃不吃帧由用户按按钮决定。这正是「停止再启动不用重等 38 秒」的原因。
+     * 是否正在吃帧：相机和 IMU 已打开，且已调用 nativeStart()。
+     * 与 [slamState] 不同，System 就绪后仍会一直存在。
      */
     private var slamRunning = false
 
@@ -183,82 +161,74 @@ class MainActivity : AppCompatActivity() {
     private var imu: ImuCollector? = null
     private var imuThread: HandlerThread? = null
 
-    /** 预热闸：这个时刻之前的相机帧不喂也不录。相机线程读、主线程写。 */
+    /** 预热截止时刻；早于该时刻的帧不喂给 SLAM，也不落盘。 */
     @Volatile
     private var framesFromTsNs = 0L
 
     // ---------------- 落盘（抽屉里的开关）----------------
 
-    /** 只在录制中非 null。相机线程和 IMU 线程都会读，必须 volatile。 */
+    /** 落盘目标，只在录制时非 null；相机线程和 IMU 线程读取。 */
     @Volatile
     private var writer: SessionWriter? = null
     private var recording = false
 
     /**
-     * 这次**会话**的目录：`files/maps/<时间戳>/`。
-     *
-     * ⚠️ **一次「新建地图」= 一个目录**，第一次按「启动 SLAM」时建，之后一直复用 ——
-     * 否则「结束再启动」会把同一次新建地图裂成好几个文件夹（2026-09-29 用户报的）。
+     * 本次会话目录：files/maps/<时间戳>/。
+     * 一次新建地图只创建一个目录，之后一直复用。
      */
     private var sessionDir: File? = null
 
-    /** atlas 的账：`[图数, 关键帧数, 地图点数]`。复用同一个数组。 */
+    /** atlas 统计：[图数, 关键帧数, 地图点数]，复用数组。 */
     private val atlasBuf = IntArray(3)
 
-    /** 最近一次存图给的文件名（不含 `.osa`），成功后显示给用户。 */
+    /** 最近一次存图的文件名（不含 .osa），成功后显示。 */
     private var savedName: String? = null
 
-    /** 存图状态那行字。`render()` 里按 C++ 的 `nativeSaveState()` 更新。 */
+    /** 存图状态文字，在 render 中根据 nativeSaveState 更新。 */
     private var saveMsg: String? = null
 
-    /** 正在存图。**ticker 靠它才继续跑** —— 存图发生在刚停止之后，那时它本来要停了。 */
+    /** 是否正在存图。ticker 依赖它继续运行。 */
     private var saving = false
 
     /**
-     * 正在把 atlas 恢复成「上一次保存」的样子。
-     *
-     * 恢复期间**不读 atlas / 轨迹** —— C++ 那头正在重建它们，`Atlas::PostLoad()` 没有锁。
-     * ticker 也靠它继续跑：要轮询到「完成」才能把按钮放开。
+     * 是否正在恢复 atlas。
+     * 恢复期间不读取 atlas 和轨迹；ticker 依赖它继续运行。
      */
     private var restoring = false
 
-    /** 上一次看到的恢复状态。只在它变化时改 [restoreMsg]（否则每帧都重写同一句）。 */
+    /** 上次看到的恢复状态；只在变化时更新 [restoreMsg]。 */
     private var restoreStateSeen = 0
 
-    /** 恢复那行字。 */
+    /** 恢复状态文字。 */
     private var restoreMsg: String? = null
 
-    /** 最近一次请求是「入口页换源」而不是「这一趟没保存」。只影响提示语。 */
+    /** 最近一次请求是否是入口页换源；仅影响提示语。 */
     private var atlasSwitching = false
 
-    /** 本趟的时间戳 —— 轨迹和录像都用它，一趟固定（中途开录制也不换目录）。 */
+    /** 本趟时间戳，轨迹和录像共用。 */
     private var runStamp = ""
 
-    /** 本趟的录像目录 `<会话>/rec/<runStamp>/`。没录过就是 null。 */
+    /** 本趟录像目录 <会话>/rec/<runStamp>/；未录制时为 null。 */
     private var curRecDir: File? = null
 
     /**
-     * 本趟轨迹的前缀（含目录、**不含扩展名**）：`<会话>/traj/traj-<runStamp>`。
-     *
-     * 先落在 `traj/`，**存图成功那一刻**才搬进 `map-<id>/`（见 [applyPendingSave]）。
-     * 没存下的图不该在磁盘上留下文件夹 —— 否则回滚后 map id 会被下一张图复用。
+     * 本趟轨迹前缀（含目录、不含扩展名）：<会话>/traj/traj-<runStamp>。
+     * 先写入 traj/，存图成功后才移动到 map-<id>/。
      */
     private var curTrajBase: File? = null
 
-    /** 本趟轨迹所属的图。`nativeStop()` 之后立刻快照；-1 = 没有。 */
+    /** 本趟轨迹所属的图，在 nativeStop() 后立即快照；-1 表示没有。 */
     private var runMapId = -1L
 
-    /** 本趟的合并链，每条 10 个 float（见 [SlamBridge.nativeLastMerges]）。 */
+    /** 本趟合并链，每条 10 个 float。 */
     private var runMerges: List<FloatArray> = emptyList()
 
-    /** 上一次保留的目录，只给状态栏显示。 */
+    /** 上次保留的目录，仅用于状态栏显示。 */
     private var lastRunDir: File? = null
 
     /**
      * 存图请求发出时的归档上下文。
-     *
-     * ⚠️ 存图是异步的，完成时用户可能已经开了**下一趟** —— 那时 `runMapId` /
-     * `curTrajBase` 都已经被重置成新趟的值了。归档要用请求那一刻的快照。
+     * 存图异步完成时可能已开始下一趟，归档必须使用请求时的快照。
      */
     private class PendingArchive(
         val session: File,
@@ -270,17 +240,17 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 位姿 ----------------
 
-    /** 复用同一个数组 —— JNI 里构造 Java 数组代价高（§6 约定 3）。 */
+    /** 复用的位姿数组，避免每帧分配。 */
     private val poseBuf = FloatArray(16)
     private var poseValid = false
     private var trkState = TRK_NOT_READY
 
     // ---------------- 测距（画面中心）----------------
 
-    /** `[0]` 距离m、`[1..3]` 目标世界坐标、`[4]`/`[5]` 目标图像像素坐标。同样复用。 */
+    /** 测量缓冲：[0] 距离、[1..3] 世界坐标、[4][5] 图像像素。 */
     private val measureBuf = FloatArray(7)
 
-    /** 给 [PreviewView.Overlay] 用的状态，比 C++ 那三档多一个「跟踪未就绪」。 */
+    /** 叠加层状态，比 C++ 的三档多一个「跟踪未就绪」。 */
     private var measureState = PreviewView.MeasureState.NO_TRACK
 
     // ---------------- 多点折线（绑在 swMeasure 那个开关上）----------------
@@ -292,24 +262,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnResetPoints: Button
 
     /**
-     * 折线**整个存在 C++ 侧** —— 它要存 `MapPoint*`（世界坐标会变，身份不会）。
-     * 这一侧只留一个**读回来的缓冲**，照着画：刷新 / 投影 / 算长度全在那边一次给完。
-     *
-     * 布局：每点 3 个 `px py flags`；每段 5 个 `x0 y0 x1 y1 len`；最后 5 个是橡皮筋。
+     * 折线保存在 C++ 侧，因为需要保存 MapPoint*。
+     * 这里只保留读取缓冲：每点 3 个 px py flags，每段 5 个 x0 y0 x1 y1 len，
+     * 最后 5 个是橡皮筋。
      */
     private var pinnedBuf = FloatArray(8 * 8 + 1)
 
-    /** 上一次读回来几个点。**只信这个，别拿 `pinnedBuf.size` 当点数**（那是容量）。 */
+    /** 上次读回的点数；pinnedBuf.size 是容量，不是点数。 */
     private var pinnedN = 0
 
-    /** 当前这条折线还开着吗 —— 开着才拉橡皮筋，也才让「断开」可点。 */
+    /** 当前折线是否还开着；开着才拉橡皮筋，才允许「断开」。 */
     private val chainOpen: Boolean
         get() = pinnedN > 0 && (pinnedBuf[1 + (pinnedN - 1) * 3 + 2].toInt() and kFlagClosed) == 0
 
-    /** 第 i 段那 5 个数在缓冲里的起点。 */
+    /** 第 i 段在缓冲中的起始下标。 */
     private fun segAt(i: Int) = 1 + 3 * pinnedN + 5 * i
 
-    /** 段标签缓存：上次的值 + 上次的文字。见 [segLabel]。 */
+    /** 段标签缓存：上次数值和文本。 */
     private val segLast = ArrayList<Float>()
     private val segLabels = ArrayList<String>()
 
@@ -317,22 +286,13 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var mapView: MapView
 
-    /**
-     * 给 [MapView] 的轨迹缓冲，复用。`3 × kTrajExportMax`。
-     *
-     * ⚠️ **不用扩容取全** —— 那侧是 stride 抽稀的**形状**契约，和 `pinnedBuf` 正好相反。
-     */
+    /** 给 [MapView] 的轨迹缓冲，3 × 512，复用。数据按 stride 抽稀。 */
     private val trajBuf = FloatArray(3 * 512)
 
-    /**
-     * 给 [MapView] 的点云缓冲，复用。`3 × kMapPointsMax`。
-     *
-     * 那边写的是**快照**（SLAM 线程每秒重建一次），这一侧只是 memcpy —— 契约和 [trajBuf] 一样：
-     * **固定缓冲、别扩容**。
-     */
+    /** 给 [MapView] 的点云缓冲，3 × kMapPointsMax，复用。 */
     private val mapPtBuf = FloatArray(3 * kMapPointsMax)
 
-    /** 小地图那一整块。开关直接作用于它（连角上那两个缩放键一起藏）。 */
+    /** 小地图容器；开关直接控制其可见性。 */
     private lateinit var mapWrap: FrameLayout
     private lateinit var swMap: SwitchCompat
     private lateinit var sbMapRange: SeekBar
@@ -340,14 +300,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnMapZoomIn: Button
     private lateinit var btnMapZoomOut: Button
 
-    /** 上一次见到的「地图重置次数」。涨了 ⟹ 世界系换过 ⟹ 老点全废。 */
+    /** 上次看到的地图重置次数；增加表示坐标系已更换。 */
     private var resetCountSeen = 0
 
-    /** 缩放键按住时的连发定时器。**挂在 [uiHandler] 上** —— `onDestroy` 那句
-     *  `removeCallbacksAndMessages(null)` 顺手就把它清了。 */
+    /** 缩放键连发定时器，挂在 [uiHandler] 上，onDestroy 时统一清除。 */
     private var zoomRepeat: Runnable? = null
 
-    /** 上一次落盘的缩放档位。长按连按时只在**真的换档**时才写盘。 */
+    /** 上次落盘的缩放档位；只在档位变化时写入。 */
     private var zoomSaved = -1
 
     // ---------------- 路径点 ----------------
@@ -355,19 +314,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnWpAdd: Button
     private lateinit var btnWpManage: Button
 
-    /** 路径点缓冲。`wpMeta` 每点 4 个：`id, mapId, kfId, flags`。 */
+    /** 路径点缓冲；wpMeta 每点 4 个：id, mapId, kfId, flags。 */
     private var wpPos = FloatArray(3 * 16)
     private var wpMeta = LongArray(4 * 16)
     private var wpNames = arrayOfNulls<String>(16)
     private var wpN = 0
 
-    /** 上次读到的那一版。只有它变了才重建小地图那一层。 */
+    /** 上次读取的版本号；变化时才重建图层。 */
     private var wpRevisionSeen = -1L
 
-    /** 上一次加路径点的结果（`nativeWaypointState`），用来只提示一次。 */
+    /** 上次加路径点的结果，用于仅提示一次。 */
     private var wpStateSeen = 0
 
-    /** 加路径点失败时给人看的那句话。 */
+    /** 加路径点失败提示。 */
     private var wpMsg: String? = null
 
     // ---------------- 历史轨迹（小地图上的蓝色层）----------------
@@ -375,31 +334,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var swHistory: SwitchCompat
     private lateinit var btnHistoryManage: Button
 
-    /** `nativeDisplayTransforms` 的缓冲：每条 9 个 float（`id s qx qy qz qw tx ty tz`）。 */
+    /** nativeDisplayTransforms 的缓冲，每条 9 个 float。 */
     private val histTfBuf = FloatArray(9 * kDisplayTfMax)
 
-    /** 读一条轨迹的缓冲：`3 × kHistoryMaxPts`。 */
+    /** 读取单条轨迹的缓冲，3 × kHistoryMaxPts。 */
     private val histPtsBuf = FloatArray(3 * kHistoryMaxPts)
 
-    /** 当前显示图里存在的全部轨迹（含隐藏的）。 */
+    /** 当前图中存在的全部轨迹，包括隐藏的。 */
     private var histEntries: List<TraceEntry> = emptyList()
 
-    /** 上次重建用的上下文（会话路径 + displayId + 所有变换）。没变就不碰磁盘。 */
+    /** 上次重建的上下文；未变化时不访问磁盘。 */
     private var histCtx = ""
 
-    /** 下次一定要重建：开关 / 增删 / 存图归档 / 换图。 */
+    /** 下次需要重建的标记。 */
     private var histDirty = true
 
-    /** 真正画出来的条数 —— [refreshMap] 的 hint 要用。 */
+    /** 实际绘制的轨迹条数。 */
     private var histShown = 0
 
-    /** 存在的条数 —— 管理按钮的可用状态。 */
+    /** 存在的轨迹条数，用于管理按钮状态。 */
     private var histAll = 0
 
-    /** 隐藏的轨迹（绝对路径），和 pref 里的 StringSet 同步。 */
+    /** 隐藏轨迹的绝对路径集合，与 pref 同步。 */
     private var histHidden: MutableSet<String> = mutableSetOf()
 
-    /** `map-<id>/traj-*.txt` + 那个文件夹到当前坐标系的累计变换（9 个 float）。 */
+    /** 一条归档轨迹及其坐标变换（9 个 float）。 */
     private class TraceEntry(val file: File, val mapId: Long, val tf: FloatArray)
 
     // ---------------- 地图查看器（全屏 2D）----------------
@@ -412,40 +371,40 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rowStatus: LinearLayout
     private lateinit var rowBottom: LinearLayout
 
-    /** 查看器开着。ticker 靠它继续跑（停着 SLAM 也要刷列表/位姿）。 */
+    /** 查看器是否打开；ticker 依赖它继续运行。 */
     private var viewerOpen = false
 
-    /** 当前查看的图 id；-1 = 还没选。 */
+    /** 当前查看的图 id；-1 表示尚未选择。 */
     private var viewerMapId = -1L
 
-    /** atlas 里 KF>0 的图。 */
+    /** atlas 中关键帧数大于 0 的图。 */
     private data class MapInfo(val id: Long, val kfs: Int, val mps: Int)
     private var viewerMaps: List<MapInfo> = emptyList()
 
-    /** 每张图有几条已归档轨迹（标题/列表显示用）。 */
+    /** 每张图的已归档轨迹条数。 */
     private var viewerTraceCounts: Map<Long, Int> = emptyMap()
 
-    /** 选中图的点云（3n，该图自己的坐标系），一次性快照。 */
+    /** 选中图的点云（3n，该图自身坐标系）。 */
     private var viewerCloud = FloatArray(0)
     private var viewerCloudN = 0
     private val viewerCloudBuf = FloatArray(3 * kMapPointsMax)
 
-    /** 选中图的历史轨迹（每条 3n，单位变换 —— 文件本来就在这张图的系里）。 */
+    /** 选中图的历史轨迹（每条 3n，使用单位变换）。 */
     private var viewerTraces: List<FloatArray> = emptyList()
     private val viewerTraceBuf = FloatArray(3 * kHistoryMaxPts)
 
-    /** 点云 z 的中位数（「切片:中位数」模式）。 */
+    /** 点云 z 的中位数。 */
     private var viewerMedianZ = 0f
 
-    /** 切片中心模式：false = 小地图当前高度，true = 点云中位数。 */
+    /** 切片中心模式：false 跟随当前高度，true 使用点云中位数。 */
     private var viewerSliceMedian = false
 
-    /** 地图列表的复用缓冲（看到写满就扩容）。 */
+    /** 地图列表复用缓冲。 */
     private var viewerMapIds = LongArray(32)
     private var viewerMapKfs = IntArray(32)
     private var viewerMapMps = IntArray(32)
 
-    /** 上次刷新地图列表的时刻（每 ~2 秒一次）。 */
+    /** 上次刷新地图列表的时刻。 */
     private var viewerListAt = 0L
 
     // ---------------- 生命周期 ----------------
@@ -485,12 +444,11 @@ class MainActivity : AppCompatActivity() {
         btnUndoPoint = findViewById(R.id.btnUndoPoint)
         btnResetPoints = findViewById(R.id.btnResetPoints)
 
-        // 两个开关的**记忆**。在挂监听**之前**恢复 —— 否则恢复这个动作本身会把监听跑一遍
-        // （`swRecord` 那条会去 `startRecording()`，虽然那时 SLAM 没跑、会被自己挡掉）。
+        // 在注册监听前恢复开关状态，避免恢复动作触发监听。
         swRecord.isChecked = pref.getBoolean(PREF_RECORD, false)
-        // 测距也默认关。它和录制一样是**用户拨开才生效**的功能，不替用户决定。
+        // 测距默认关闭。
         swMeasure.isChecked = pref.getBoolean(PREF_MEASURE, false)
-        // ⚠️ 顺手推给 C++ —— 那边默认是关的，不在这儿推一次，两边会不一致。
+        // 同步给 C++，避免两侧状态不一致。
         SlamBridge.nativeSetMeasuring(swMeasure.isChecked)
 
         // 相机线程和相机对象活得和 Activity 一样久（和录制页同一个理由：
@@ -505,25 +463,22 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnMenu).setOnClickListener {
             drawer.openDrawer(GravityCompat.END)
         }
-        // 开关是**用户的意图**，录制跟着它走：启动 SLAM 时若开着就自动录，
-        // 运行中拨动也立刻生效。所以它一直可点（见 render）。
+        // 开关表示用户意图：启动 SLAM 时若开启则自动录制，运行中拨动立即生效。
         swRecord.setOnCheckedChangeListener { _, checked ->
             pref.edit().putBoolean(PREF_RECORD, checked).apply()
             if (checked) startRecording() else stopRecording()
         }
 
-        // 测距同理，只是它作用在画面上而不是磁盘上。**关掉时清掉叠加层** ——
-        // 不然后面 ticker 不再刷它，那个十字会一直挂在画面上。
+        // 测距作用在画面上；关闭时清掉叠加层，避免十字残留。
         swMeasure.setOnCheckedChangeListener { _, checked ->
             pref.edit().putBoolean(PREF_MEASURE, checked).apply()
             SlamBridge.nativeSetMeasuring(checked)
             if (!checked) measureState = PreviewView.MeasureState.NO_TRACK
-            // 「多点折线」那一行跟着它出现/消失。**已钉住的点留着** —— 拨开关不清会话，
-            // 要清就按「重置」（或者等地图重置，见 pollMeasure）。
+            // 多点折线随开关显示或隐藏；已钉住的点保留。
             render()
         }
 
-        // 小地图：开关 + 切片厚度。同样在挂监听**之前**恢复。
+        // 小地图开关和切片厚度，同样在注册监听前恢复。
         swMap.isChecked = pref.getBoolean(PREF_MAP, true)
         sbMapRange.max = kRangeSeekMax
         sbMapRange.progress = rangeToSeek(pref.getFloat(PREF_MAP_RANGE, MapView.SLICE_DEFAULT))
@@ -537,7 +492,7 @@ class MainActivity : AppCompatActivity() {
         applyMapVisible(swMap.isChecked)
 
         sbMapRange.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            // ⚠️ 边拖边生效（`fromUser` 才落盘）—— 拖的时候要能当场看见切片变厚变薄。
+            // 拖动时立即生效；仅用户操作时写入偏好。
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 applyMapRange(progress)
                 if (fromUser) pref.edit().putFloat(PREF_MAP_RANGE, seekToRange(progress)).apply()
@@ -548,10 +503,10 @@ class MainActivity : AppCompatActivity() {
         })
 
         // 缩放档位要记着：上次按到哪一档，这次进来还是哪一档。
-        // `-1` = 还没存过，`setZoomIndex` 会忽略它、用视图自己的默认档。
+        // -1 表示尚未保存，setZoomIndex 会忽略并使用默认档。
         mapView.setZoomIndex(pref.getInt(PREF_MAP_ZOOM, -1))
         zoomSaved = mapView.zoomIndex()
-        // 只有加/减两个按钮；**长按连按**由 wireZoomButton 那一侧负责。
+        // 缩放键的长按连发由 wireZoomButton 处理。
         wireZoomButton(btnMapZoomIn) {
             mapView.zoomIn()
             saveZoom()
@@ -561,8 +516,7 @@ class MainActivity : AppCompatActivity() {
             saveZoom()
         }
 
-        // 多点折线：加点 / 断开 / 撤销 / 重置。**折线整个存在 C++ 侧**（它要存 `MapPoint*`），
-        // 这一侧只调它、然后把结果读回来画。
+        // 多点折线：加点、断开、撤销、重置。折线保存在 C++ 侧，这里只调用并读取结果。
         btnAddPoint.setOnClickListener { addPinnedPoint() }
         btnBreakChain.setOnClickListener { breakChain() }
         btnUndoPoint.setOnClickListener {
@@ -574,11 +528,11 @@ class MainActivity : AppCompatActivity() {
             refreshPinned()
         }
 
-        // 路径点。开关只影响**画不画**；管理界面始终能看（否则关掉开关就再也找不到它们了）。
+        // 路径点开关只影响是否绘制，管理界面始终可用。
         swWaypoints.isChecked = pref.getBoolean(PREF_WAYPOINTS, true)
         swWaypoints.setOnCheckedChangeListener { _, checked ->
             pref.edit().putBoolean(PREF_WAYPOINTS, checked).apply()
-            // 关掉时 `clearWaypoints()`；打开时必须**强制重读**，否则 revision 没变会一直空着。
+            // 打开时必须强制重读，否则 revision 未变会一直为空。
             wpRevisionSeen = -1
             refreshWaypoints()
         }
@@ -589,8 +543,7 @@ class MainActivity : AppCompatActivity() {
         histHidden = (pref.getStringSet(PREF_HIST_HIDDEN, emptySet()) ?: emptySet())
             .toMutableSet()
         swHistory.isChecked = pref.getBoolean(PREF_HISTORY, true)
-        // 这行在挂监听**之前**，不会触发 listener；而 `applyMapVisible` 已经先跑过一轮
-        // （那时开关还是默认的关）⟹ 不置脏的话第一轮会停在那结果上，历史一直不出来。
+        // 此前 applyMapVisible 已执行过一次，这里标记重建以刷新历史层。
         histDirty = true
         swHistory.setOnCheckedChangeListener { _, checked ->
             pref.edit().putBoolean(PREF_HISTORY, checked).apply()
@@ -638,13 +591,12 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // ⚠️ 叠加层**跟着画面走**，不跟着 ticker —— 否则标记会拖着画面跑（见 overlaySupplier）。
+        // 叠加层随画面帧更新，不随 ticker 更新。
         preview.overlaySupplier = { if (swMeasure.isChecked) buildOverlay() else null }
 
         mapFile = intent.getStringExtra(EXTRA_MAP_FILE)
         Log.i(TAG, "地图来源：" + (mapFile ?: "新建地图"))
-        // 载入地图的话，会话目录就是 `.osa` 的父目录。**提前**定下来（原先在 startHardware
-        // 里才定）—— 这样没启动 SLAM 也能看 / 管理这张图的历史轨迹。
+        // 载入地图时，会话目录取 .osa 的父目录，这样未启动 SLAM 也能管理历史轨迹。
         mapFile?.let { f ->
             File(f).parentFile?.let { dir ->
                 dir.mkdirs()
@@ -652,16 +604,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 读一次构造状态：可能是**上一个 Activity 实例**留下的（从入口页再进来一次）。
-        // System 是进程级的，Kotlin 这边每次都要重新问，不能自己记。
-        //
-        // ⚠️ 这一句还是**第一次碰 `SlamBridge`** —— `.so` 在此刻加载，`JNI_OnLoad`
-        // 顺带装上日志重定向（ORB-SLAM3 的 cout/cerr 全靠它）。别把它排到后面去。
+        // 读取构造状态；System 是进程级的，可能由上一个 Activity 实例创建。
+        // 这里也是第一次访问 SlamBridge，.so 在此刻加载并由 JNI_OnLoad 安装日志重定向。
         slamState = SlamBridge.nativeState()
 
-        // `System` 是进程级的：已经造好的话，入口页这次的选择必须**手动生效** ——
-        // `nativeInit` 不会再跑一遍。不换的话「新建地图」只是又开一张当前图，
-        // 旧 atlas 原样留着（回环检测照样能匹配到它）；「换一张图」同理。
+        // System 已存在时，入口页的选择需要手动换源，nativeInit 不会再次执行。
         var atlasSwitch = false
         if (slamState == SLAM_READY || slamState == SLAM_LOADING) {
             val want = mapFile?.removeSuffix(".osa") ?: ""
@@ -681,8 +628,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // 切后台等同「停止」（§7.3）。回来要重新按「启动」—— 后台相机会被限帧，
-        // 而且手机可能移动了，上一帧的位姿不再成立。
+        // 切后台等同于停止；返回后需要重新启动。
         stopHardware("切后台")
     }
 
@@ -703,13 +649,10 @@ class MainActivity : AppCompatActivity() {
     //                                          [启动 SLAM] ▼
     //                                                  运行中 ──[结束]──► 就绪
     //
-    // ⚠️ **没有「取消准备」** —— 和录制页不一样。`System` 的构造没法中途取消，
-    // 而且造好之后**也没有安全的销毁时机**（它没有析构函数、`Shutdown()` 又不 join 线程，
-    // delete 就是 use-after-free）。所以这个按钮是**单行道**：准备过就回不去「未准备」。
-    // 这不是偷懒，是把 ORB-SLAM3 的事实如实反映到界面上。
+    // 没有取消准备：System 构造无法中途取消，也没有安全的销毁时机。
 
     private fun onButtonSlam() {
-        // —— 运行中：结束（结束会话，那张图成为「旧图」，§2.3）——
+        // 运行中：结束本次会话
         if (slamRunning) {
             stopHardware("用户结束")
             render()
@@ -724,7 +667,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // —— System 已经造好了：只开硬件，不重等那 38 秒（§5 决策一）——
+        // System 已就绪：只打开硬件，不重新加载
         if (slamState == SLAM_READY) {
             openHardware()
             render()
@@ -743,9 +686,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 开相机 + IMU + `nativeStart()`。
-     *
-     * **等 `System` 就绪之后才调** —— 词袋加载那 38 秒里灌帧没人消费，队列满了纯属白丢。
+     * 打开相机和 IMU，并调用 nativeStart()。必须在 System 就绪后执行。
      */
     private fun openHardware() {
         if (slamRunning || !hasCameraPermission()) return
@@ -756,7 +697,7 @@ class MainActivity : AppCompatActivity() {
         imuThread = t
         imu = c
         c.onSample = { ts, wx, wy, wz, ax, ay, az ->
-            // **跑在 IMU 线程上，里面绝不能阻塞**（铁律 1）。
+            // 运行在 IMU 线程上，不能阻塞。
             try {
                 SlamBridge.nativePushImu(ts, wx, wy, wz, ax, ay, az)
             } catch (e: Throwable) {
@@ -792,7 +733,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        // 一趟固定一个时间戳；轨迹先落 `traj/`，存图成功才归档到 `map-<id>/`。
+        // 一趟固定一个时间戳；轨迹先落 traj/，存图成功才归档到 map-<id>/。
         runStamp = stamp()
         curTrajBase = null
         curRecDir = null
@@ -802,16 +743,13 @@ class MainActivity : AppCompatActivity() {
         if (swRecord.isChecked) startRecording()
 
         Log.i(TAG, "SLAM 开始吃帧")
-        // ⚠️ 必须自己把 ticker 叫起来：它在词袋加载完的那一刻就停了（busy 变 false），
-        // 而位姿是靠它刷的。不叫的话界面会停在「已就绪」一动不动。
+        // 重新启动 ticker 以刷新位姿。
         uiQueueTicker()
     }
 
     /**
-     * 关硬件。**幂等**，「停止」/ 切后台 / 退出共用。
-     *
-     * ⚠️ **不销毁 `System`** —— 那要重付 38 秒。C++ 那边 `slam::stop()` 只是停止吃帧，
-     * 顺便清空积压的队列（否则下次启动会吃到停止前的旧帧）。
+     * 关闭硬件，幂等，由停止、切后台和退出共用。
+     * 不销毁 System；C++ 的 stop() 只停止吃帧并清空队列。
      */
     private fun stopHardware(reason: String) {
         if (!slamRunning) return
@@ -819,22 +757,20 @@ class MainActivity : AppCompatActivity() {
 
         SlamBridge.nativeStop()   // 先让它别吃了，再拆硬件
 
-        // ⚠️ 紧跟 `nativeStop()` 读：快照就在 `slam::stop()` 里做的。
-        // 再晚一步，worker 可能已经消费「恢复 atlas」请求、把整张图换掉了。
+        // 紧跟 nativeStop() 读取快照；再晚可能已被恢复请求换掉。
         runMapId = SlamBridge.nativeLastTrajMapId()
         runMerges = readMerges()
         slamRunning = false
 
         stopRecording()           // 正在录的话文件一律保留（录到一半也是真数据）
 
-        // 轨迹先落 `traj/`；存图成功那一刻才归档进 `map-<id>/`（见 applyPendingSave）。
-        // **主动结束**才弹窗问留不留；切后台 / 退出直接留着（数据是真的）。
+        // 轨迹先写入 traj/，存图成功后才归档到 map-<id>/。
+        // 仅主动结束时询问是否保留；切后台或退出时直接保留。
         val base = newTrajBase()
         if (base != null) {
             curTrajBase = base
             exportTrajectory(base)
-            // 元信息**当场就写**，不等「留不留」那个弹窗 —— 存图可能在用户回答之前完成，
-            // 那时归档会把这两个文件一起搬走；晚写就会一个在 map/、一个留在 traj/。
+            // 元信息立即写入，避免归档时两个文件分处不同目录。
             writeRunMeta(base)
             // 先问地图、再问轨迹（askMapSave 问完会接着问轨迹）。一次只弹一个。
             if (reason == "用户结束") askMapSave(base) else keepRun(base)
@@ -846,12 +782,11 @@ class MainActivity : AppCompatActivity() {
         // 必须置 null：不置的话下次读到的是上一轮那个已经停掉的 collector。
         imu = null
         imuThread = null
-        // ⚠️ 只清画面。叠加层不用管 —— 它现在**跟着新帧走**（`overlaySupplier`），
-        // 没帧就没有叠加层，也就不用担心「没有画面的十字挂在黑底上」。
+        // 只清除画面；叠加层随后续帧更新，无帧时不会显示。
         preview.setActive(false)
         measureState = PreviewView.MeasureState.NO_TRACK
-        // ticker 停了，小窗不会再被喂 ⟹ 在这儿补一次，**把整趟的图定格下来**（复盘好看）。
-        // 历史要先刷：hint 取决于这一拍有没有东西可画。
+        // ticker 停止后补充刷新一次，保留本趟最终画面。
+        // 先刷新历史，因为 hint 依赖当前是否有内容可画。
         refreshHistory()
         refreshMap()
     }
@@ -859,9 +794,8 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 帧出口 ----------------
 
     /**
-     * 每帧的出口。**跑在相机线程上**，实现里不能有阻塞操作。
-     *
-     * **三个消费者，各自一道显式闸、各自包 try** —— 一路出岔子不能把另外两路吃掉。
+     * 每帧出口，运行在相机线程上，不能阻塞。
+     * 三个消费者各自检查并捕获异常，互不影响。
      */
     private fun onCameraFrame(gray: ByteArray, tsNs: Long) {
         // 预热期内的帧不喂也不录；预览不受影响。
@@ -908,17 +842,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 一趟一个 `rec/<runStamp>/`；中途开录制也落在同一个底下。
+        // 本趟录像目录为 rec/<runStamp>/；中途开始录制也使用同一目录。
         val run = curRecDir
             ?: File(TrajectoryStore.recDir(session), runStamp).also { curRecDir = it }
 
-        // ⚠️ **每一段写自己的目录**（`session-1/`、`session-2/`…）。不能复用同一个 ——
-        // `SessionWriter.start()` 用 `FileOutputStream` 打开 csv 会**截断**，
-        // 而上一段的 PNG 还在磁盘上，结果 csv 和 PNG 对不上，而且坏得很隐蔽。
+        // 每段使用独立目录；复用目录会截断 CSV，导致与已有 PNG 不匹配。
         val dir = nextSessionDir(run)
         val w = SessionWriter(dir)
-        // ⚠️ 标出来：这样录的和「录制模式」录的才分得清 —— 格式一模一样，
-        // 而这段的帧率是被落盘拖低过的，用途也不同（见 SessionWriter.withSlam）。
+        // 标记为 SLAM 期间录制；格式与录制模式相同，但帧率受落盘影响。
         w.withSlam = true
         w.start()
         if (w.ioError != null) {
@@ -949,7 +880,7 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 位姿与轨迹 ----------------
 
-    /** [base] 不含扩展名 —— 轨迹写 `base.txt`，元信息写 `base.json`。 */
+    /** base 不含扩展名；轨迹写 base.txt，元信息写 base.json。 */
     private fun exportTrajectory(base: File) {
         try {
             SlamBridge.nativeDumpTrajectory("$base.txt")
@@ -961,19 +892,15 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 状态栏 ----------------
 
     /**
-     * **加载中要跑，运行中也要跑。**
-     *
-     * 两个都必需：加载中是为了刷那 38 秒的进度；运行中是为了刷位姿和跟踪状态。
-     * ⚠️ 而「刚变成 `kReady` 的那一刻」两件事同时发生 —— 开硬件也是在那一刻做的，
-     * 所以这里不能一看到不是 `kLoading` 就 return。
+     * 加载中和运行中都需要运行：
+     * 前者刷新加载进度，后者刷新位姿和跟踪状态。
      */
     private val ticker = object : Runnable {
         override fun run() {
             if (slamState == SLAM_LOADING) {
                 slamState = SlamBridge.nativeState()
                 slamElapsedMs = SlamBridge.nativeElapsedMs()
-                // ⚠️ **不要在这儿开硬件。** 「就绪」和「启动」是两个阶段，
-                // 中间隔着用户那一下 —— 自动开会把三段式黏成两段（改标签时漏改过一版）。
+                // 不在这里打开硬件；就绪和启动是两个阶段。
             }
             if (slamRunning) {
                 poseValid = SlamBridge.nativeGetPose(poseBuf)
@@ -981,10 +908,7 @@ class MainActivity : AppCompatActivity() {
                 pollMeasure()
             }
 
-            // ⚠️ **先刷，再判断要不要继续。** 反过来写的话，「词袋加载完」那一轮会
-            // 读到 READY、算出 busy=false、然后在 render **之前**就 return ——
-            // 界面永远停在「加载中…（已 40s）」，时间不走、按钮也不变。
-            // **最后一轮刷新被自己吃掉了。**
+            // 先刷新界面，再判断是否继续调度；否则最后一轮刷新会被跳过。
             render()
 
             if (slamState == SLAM_LOADING || slamRunning || saving || restoring || viewerOpen) {
@@ -999,19 +923,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 取一次画面中心的距离读数，交给 [PreviewView] 画。
-     *
-     * ⚠️ 「跟踪未就绪」要**单独一档**。C++ 只回 0/1/2（不可测/勉强/好），而跟踪没就绪时
-     * 它回的也是 0 —— 直接显示成「对准有纹理的地方」是**错的话**，用户会去擦镜头。
-     * 那个状态属于 SLAM，在这儿叠上去（STAGE6 §2.7：沉默和「测不了」必须能区分）。
+     * 读取一次画面中心的距离读数，交给 [PreviewView] 绘制。
+     * 跟踪未就绪单独一档，避免被误显示为「对准有纹理的地方」。
      */
     private fun pollMeasure() {
-        // ⚠️ **这儿不画东西**。叠加层由 `overlaySupplier` 跟着新帧拉（15fps），
-        // 在这儿推的话只有 ticker 那 4Hz，标记会拖尾。这里只管**状态**。
+        // 这里只更新状态；叠加层由 overlaySupplier 随新帧生成。
         if (!swMeasure.isChecked) return
 
-        // ⚠️ 地图一重置，世界坐标系**重新锚定** ⟹ 已钉住的点是废图里的坐标，画出来是乱飘的。
-        // 用 `>` 而不是 `!=`：`nativeStart()` 会把计数归零，那不算重置。
+        // 地图重置后坐标系重新锚定，已钉住的点失效，需要清空。
+        // 使用 > 而不是 !=，因为 nativeStart() 会把计数归零。
         val resets = SlamBridge.nativeResetCount()
         if (resets > resetCountSeen) {
             SlamBridge.nativeClearPinned()
@@ -1024,10 +944,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 读一次画面中心的测量，顺手把 [measureState] 定下来。返回 C++ 那个质量码。
-     *
-     * ⚠️ **两处都调它**：ticker 上那次（4Hz）管**按钮的灰亮**，`buildOverlay` 里那次（15Hz）
-     * 管**画**。少任何一处都会「一半新一半旧」。
+     * 读取一次测量并更新 [measureState]，返回 C++ 的质量码。
+     * ticker 和 buildOverlay 都会调用，分别负责按钮状态和绘制。
      */
     private fun readMeasure(): Int {
         val q = SlamBridge.nativeGetMeasure(measureBuf)
@@ -1042,9 +960,8 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 多点折线 ----------------
 
     /**
-     * 折线变了：读一次 + 刷按钮状态。
-     *
-     * **不用手动重画叠加层** —— 它跟着下一帧（≤66ms）自己就更新，见 [PreviewView.overlaySupplier]。
+     * 折线变化后重新读取并刷新按钮状态。
+     * 叠加层会随下一帧自动更新。
      */
     private fun refreshPinned() {
         readPinned()
@@ -1052,21 +969,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 读一次折线到 [pinnedBuf]，点数写进 [pinnedN]。**主线程**。
+     * 读取折线到 [pinnedBuf]，点数写入 [pinnedN]。主线程。
      *
-     * ⚠️ 容量不够时 C++ **只写装得下的那几个**（它返回「实际写了几个」—— 这样调用方
-     * 不会去读没写过的内存）。所以看到「写满」就扩容。
-     *
-     * **留 8 个点的余量**，而加点一次只加一个、每次加完立刻重读 ⟹ **正常用法碰不到截断**。
-     * 真撞上了也只是**那一帧少画一个点**，下一帧就好（不为「批量加载」那种不存在的场景
-     * 加一层重读循环）。
+     * C++ 在容量不足时只写装得下的部分，因此缓冲区保留 8 个点余量；
+     * 余量不足时提前扩容，避免正常使用中出现截断。
      */
     private fun readPinned(): Int {
         pinnedN = SlamBridge.nativeGetPinned(pinnedBuf)
-        // ⚠️ **保持余量，不是「满了才扩」。** 满了才扩的话那一帧**已经被 C++ 截断了**
-        // （它只写装得下的那几个），会少画几个点。余量掉到 [kPinnedSlack] 以下就提前扩，
-        // 于是**截断那条路正常永远走不到**。
-        // 和现有大小一起翻倍，是为了别每加一个点就重分配一次。
+        // 余量低于 kPinnedSlack 时提前扩容；与现有大小一起翻倍，减少重分配。
         val cap = (pinnedBuf.size - 1) / 8   // C++ 最多能写几个点（那个 -1 留给橡皮筋那块）
         if (cap - pinnedN < kPinnedSlack) {
             pinnedBuf = FloatArray(maxOf(8 * (pinnedN + kPinnedSlack) + 1, pinnedBuf.size * 2))
@@ -1075,12 +985,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 段标签。**只在变化超过 0.5mm 时才重新 `format`。**
-     *
-     * ⚠️ 长度现在**每帧都在变** —— 地图一直在收敛，两点的距离跟着变（这是刷新要的效果，
-     * 不是抖动）。所以不能像以前那样「只在点变了时算」；但也不该每帧都 `String.format`
-     * （几十微秒 × 段数 × 15fps 是毫秒级）。显示到毫米，**比半毫米更小的变化不该让
-     * 字符串重排** —— 那只会让标签闪。
+     * 生成段标签，只在数值变化超过 0.5 mm 时重新格式化。
+     * 长度每帧都会变化，但不应每帧调用 String.format。
      */
     private fun segLabel(i: Int, v: Float): String {
         while (segLast.size <= i) {
@@ -1095,31 +1001,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildOverlay(): PreviewView.Overlay {
-        // ⚠️ **这里也要读一次测量。** 叠加层是 15fps 画的，而 ticker 上的 `pollMeasure`
-        // 只有 4Hz —— 只靠它的话，标记和折线是平滑的，**十字读数、琥珀吸附圈、橡皮筋的
-        // 另一端却在一秒跳 4 次**，一头平滑一头在跳，比全都慢更难看。
+        // 这里也需要读取测量；只靠 4Hz 的 ticker 会导致读数、吸附圈和橡皮筋跳动。
         readMeasure()
         val n = readPinned()
         val marks = ArrayList<PreviewView.Mark>(n)
         val segs = ArrayList<PreviewView.Seg>(maxOf(0, n - 1))
         var live: PreviewView.Seg? = null
 
-        // 每点 3 个：`px py flags`。**标记点**只画在相机前方的。
+        // 每点 3 个：px py flags；只绘制相机前方的标记点。
         for (i in 0 until n) {
             val o = 1 + i * 3
             val f = pinnedBuf[o + 2].toInt()
             if (f and kFlagFront == 0) continue
             marks.add(PreviewView.Mark(pinnedBuf[o], pinnedBuf[o + 1], f and kFlagLow != 0))
         }
-        // 每段 5 个：`x0 y0 x1 y1 len` —— **两个端点都是 C++ 算好的**，
-        // 包括「一端在相机后面」时那个朝正确方向的画外点。这里只认 `len`。
+        // 每段 5 个：x0 y0 x1 y1 len；端点由 C++ 计算，这里只检查 len。
         for (i in 0 until n - 1) {
             val o = segAt(i)
             if (pinnedBuf[o + 4] < 0f) continue
             segs.add(PreviewView.Seg(pinnedBuf[o], pinnedBuf[o + 1], pinnedBuf[o + 2], pinnedBuf[o + 3],
                                      segLabel(i, pinnedBuf[o + 4])))
         }
-        // 橡皮筋：最后一个点 → 十字。**断开 / 没读数 / 两端都在相机后面时那侧给的是 -1**。
+        // 橡皮筋：最后一个点到十字；断开、无读数或两端在相机后方时为 -1。
         if (n > 0) {
             val lo = segAt(n - 1)
             if (pinnedBuf[lo + 4] >= 0f) {
@@ -1135,12 +1038,8 @@ class MainActivity : AppCompatActivity() {
     /**
      * 把当前读数钉成一个点。
      *
-     * 先试**吸到已有点**：用**上一帧那份缓冲**里的投影判像素距离（≤66ms 旧，够用）——
-     * 因为用户是按**屏幕上看到的**判断「是不是同一个角」的，世界距离阈值在不同景深下
-     * 含义完全不同。
-     *
-     * ⚠️ 判出下标之后交给 C++ **复制那个点的身份**，不是「把当前读数钉下去」——
-     * 后者存的是十字命中的**另一个**地图点（只是碰巧很近），之后两个点会**各漂各的**。
+     * 先用上一帧缓冲的投影判断是否吸附到已有点；用户依据屏幕位置判断是否为同一点。
+     * 命中后交给 C++ 复制该点的身份，而不是写入当前读数命中的另一个地图点。
      */
     private fun addPinnedPoint() {
         if (!measureState.hasReading) return
@@ -1162,11 +1061,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 「断开」：当前这条折线到此为止。
-     *
-     * **点全部留着**，只是不再从最后一个点拉橡皮筋，下一个「加点」会**另起一条**。
-     * 「开没开」完全从读回来的 flags 推（见 [chainOpen]），这一侧一条链状态都不存 ——
-     * 那样「撤销」就得按情况还原它，两边很容易对不上。
+     * 断开当前折线：保留已有点，只停止橡皮筋，下一个点另起一条。
+     * 折线状态完全由读回的 flags 推导。
      */
     private fun breakChain() {
         SlamBridge.nativeClosePinnedChain()
@@ -1189,8 +1085,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // ---- 按钮 ----
-        // 三个标签对应三个阶段。**加载中和构造失败都不可点** —— 前者没法取消，后者重试也没用
-        // （C++ 那边的 `init` 只生效一次）。恢复期间也不可点：atlas 正在换。
+        // 加载中和构造失败时不可点；恢复期间也不可点。
         btnSlam.isEnabled =
             (slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY) && !restoring
         btnSlam.text = when {
@@ -1206,19 +1101,16 @@ class MainActivity : AppCompatActivity() {
             if (slamRunning) ColorStateList.valueOf(RED) else null
         btnSlam.setTextColor(if (slamRunning) Color.WHITE else DARK_TEXT)
 
-        // 两个开关都**一直可点** —— 它们表达的是「这一段要不要录 / 要不要量」，
-        // 所以启动之前就得能设。
+        // 两个开关始终可点，因为需要在启动前就能设置。
         swRecord.isEnabled = true
         swMeasure.isEnabled = true
 
-        // ---- 多点折线。**绑在测距开关上**：关着就整行消失 ----
-        // 查看器全屏时这一行也要藏起来（render 每拍都会跑，不加这个闸会被它弹回来）。
+        // ---- 多点折线：随测距开关显示或隐藏；查看器打开时也隐藏 ----
         rowMeasure.visibility =
             if (!viewerOpen && swMeasure.isChecked) View.VISIBLE else View.GONE
-        // 「加点」没有效读数时**灰着**。按了没反应，用户分不清是坏了还是没对准（STAGE6 §2.7）；
-        // 灰着 + 十字旁边那句「对准有纹理的地方」已经说清为什么。
+        // 无有效读数时禁用「加点」，避免用户误以为功能损坏。
         btnAddPoint.isEnabled = swMeasure.isChecked && measureState.hasReading
-        // 「断开」只在折线**还开着**的时候有意义（已经断开了再按是空操作 ⟹ 灰着）。
+        // 折线未开时禁用「断开」。
         btnBreakChain.isEnabled = swMeasure.isChecked && chainOpen
         btnUndoPoint.isEnabled = pinnedN > 0
         btnResetPoints.isEnabled = pinnedN > 0
@@ -1227,7 +1119,7 @@ class MainActivity : AppCompatActivity() {
         btnWpAdd.isEnabled = slamRunning && poseValid
         btnWpManage.isEnabled = SlamBridge.nativeWaypointCount() > 0
 
-        // 加路径点的结果：**只提示一次**（`wpState` 是粘性的，会一直是 2/3）。
+        // 加路径点结果只提示一次；wpState 会保持为 2 或 3。
         val wpState = SlamBridge.nativeWaypointState()
         if (wpState != wpStateSeen) {
             wpStateSeen = wpState
@@ -1239,8 +1131,7 @@ class MainActivity : AppCompatActivity() {
 
         // ---- 状态栏 ----
         val mapLabel = mapFile?.let { File(it).name } ?: "新建地图"
-        // `System` 造好之后有两种情形，先算出来 —— 塞进 `when` 的 else 分支里会写出
-        // 「一个 when 里两个 else」那种读起来像错的东西。
+        // System 就绪后有两种情形，先算出来再放进 when 的 else 分支。
         val afterReady = if (slamRunning) {
             trackingLine()
         } else {
@@ -1262,8 +1153,7 @@ class MainActivity : AppCompatActivity() {
         when (SlamBridge.nativeSaveState()) {
             1, 2 -> saveMsg = "正在保存地图…"
             3 -> {
-                // ⚠️ 只在「保存中 → 完成」这一拍归档。`saveState` 是**粘性的**（一直是 3），
-                // 之后任何一次 render 都会再看到它 —— 不加这个闸，坐标会被变换很多遍。
+                // 只在保存中变为完成的那一帧归档；saveState 会保持为 3，否则会重复变换坐标。
                 val justFinished = saving
                 saveMsg = "地图已保存 → ${savedName ?: "?"}.osa"
                 saving = false
@@ -1288,18 +1178,13 @@ class MainActivity : AppCompatActivity() {
                 )
             }
             if (slamRunning) {
-                // ⚠️ 重置次数是**初始化问题最直接的证据** —— 归零重来多少次，一眼看到。
                 if (isNotEmpty()) append("\n")
                 append("轨迹 ${SlamBridge.nativeTrajSize()} 点")
                 val resets = SlamBridge.nativeResetCount()
                 if (resets > 0) append("　⚠️ 地图已重置 $resets 次")
-                // ⚠️ 只加**纹理**，不加距离 —— 这一行太长会**折行**，`tvStatus` 一变高
-                // 就把预览挤下去（那个距离十字旁边本来就有）。
-                // **世界坐标也不在这儿显**：它是给折线和日志用的，这行放不下
-                // （要看那三个数读 logcat，tag `slam` 的 `[M6]`）。
+                // 只显示纹理，不显示距离和世界坐标，避免状态栏折行。
                 if (swMeasure.isChecked) {
-                    // 纹理 = 十字附近有几个**特征点**（不管有没有地图点）。
-                    // **没读数时也有值** ⟹ 正好告诉用户「这地方为什么测不了」。
+                    // 十字附近的特征点数；无读数时也有值，可用于说明测不到的原因。
                     append("　纹理 %.0f".format(measureBuf[6]))
                 }
             }
@@ -1307,9 +1192,7 @@ class MainActivity : AppCompatActivity() {
             if (recording && w != null) {
                 append("\n录制中：相机 ${w.framesWritten.get()} 帧 / IMU ${w.imuWritten.get()} 条")
             }
-            // 地图账。载图之后这是界面上唯一看得出「图进来了」的地方 ——
-            // 载进来的图不是当前图，小窗、轨迹、测距都看不到它。
-            // ⚠️ 恢复期间不读：`Atlas::PostLoad()` 在重建整个 atlas，它没拿锁。
+            // 地图统计；恢复期间不读取，因为 atlas 正在重建。
             if (slamState == SLAM_READY && !restoring) {
                 SlamBridge.nativeAtlasStats(atlasBuf)
                 if (isNotEmpty()) append("\n")
@@ -1328,7 +1211,7 @@ class MainActivity : AppCompatActivity() {
 
         // 2D 地图小窗也由这儿喂 —— 于是 ticker、按钮事件、以及 idle 的首帧全覆盖。
         // 恢复期间跳过：轨迹表刚被清、点云快照也刚被清，读出来是一片空。
-        // **历史先刷**：`refreshMap` 的 hint 要看这一拍有没有历史可画。
+        // 先刷新历史，refreshMap 的提示依赖历史数量。
         if (!restoring) {
             refreshHistory()
             refreshMap()
@@ -1340,13 +1223,10 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 路径点 ----------------
 
     /**
-     * 读一次路径点喂给小地图。
+     * 读取路径点并更新小地图。
      *
-     * ⚠️ **不能按 revision 跳过**：回环/合并会把整张图的位姿改掉（`ApplyScaledRotation`），
-     * 坐标变了而 revision 不变，只认 revision 的话标记会一直停在旧位置（看着就是「没了」）。
-     * 点只有几个，每拍重读的代价可以忽略。
-     *
-     * 只把**有效且在当前图**的交给 [MapView]：别的图在另一个坐标系里，画上去必然错位。
+     * 不能仅按 revision 跳过：回环或合并会改变坐标而不改变 revision。
+     * 只向 [MapView] 传入有效且位于当前图的点。
      */
     private fun refreshWaypoints() {
         // 小地图关着、查看器也没开：不用读。
@@ -1355,8 +1235,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // **开关关着但查看器开着时也要读** —— 查看器要用同一份列表，
-        // 它按 `meta.mapId` 筛自己那张图。读的代价只有几条。
+        // 开关关闭但查看器打开时仍需读取；查看器按 mapId 筛选自己的图。
         readWaypointList()
 
         if (!swWaypoints.isChecked) {
@@ -1377,7 +1256,7 @@ class MainActivity : AppCompatActivity() {
             mapView.setWaypoints(xs, k, ns)
         }
 
-        // 查看器：画**选中那张图**里的有效路标点（不要求 current —— 历史图看的正是它自己）。
+        // 查看器绘制选中图中的有效路径点，不要求是当前图。
         if (viewerOpen) {
             val xs = FloatArray(wpN * 2)
             val ns = arrayOfNulls<String>(wpN)
@@ -1395,7 +1274,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 读一次路径点进 `wp*` 缓冲。装不下就扩容重读（和 `readPinned` 同一个契约）。 */
+    /** 读取路径点到缓冲；装不下时扩容重读。 */
     private fun readWaypointList() {
         while (true) {
             val n = SlamBridge.nativeGetWaypoints(wpPos, wpMeta, wpNames)
@@ -1409,11 +1288,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 加路径点：先问名字，再发请求。**名字可以当场改**。 */
+    /** 添加路径点：先询问名字，再发送请求。 */
     private fun askAddWaypoint() {
         val input = EditText(this).apply {
-            // 用**下一个 id** 而不是「现有条数 + 1」：删过点之后条数会回退，
-            // 那样新点会和还没删的那个重名。
+            // 使用下一个 id 而不是条数，避免删除后重名。
             setText("路径点 ${SlamBridge.nativeNextWaypointId()}")
             setSelectAllOnFocus(true)
             setPadding(56, 0, 56, 0)
@@ -1432,7 +1310,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 管理界面：每条路径点一行，点了就能改名或删掉。**含不在当前图 / 已失效的**。 */
+    /** 路径点管理界面，包含不在当前图和已失效的条目。 */
     private fun showWaypointManager() {
         val total = SlamBridge.nativeWaypointCount()
         if (total == 0) {
@@ -1505,12 +1383,8 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 2D 地图小窗 ----------------
 
     /**
-     * 读一次轨迹和点云塞给小窗。**纯读 + 换引用**，算和画都在 [MapView] 那边。
-     *
-     * 小地图关着时**整个不读** —— 这两条读的都是要拿锁的活：
-     * 轨迹走四条 `std::list` 抱 `mMutexTraj`（tracking 每帧都要拿），
-     * 点云是 SLAM 线程那份快照（每秒重建一次，重建时抱地图的锁）。
-     * 藏起来时白付不起，见 [applyMapVisible]。
+     * 读取轨迹和点云并交给小地图；计算和绘制由 [MapView] 完成。
+     * 小地图隐藏时不读取，避免无谓的加锁。
      */
     private fun refreshMap() {
         // 查看器盖住了小窗：不读、不画，省一倍锁和绘制。
@@ -1518,10 +1392,8 @@ class MainActivity : AppCompatActivity() {
 
         val n = SlamBridge.nativeGetTrajectory(trajBuf)
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
-        // ⚠️ **不沉默**：空窗也要说清为什么空。**分开四态**（STAGE6 §2.7）——
-        // 「加载中」和「没启动」混成一句的话，用户会去擦镜头。
-        // ⚠️ 判据是「**两样都没有**」：有点云 / 轨迹 / 历史可画时再拿提示盖上去，
-        //    那些就白出来了。停止之后也保留最后一趟 + 历史轨迹（复盘用）。
+        // 空窗也要给出原因，并区分加载中、未启动等状态。
+        // 只有在无任何可绘制内容时才显示提示。
         val anything = n > 0 || pn > 0 || histShown > 0
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
@@ -1531,13 +1403,10 @@ class MainActivity : AppCompatActivity() {
             !anything -> "等待定位…"
             else -> null
         }
-        // 停止后不再画当前位置：`poseValid` 是最后一帧的旧值，历史轨迹的坐标系
-        // 可能已经换过（恢复 atlas）。视图中心由 MapView 冻住，不会跳。
+        // 停止后不绘制当前位置，避免使用过期位姿。
         val hasCur = slamRunning && poseValid
-        // 朝向：相机光轴投到 XY 地面。`poseBuf` 是 **Twc**（列主序），
-        // 所以**第 3 列**就是相机系 `+z`（光轴）在世界里的方向。
-        // ⚠️ 只挡**除零**（真的正下方，方位角无定义）。**不挡「朝下」** ——
-        //    低头测地板时那点水平分量仍然是**稳定的方位角**（晃 1° 就动 1°）。
+        // 朝向：将相机光轴投影到 XY 平面。poseBuf 是列主序 Twc，
+        // 第 3 列即相机 +z 轴的世界方向；只排除正下方的情况。
         var dx = 0f
         var dy = 0f
         if (hasCur) {
@@ -1561,12 +1430,9 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 历史轨迹 ----------------
 
     /**
-     * 读一次「当前这张图」的历史轨迹喂给小地图。
-     *
-     * 只画轨迹所属那张图的文件夹（`map-<id>/`）—— 别的图各有一个原点，叠上来必然错位。
-     * 合并还没落盘时文件夹要乘 `T_on`；`nativeDisplayTransforms` 已经按链合成好了。
-     *
-     * ⚠️ 只在上下文变了 / 置脏时列目录、读文件。ticker 是 4 Hz，每拍读盘白付不起。
+     * 读取当前图的历史轨迹并交给小地图。
+     * 只读取该图对应的 map-<id>/ 目录；合并变换已由 nativeDisplayTransforms 合成。
+     * 仅在上下文变化或标记为脏时访问磁盘。
      */
     private fun refreshHistory() {
         if (restoring) return
@@ -1611,12 +1477,12 @@ class MainActivity : AppCompatActivity() {
                 histPtsBuf)
             if (n > 0) traces += histPtsBuf.copyOf(n * 3)
         }
-        // 单点的轨迹画不出来（`MapView` 要 ≥ 2 点），别让它把 hint 顶掉。
+        // 单点轨迹无法绘制（MapView 至少需要 2 点），不计入提示判据。
         histShown = traces.count { it.size >= 6 }
         mapView.setHistory(traces)
     }
 
-    /** 管理当前图的已归档轨迹：逐条显示 / 隐藏、删除。 */
+    /** 管理当前图的已归档轨迹：显示、隐藏、删除。 */
     private fun showHistoryManager() {
         // 重新算一次条目：用户可能刚在别处删过 / 加过。
         histDirty = true
@@ -1664,7 +1530,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setTraceHidden(f: File, hidden: Boolean) {
         if (hidden) histHidden.add(f.absolutePath) else histHidden.remove(f.absolutePath)
-        // 不能改 `getStringSet` 返回的那个对象；存一份新的。
+        // 不能修改 getStringSet 返回的对象，需存入新集合。
         pref.edit().putStringSet(PREF_HIST_HIDDEN, histHidden.toSet()).apply()
         histDirty = true
         render()
@@ -1687,7 +1553,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 轨迹的元信息里那个点数；没有 / 读不到返回 -1。 */
+    /** 读取轨迹元信息中的点数；读不到时返回 -1。 */
     private fun readTracePoints(txt: File): Int = try {
         val meta = File(txt.absolutePath.removeSuffix(".txt") + ".json")
         if (!meta.isFile) -1
@@ -1744,11 +1610,11 @@ class MainActivity : AppCompatActivity() {
         viewerWrap.visibility = View.GONE
         rowStatus.visibility = View.VISIBLE
         rowBottom.visibility = View.VISIBLE
-        // `rowMeasure` 由 render 按「实时测距」开关恢复。
+        // rowMeasure 由 render 按「实时测距」开关恢复。
         render()
     }
 
-    /** 查看器开着时每拍调一次：刷新列表 / 位置 / 切片；点云只在选图/刷新时读。 */
+    /** 查看器打开时每帧调用：刷新列表、位置和切片；点云仅在选图或刷新时读取。 */
     private fun refreshMapViewer() {
         if (restoring) {
             setViewerHint("正在载入地图…")
@@ -1816,7 +1682,7 @@ class MainActivity : AppCompatActivity() {
         updateViewerTitle(trajId)
     }
 
-    /** 重读 atlas 的地图列表（每 ~2 秒一次）。 */
+    /** 重新读取 atlas 的地图列表，约每 2 秒一次。 */
     private fun refreshViewerList() {
         if (restoring || slamState != SLAM_READY) {
             if (viewerMaps.isNotEmpty()) {
@@ -1826,7 +1692,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 看到写满就扩容重来 —— 和 `nativeGetWaypoints` 同一个契约。
+        // 看到写满就扩容重读，与 nativeGetWaypoints 契约相同。
         var n: Int
         while (true) {
             n = SlamBridge.nativeMapList(viewerMapIds, viewerMapKfs, viewerMapMps)
@@ -1885,7 +1751,7 @@ class MainActivity : AppCompatActivity() {
         if (dt > 20) Log.w(TAG, "[VIEW] 点云枚举花了 ${dt}ms（主线程）")
     }
 
-    /** 读这张图自己的轨迹：`map-<id>/` 里的文件本来就在这张图的系里，用单位变换。 */
+    /** 读取指定图自己的轨迹；map-<id>/ 中的文件已在该图坐标系中，使用单位变换。 */
     private fun loadViewerTraces(id: Long) {
         val session = sessionDir
         val list = ArrayList<FloatArray>()
@@ -1910,7 +1776,7 @@ class MainActivity : AppCompatActivity() {
         return z[n / 2]
     }
 
-    /** 把选中图缩放到刚好装下：点云 + 轨迹 + 路标点（+ 当前位置，如果就在这张图上）。 */
+    /** 缩放以装下选中图的点云、轨迹和路径点，必要时包含当前位置。 */
     private fun fitViewer() {
         if (!viewerOpen) return
         var minX = Float.MAX_VALUE
@@ -1992,7 +1858,7 @@ class MainActivity : AppCompatActivity() {
         selectViewerMap(id)
     }
 
-    /** 「刷新」：重读列表和选中图的点云/轨迹，但不动当前的平移/缩放。 */
+    /** 刷新列表、点云和轨迹，但保持当前平移和缩放。 */
     private fun reloadViewerMap() {
         if (!viewerOpen || viewerMapId < 0) return
         if (restoring) {
@@ -2032,7 +1898,7 @@ class MainActivity : AppCompatActivity() {
         btnViewerSlice.text = if (viewerSliceMedian) "切片:中位数" else "切片:高度"
     }
 
-    /** 非每拍场景（打开 / 切图 / 切模式）：按当前模式把切片中心同步给查看器。 */
+    /** 打开、切图或切换模式时，按当前模式同步切片中心。 */
     private fun applyViewerSlice() {
         viewerMapView.setSliceCenter(
             if (viewerSliceMedian) viewerMedianZ else mapView.sliceCenter())
@@ -2050,14 +1916,9 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 小地图的开关和切片厚度 ----------------
 
     /**
-     * 显示 / 隐藏小地图。
-     *
-     * **关掉时连 C++ 那边也停**：点云快照那次枚举要抱 `Map::mMutexMap`（几毫秒，
-     * 红黑树指针追逐），而 LocalMapping 每建一个点都要拿它。藏起来时白付不起。
-     * 重开时下一个帧间空隙就重建，不会空一下。
-     *
-     * 轨迹的**记录**停不了也不该停（那是 ORB-SLAM3 自己在 push，`trajectory.txt` 靠它），
-     * 但那个 4 Hz 的**读取**跟着一起停了 —— 见 [refreshMap]。
+     * 显示或隐藏小地图。
+     * 隐藏时同时停止 C++ 侧的点云快照和 Java 侧的轨迹读取。
+     * 轨迹记录本身由 ORB-SLAM3 维护，不受影响。
      */
     private fun applyMapVisible(on: Boolean) {
         mapWrap.visibility = if (on) View.VISIBLE else View.GONE
@@ -2066,13 +1927,13 @@ class MainActivity : AppCompatActivity() {
         sbMapRange.alpha = if (on) 1f else 0.4f
         tvMapRange.alpha = if (on) 1f else 0.4f
         SlamBridge.nativeSetMapCloudEnabled(on)
-        // 藏起来时 `refreshHistory` 会清掉历史层；重新打开要重读一遍。
+        // 隐藏时 refreshHistory 会清掉历史层，重新打开需要重读。
         histDirty = true
         refreshHistory()
         refreshMap()
     }
 
-    /** 滑块刻度 → 切片厚度（**米，全宽**）。 */
+    /** 滑块刻度转换为切片厚度（米，全宽）。 */
     private fun seekToRange(p: Int): Float =
         MapView.SLICE_MIN + (MapView.SLICE_MAX - MapView.SLICE_MIN) * p / kRangeSeekMax
 
@@ -2089,9 +1950,7 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 缩放键 ----------------
 
     /**
-     * 缩放键：**点一下走一档，按住不放连续走**。松手（或滑出去取消）就停。
-     *
-     * 档位是 ×1.5 递下去的、有十几档，一路点过去太费手。
+     * 缩放键：单击走一档，按住连续走，松手或取消时停止。
      */
     private fun wireZoomButton(b: Button, zoom: () -> Unit) {
         b.setOnClickListener { zoom() }
@@ -2105,9 +1964,9 @@ class MainActivity : AppCompatActivity() {
             }
             zoomRepeat = r
             uiHandler.post(r)   // 长按判定一成立就当场走一档，不用再等一拍
-            true                // 消费掉 ⟹ 长按之后不会再补一次点击
+            true                // 消费事件，避免长按后再次触发点击
         }
-        // ⚠️ 返回 **false**：别把事件吃掉，点击和长按照常走 View 自己那套。
+        // 返回 false，保留 View 默认的点击和长按处理。
         b.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_UP || e.action == MotionEvent.ACTION_CANCEL) {
                 stopZoomRepeat()
@@ -2121,7 +1980,7 @@ class MainActivity : AppCompatActivity() {
         zoomRepeat = null
     }
 
-    /** 缩放档位落盘。**只在真的换档时写** —— 长按连按时这个函数每秒会被叫十几次。 */
+    /** 保存缩放档位，仅在档位变化时写入。 */
     private fun saveZoom() {
         val i = mapView.zoomIndex()
         if (i == zoomSaved) return
@@ -2130,10 +1989,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 跟踪状态那一行。
-     *
-     * `NOT_INITIALIZED` 那一条要把话说明白：**惯性初始化需要运动激励，静止举着手机
-     * 永远初始化不了** —— 用户会以为坏了（STAGE7 §2.3 的引导文案）。
+     * 跟踪状态文字。
+     * 惯性初始化需要运动，静止时无法完成，提示中需要说明这一点。
      */
     private fun trackingLine(): String = when (trkState) {
         TRK_OK -> "● 跟踪中（OK）"
@@ -2166,9 +2023,8 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 文件 ----------------
 
     /**
-     * 词袋路径。145 MB，没进 APK，靠 `tools/push-vocab.sh` 推到外部文件目录。
-     *
-     * 返回 null = 已经往状态栏写了可读的提示，调用方直接返回、**不要调 nativeInit**。
+     * 词袋路径。文件未打入 APK，需要推送到外部文件目录。
+     * 返回 null 表示状态栏已显示提示，调用方不应继续调用 nativeInit。
      */
     private fun resolveVocabPath(): String? {
         val f = File(getExternalFilesDir(null) ?: filesDir, VOCAB_NAME)
@@ -2177,8 +2033,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * yaml 路径。`assets/phone.yaml` 是权威副本，但 C++ 那边要的是**真实文件路径**
-     * （`cv::FileStorage` 不吃 AssetManager），所以先落到私有目录。
+     * yaml 路径。assets/phone.yaml 是权威副本，但 C++ 需要真实文件路径，
+     * 因此先复制到私有目录。
      */
     private fun resolveSettingsPath(): String? {
         val dst = File(filesDir, SETTINGS_NAME)
@@ -2186,8 +2042,8 @@ class MainActivity : AppCompatActivity() {
             assets.open(SETTINGS_NAME).use { input ->
                 dst.outputStream().use { output -> input.copyTo(output) }
             }
-            // 选了旧图就把路径补进去。`System` 构造时读的就是这个键，所以载图只在
-            // 那一刻生效一次。值不带 `.osa`，上游自己加后缀。
+            // 选择旧图时补充路径。System 构造时读取该键，载图只在那一刻生效；
+            // 值不带 .osa，上游会自行追加。
             mapFile?.let { dst.appendText("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }
         } catch (e: IOException) {
             Log.e(TAG, "释放 $SETTINGS_NAME 失败", e)
@@ -2199,11 +2055,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * **第一道防线**（STAGE5 §3.2）。路径不对时 ORB-SLAM3 用 `exit(-1)` 报错，
-     * 表现是「App 整个退回桌面、logcat 干干净净」—— 能在这里挡住的就别让它跑进去。
-     *
-     * 挡不住的也得知道它挡不住：yaml **存在但缺一个必填键**照样会 exit(-1)，
-     * 那种只能靠 M2 接进 logcat 的 `cerr`。
+     * 路径检查。路径错误时 ORB-SLAM3 会直接 exit(-1)，应尽量在这里拦住；
+     * 缺少必填项的情况只能依靠 logcat 中的日志。
      */
     private fun refuse(what: String, f: File, hint: () -> String): String? {
         Log.e(TAG, "找不到$what：${f.absolutePath}")
@@ -2212,14 +2065,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 一次**会话**（一次「新建地图 / 打开地图」）= 一个目录：`files/maps/<yyyyMMdd-HHmmss>/`。
-     *
-     * **用时间戳不用 `mapId`** —— mapId 会随进程重启和新建图变，时间戳稳定；
-     * 而且「另存为新图」天然就是新目录。
+     * 一次新建或打开地图对应一个目录：files/maps/<yyyyMMdd-HHmmss>/。
+     * 使用时间戳而不是 mapId，因为后者会随进程和地图变化。
      */
     private fun newSessionDir(): File {
         // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
-        // **绝不能**用 File(null, ...)——那会落到进程的 CWD，在 Android 上就是 "/"。
+        // 不能把 null 传给 File 构造器，否则路径会落到进程当前目录。
         val maps = File(getExternalFilesDir(null) ?: filesDir, "maps")
         // 时间戳只到秒，同一秒里连开两次会撞名 —— 而撞了就会有两个 .osa 落进同一目录。
         val s = stamp()
@@ -2232,25 +2083,24 @@ class MainActivity : AppCompatActivity() {
         return d.apply { mkdirs() }
     }
 
-    /** 目录名和地图文件名的统一时间戳格式。 */
+    /** 目录名和地图文件名使用的时间戳格式。 */
     private fun stamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
 
-    /** `<rec/<runStamp>>/session-M/`，M 取第一个没被占的号。理由见 [startRecording]。 */
+    /** 返回 rec/<runStamp>/session-M/，M 取第一个未占用的编号。 */
     private fun nextSessionDir(run: File): File {
         var n = 1
         while (File(run, "session-$n").exists()) n++
         return File(run, "session-$n")
     }
 
-    /** 这一趟已经录出来的段（`rec/<runStamp>/session-M/`）。 */
+    /** 本趟已录制的段：rec/<runStamp>/session-M/。 */
     private fun sessionDirs(run: File?): List<File> =
         run?.listFiles { f -> f.isDirectory && f.name.startsWith("session-") }
             ?.sorted() ?: emptyList()
 
     /**
-     * 本趟轨迹的前缀：`<会话>/traj/traj-<runStamp>`（不含扩展名）。
-     *
-     * 落在这里而不是 `map-<id>/` —— 图还没存下来之前，那个 id 随时可能被回滚复用。
+     * 本趟轨迹前缀（不含扩展名）：<会话>/traj/traj-<runStamp>。
+     * 图保存前 map id 可能被复用，因此先放在 traj/。
      */
     private fun newTrajBase(): File? {
         val session = sessionDir ?: return null
@@ -2263,7 +2113,7 @@ class MainActivity : AppCompatActivity() {
         return File(dir, "traj-$runStamp")
     }
 
-    /** 读本趟的合并链（`slam::stop()` 里快照好的）。每条 10 个 float。 */
+    /** 读取本趟合并链，每条 10 个 float。 */
     private fun readMerges(): List<FloatArray> {
         val buf = FloatArray(10 * 16)
         val n = SlamBridge.nativeLastMerges(buf)
@@ -2273,8 +2123,8 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 这一趟留不留 ----------------
 
     /**
-     * 弹窗问「这一趟留不留」。
-     * ⚠️ **「不保存」必须是明确动作** —— 点外面 / 按返回都算保存，免得手滑丢数据。
+     * 询问是否保留本趟数据。
+     * 点击外部或返回键都视为保留，只有明确选择「不保存」才丢弃。
      */
     private fun askKeepRun(base: File) {
         val segs = sessionDirs(curRecDir).size
@@ -2301,10 +2151,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 结束时的**第一问**：地图存不存。问完（不管选了哪个）接着问轨迹。
-     *
-     * 排在轨迹前面是有原因的：存地图要**当场把文件名定下来**，定完之后写出来的
-     * 轨迹 json 才记得上它。
+     * 结束时的第一问：是否保存地图。完成后继续询问轨迹。
+     * 先确定地图文件名，随后写出的轨迹元信息才能记录它。
      */
     private fun askMapSave(trajBase: File) {
         SlamBridge.nativeAtlasStats(atlasBuf)
@@ -2374,7 +2222,7 @@ class MainActivity : AppCompatActivity() {
         dlg.show()
     }
 
-    /** 让 SLAM 线程把地图存成 `path + ".osa"`（`path` 不含扩展名）。 */
+    /** 让 SLAM 线程把地图保存为 path + ".osa"（path 不含扩展名）。 */
     private fun startMapSave(pathNoExt: String) {
         savedName = File(pathNoExt).name
         saveMsg = "正在保存地图…"
@@ -2407,7 +2255,7 @@ class MainActivity : AppCompatActivity() {
                 ?.let { copyTree(it, TrajectoryStore.recDir(dst)) }
         }
 
-        // 本趟的松文件也换位置了 —— **指针必须跟着改**，否则存图成功后会去旧目录搬。
+        // 本趟文件路径已改变，指针需要同步更新。
         curTrajBase?.let { base ->
             curTrajBase = File(TrajectoryStore.trajDir(dst), base.name)
         }
@@ -2432,10 +2280,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 用户不要这一趟的轨迹了。
-     *
-     * ⚠️ **录过会话就再问一次** —— 那段得走一趟才录得到，成本比轨迹高得多，
-     * 不该跟着轨迹一起没。没录过就直接删。
+     * 丢弃本趟轨迹。录制过会话时再次确认是否保留录像。
      */
     private fun onDropTrajectory(base: File) {
         val segs = sessionDirs(curRecDir).size
@@ -2457,10 +2302,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 本趟轨迹现在在哪 —— 可能还在 `traj/`，也可能已经被存图成功归档进 `map-<id>/`。
-     *
-     * ⚠️ 存图可能在「留不留轨迹」那个弹窗回答之前就完成 ⟹ 不查这里的话，
-     * 「不保存」会删一个不存在的路径，文件反而留在图目录里。
+     * 返回本趟轨迹的实际位置，可能仍在 traj/，也可能已归档到 map-<id>/。
+     * 存图可能早于是否保留的选择完成，因此需要同时检查两处。
      */
     private fun runTrajFile(base: File, ext: String): File {
         val direct = File("${base}$ext")
@@ -2473,7 +2316,7 @@ class MainActivity : AppCompatActivity() {
         return direct
     }
 
-    /** 只删本趟的轨迹和 json，留下录像。 */
+    /** 只删除本趟轨迹和元信息，保留录像。 */
     private fun dropTrajectoryOnly(base: File) {
         runTrajFile(base, ".txt").delete()
         runTrajFile(base, ".json").delete()
@@ -2483,9 +2326,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 整趟不要了：轨迹 + 录像都删。
-     *
-     * ⚠️ **不能删会话目录** —— `map-<id>/` 里是别的趟的轨迹，`rec/` 里也可能是别的趟的录像。
+     * 丢弃整趟数据：删除轨迹和录像。
+     * 不能删除整个会话目录，其中可能包含其他趟的数据。
      */
     private fun discardAll(base: File) {
         Log.i(TAG, "丢弃这一趟：${base.absolutePath}")
@@ -2498,11 +2340,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * `traj-<stamp>.json`：这一趟的元信息。
-     * 轨迹只含跟踪 OK 的帧；地图每次重置后轨迹清空重来，所以只有最后一段。
-     *
-     * `merges` 记的是**坐标系怎么来的**：重组只在存图成功那一刻做一次，之后被吸收的
-     * 目录就删了，链从磁盘上再也看不出来。
+     * 写入 traj-<stamp>.json 元信息。
+     * 轨迹只包含跟踪 OK 的帧，地图重置后只保留最后一段。
+     * merges 记录坐标系的来源，归档完成后无法再从目录结构推断。
      */
     private fun writeRunMeta(base: File) {
         try {
@@ -2524,7 +2364,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 合并链的 JSON：`[[survivor, absorbed, s, qx, qy, qz, qw, tx, ty, tz], …]`。 */
+    /** 合并链 JSON：[[survivor, absorbed, s, qx, qy, qz, qw, tx, ty, tz], ...]。 */
     private fun mergesJson(): String =
         runMerges.joinToString(", ", "[", "]") { r ->
             "[" + r[0].toLong() + ", " + r[1].toLong() + ", " +
@@ -2532,11 +2372,10 @@ class MainActivity : AppCompatActivity() {
         }
 
     /**
-     * 存图成功之后把本趟轨迹归档进 `map-<id>/`，并按合并链把磁盘上的坐标系统一。
+     * 存图成功后把本趟轨迹归档到 map-<id>/，并按合并链统一磁盘坐标。
      *
-     * ⚠️ **只在「保存中 → 完成」那一拍调一次**（见 [render]）—— `saveState` 是粘性的。
-     * ⚠️ 按链**逐条**做：每一步「幸存目录里现有的东西」正好在当时的坐标系里 ——
-     *    先变换、再把被吸收目录原样搬进来。两条合并记录不能拆成「先全变换再全搬」。
+     * 只在保存中变为完成时调用一次；必须按链逐条处理：
+     * 先变换幸存目录中的现有文件，再将被吸收目录原样移入。
      */
     private fun applyPendingSave() {
         val p = pendingArchive ?: return
@@ -2549,7 +2388,7 @@ class MainActivity : AppCompatActivity() {
             val absorbed = r[1].toLong()
             val dir = TrajectoryStore.mapDir(session, survivor)
 
-            // ① 存量轨迹按 `T_on` 变换。先全部写 `.tmp`，都成功了再统一换名。
+            // ① 按 T_on 变换已有轨迹，先全部写 .tmp，成功后统一改名。
             if (dir.isDirectory) {
                 val files = dir.listFiles { f ->
                     f.isFile && f.name.startsWith("traj-") && f.name.endsWith(".txt")
@@ -2574,7 +2413,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // ② 被吸收目录：**原样**搬进来（它本来就在最终坐标系里），空了才删。
+            // ② 被吸收目录原样移入，清空后删除。
             val src = TrajectoryStore.mapDir(session, absorbed)
             if (!src.isDirectory) continue
             val dst = dir.apply { mkdirs() }
@@ -2587,7 +2426,7 @@ class MainActivity : AppCompatActivity() {
             if (src.listFiles().isNullOrEmpty()) src.delete()
         }
 
-        // ③ 本趟的松轨迹：已经在最终坐标系里，直接搬，**不参与任何变换**。
+        // ③ 本趟轨迹已在最终坐标系中，直接移入，不做变换。
         if (id < 0) return   // 没有图：松文件留在 traj/
         val base = p.base ?: return
         val dst = TrajectoryStore.mapDir(session, id).apply { mkdirs() }
@@ -2596,7 +2435,7 @@ class MainActivity : AppCompatActivity() {
         lastRunDir = dst
     }
 
-    /** 把 [f] 搬进 [dst]；重名时加 `-2`。失败返回 false（调用方**不能**因此删源目录）。 */
+    /** 把 [f] 移入 [dst]，重名时加 -2；失败返回 false，调用方不应删除源目录。 */
     private fun moveInto(f: File, dst: File): Boolean {
         if (!f.isFile) return true
         val dot = f.name.lastIndexOf('.')
@@ -2614,9 +2453,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * `<会话>/session.json`：整个会话的汇总。建目录时写一次，之后不动。
-     *
-     * ⚠️ 名字故意不叫 `traj-*.json` —— 免得和趟级那份混淆（一个是会话级、一个是趟级）。
+     * 写入 <会话>/session.json，作为会话汇总，只在建目录时写一次。
+     * 名字不使用 traj-*.json，以免与趟级元信息混淆。
      */
     private fun writeSessionMeta(session: File) {
         try {

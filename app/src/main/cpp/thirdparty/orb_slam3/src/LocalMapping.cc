@@ -1414,8 +1414,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     for(list<KeyFrame*>::iterator lit = mlNewKeyFrames.begin(), lend=mlNewKeyFrames.end(); lit!=lend; lit++)
     {
         (*lit)->SetBadFlag();
-        // ⚠️ `SetBadFlag()` 对**这张图的初始关键帧**会直接 return（它保护地图原点），
-        //    那种情况下 KF 还在地图里、还被地图点观测着 —— delete 会留下一堆悬空指针。
+        // SetBadFlag() 对初始关键帧会直接返回，此时不能 delete，否则留下悬空指针。
         if((*lit)->isBad())
             delete *lit;
     }
@@ -1486,7 +1485,7 @@ void LocalMapping::ScaleRefinement()
     for(list<KeyFrame*>::iterator lit = mlNewKeyFrames.begin(), lend=mlNewKeyFrames.end(); lit!=lend; lit++)
     {
         (*lit)->SetBadFlag();
-        // 同 `InitializeIMU`：初始关键帧会被 `SetBadFlag()` 拒绝，不能 delete。
+        // 同 InitializeIMU：初始关键帧不会被标记为坏，不能 delete。
         if((*lit)->isBad())
             delete *lit;
     }

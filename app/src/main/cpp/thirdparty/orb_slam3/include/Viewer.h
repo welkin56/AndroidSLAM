@@ -37,9 +37,8 @@ class MapDrawer;
 class System;
 class Settings;
 
-// 原版是那个 Pangolin 窗口 + 绘制线程，整个 Pangolin 依赖就是它带来的。
-// 安卓上没有 Pangolin，所以削成空壳：公有方法签名原样保留（System 和 Tracking 的调用点
-// 一行都不用改），方法体全空。帧绘制本身在 FrameDrawer 里，那个类没动。
+// 原版负责 Pangolin 窗口和绘制线程。安卓上移除了 Pangolin，
+// 这里保留公有方法签名，方法体为空。
 class Viewer
 {
 public:

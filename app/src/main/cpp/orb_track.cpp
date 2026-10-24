@@ -1,4 +1,4 @@
-// 见 orb_track.h —— 这个文件存在的唯一理由是「让不链 OpenCV 的那一层也能喂帧」。
+// 见 orb_track.h。存在的唯一理由：让不链 OpenCV 的那一层也能喂帧。
 #include "orb_track.h"
 
 #include <cstring>
@@ -10,7 +10,7 @@
 namespace slam {
 
 namespace {
-// ORB_SLAM3 `eTrackingState::OK`（Tracking.h:121）。
+// ORB_SLAM3 eTrackingState::OK。
 constexpr int kTrackingOk = 2;
 }  // namespace
 
@@ -19,9 +19,8 @@ bool orbTrack(ORB_SLAM3::System* sys, const unsigned char* gray, int w, int h,
               TrackResult* out) {
     if (sys == nullptr || gray == nullptr || out == nullptr || w <= 0 || h <= 0) return false;
 
-    // 灰度 640x480 连续缓冲。Kotlin 侧 `extractGray()` 已经拍平成 w*h，
-    // 没有 rowStride 的问题（§7 报错速查第 10 条）。
-    // `cv::Mat` 不持有这块内存，`TrackMonocular` 进来第一件事就是 `im.clone()`。
+    // 灰度 640x480 连续缓冲，Kotlin 侧的 extractGray() 已经拍平成 w*h。
+    // cv::Mat 不持有这块内存，TrackMonocular 内部会 clone。
     cv::Mat im(h, w, CV_8UC1, const_cast<unsigned char*>(gray));
 
     const Sophus::SE3f Tcw = sys->TrackMonocular(im, timestamp, imu);
@@ -29,24 +28,20 @@ bool orbTrack(ORB_SLAM3::System* sys, const unsigned char* gray, int w, int h,
     out->trackingState = sys->GetTrackingState();
     out->kfCount = sys->KeyFramesInMap();
 
-    // ⚠️ **Tcw**（世界→相机），和下面存轨迹的 Twc 方向相反。测距要用它 ——
-    // 为什么在这儿带出去见 orb_track.h。这个 memcpy 比那两次 vector 拷贝便宜得多，
-    // 所以不跟着测距开关走。
+    // Tcw（世界到相机），与下面保存的 Twc 方向相反。测距需要它，见 orb_track.h。
     {
         const Eigen::Matrix4f m_cw = Tcw.matrix();
         std::memcpy(out->t_cw16, m_cw.data(), sizeof(out->t_cw16));
     }
 
-    // ⚠️ 只认 OK 的帧。没定位时返回的是**单位阵**，`allFinite()` 照样过，
-    // 存下去就是一堆原点位姿（M5 那趟 224 行里 212 行是 `0 0 0`）。
+    // 只认 OK 的帧。其他状态下返回单位阵，allFinite() 照样通过，
+    // 存下来会得到一堆原点位姿。
     if (out->trackingState != kTrackingOk) return false;
 
-    // 兜住 NaN/Inf。`Sophus::SE3f` 没有 `empty()`。
+    // 过滤 NaN/Inf。Sophus::SE3f 没有 empty()。
     if (!Tcw.matrix().allFinite()) return false;
 
-    // ⚠️ 存 **Twc**（= Tcw.inverse()），和 `SaveTrajectoryEuRoC`（`System.cc:616-622`）一致 ——
-    // 那样和 PC 跑出来的 CameraTrajectory.txt 就是同款格式，直接 diff。
-    // 存成 Tcw 的话对照会看着像旋转错位，白查一轮。
+    // 存 Twc（Tcw 的逆），与 SaveTrajectoryEuRoC 的输出格式一致，便于和 PC 端对比。
     const Sophus::SE3f Twc = Tcw.inverse();
     const Eigen::Matrix4f m = Twc.matrix();
     std::memcpy(out->pose16, m.data(), sizeof(out->pose16));

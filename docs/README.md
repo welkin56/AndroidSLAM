@@ -47,6 +47,8 @@
 - [MEASUREMENT_TUNING.md](tutorial/MEASUREMENT_TUNING.md) —— **测距调参表**：
   每个阈值在哪、管什么、调大调小的后果，以及**调参时看不到什么**（已知的日志缺口）。
   调读数之前先看这份
+- [BUILD_MEMORY.md](tutorial/BUILD_MEMORY.md) —— **编译内存**：`installDebug` 为什么占满内存
+  （ninja 不带 `-j`，按核数开满），现在的 job pool / 堆配置在哪，怎么验证、怎么调
 - [STAGE7_UI_STATE_MACHINE.md](tutorial/STAGE7_UI_STATE_MACHINE.md) —— 阶段七：两个状态机
   ——采集端（已实现）和 SLAM 侧的测距可用性（未开始）
 - [APP_DESIGN.md](tutorial/APP_DESIGN.md) —— **已定的 App 形态**：一条流水线 + 两个视图、

@@ -9,7 +9,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 把采集到的帧和 IMU 样本落盘成 EuRoC 数据集格式。
+ * 把采集到的帧和 IMU 样本按 EuRoC 格式落盘。
  *
  * 目录布局：
  *   sessionDir/cam0/data/<时间戳ns>.png
@@ -20,8 +20,7 @@ class SessionWriter(val sessionDir: File) {
 
     companion object {
         private const val TAG = "SessionWriter"
-        // 队列深度 = 允许积压的帧数。64 帧 ≈ 2 秒。太大则崩溃时丢一大片，
-        // 太小则写入线程偶发卡顿就掉帧。
+        // 队列深度，64 帧约 2 秒；在崩溃丢数据和偶发卡顿之间取平衡。
         private const val FRAME_QUEUE_SIZE = 64
         private const val IMU_QUEUE_SIZE = 8192
     }
@@ -52,20 +51,14 @@ class SessionWriter(val sessionDir: File) {
     val imuWritten = AtomicLong()
     val imuDropped = AtomicLong()
 
-    /** IMU 配对时，加速度和陀螺仪时间戳的最大偏差（纳秒）。 */
+    /** IMU 配对时加速度与陀螺仪时间戳的最大偏差（纳秒）。 */
     val imuMaxPairGapNs = AtomicLong()
 
-    /** 配对偏差的累计值与次数，用来算**均值**。 */
+    /** 配对偏差累计值与次数，用于计算均值。 */
     private val imuGapSumNs = AtomicLong()
     private val imuGapCount = AtomicLong()
 
-    /**
-     * 配对偏差超过 5ms 的次数。
-     *
-     * 这个才是真正要看的指标：最大值只是 12000 次里的一个尖峰（线程被
-     * 调度走了、GC 了一下都会造成），完全没有代表性。如果这一项接近 0，
-     * 说明偏差只是偶发；如果占比可观，才是系统性问题。
-     */
+    /** 配对偏差超过 5 ms 的次数。比最大值更能反映是否存在系统性问题。 */
     val imuGapOver5ms = AtomicLong()
 
     fun recordPairGap(gapNs: Long) {
@@ -84,55 +77,38 @@ class SessionWriter(val sessionDir: File) {
     var startedAtNs: Long = 0
         private set
 
-    /**
-     * 这一段是不是「强制开始」的——对焦没收敛、或者 IMU 还没出数，用户按了红按钮。
-     * 由编排层在 [start] 之前设好，写进 meta.json，**事后审查时一眼能认出可疑数据**。
-     */
+    /** 这一段是否是强制开始：对焦未收敛或 IMU 尚未出数。会写入 meta.json。 */
     @Volatile
     var forced = false
 
-    /**
-     * 这一段是不是**在 SLAM 跑着的时候录的**（抽屉里那个开关）。
-     *
-     * ⚠️ 必须标出来：两种来源录出来的文件**格式完全一样**，事后光看目录分不出。
-     * 而它们的用途不同 —— 带 SLAM 的那段是给「同段数据手机跑 vs PC 跑」做对照用的，
-     * 帧率被落盘拖低过；录制模式录的才是干净的采集数据。
-     */
+    /** 这一段是否在 SLAM 运行时录制。两种来源格式相同，需要额外标记以便区分。 */
     @Volatile
     var withSlam = false
 
-    /** 第一帧落盘的时刻。0 = 一帧都没落。writer 线程独占写。 */
+    /** 第一帧落盘的时刻；0 表示没有写入。只由 writer 线程写。 */
     @Volatile
     var firstFrameTsNs = 0L
         private set
 
     /**
-     * 第一条 IMU 落盘的时刻。0 = 一条都没落。writer 线程独占写。
-     *
-     * 这是「**这一段到底写进去没有**」的权威事实——和 ImuCollector.ready 那个事前
-     * 判断是两回事。事前判断永远可能过时（传感器刚好哑了、写盘刚好失败），
-     * 所以两个都要：一个用来当场决定要不要放行，一个用来事后核对。
-     *
-     * 和 [firstFrameTsNs] 一比，就是这一段两个流的实际覆盖关系。
-     * 按设计 IMU 应该**小于**相机、且差约 300 ms。
+     * 第一条 IMU 落盘的时刻；0 表示没有写入。只由 writer 线程写。
+     * 与 [firstFrameTsNs] 比较可得到两个流的实际覆盖关系，正常情况下 IMU 早约 300 ms。
      */
     @Volatile
     var firstImuTsNs = 0L
         private set
 
-    /** 建文件失败的原因，正常为 null。编排层看它决定要不要继续。 */
+    /** 建文件失败的原因，正常为 null。 */
     @Volatile
     var ioError: String? = null
         private set
 
-    /** writer 线程还在不在。**`stop()` 的 join 超时之后，不能再去删目录。** */
+    /** writer 线程是否仍在运行。stop() 的 join 超时后不能再删除目录。 */
     val threadAlive: Boolean get() = thread?.isAlive == true
 
     /**
      * 建文件并启动 writer 线程。
-     *
-     * **IO 异常在这里收掉，不抛给调用方。** 磁盘满、外部存储没挂载都会走到这儿，
-     * 而调用方是主线程——让它接这个异常只会崩掉 App。失败时 [ioError] 非 null。
+     * IO 异常在这里处理，不抛给主线程；失败时 [ioError] 非 null。
      */
     fun start() {
         try {
@@ -161,19 +137,14 @@ class SessionWriter(val sessionDir: File) {
     }
 
     /**
-     * 采集线程调用。队列满了就丢帧并计数——绝不阻塞采集。
-     *
-     * `running` 为 false 时送来的，是拆除途中的在途帧。[MainActivity] 读 `writer`
-     * 和 `phase` 的顺序（先 writer 后 phase）与本类拆除时的写序（先 phase 后 writer）
-     * **正好相反**，所以相机线程可能读到非 null 的 writer 加一个陈旧的 RECORDING。
-     * 这个窗口只有毫秒级，后果也就是丢一帧——但老代码在这条路上是**静默丢弃且不计数**，
-     * 于是 `frames_written + frames_dropped` 不等于相机实际出的帧数，统计口径骗人。
+     * 采集线程调用。队列满时丢帧并计数，不阻塞采集。
+     * 拆除期间送来的在途帧会因 running 为 false 而计入丢弃。
      */
     fun offerFrame(item: FrameItem) {
         if (!running || !frameQueue.offer(item)) framesDropped.incrementAndGet()
     }
 
-    /** 同上，[offerImu] 侧的那道检查。 */
+    /** 与 [offerFrame] 相同的丢弃计数规则。 */
     fun offerImu(item: ImuItem) {
         if (!running || !imuQueue.offer(item)) imuDropped.incrementAndGet()
     }
@@ -206,23 +177,12 @@ class SessionWriter(val sessionDir: File) {
             val name = "${f.tsNs}.png"
             val file = File(camDir, name)
 
-            // 直接手写灰度 PNG，不走 Bitmap。
-            //
-            // 早期版本用 Bitmap.compress()，踩了两个坑：
-            //   ① ALPHA_8（"纯 alpha"，没有颜色通道）不被 Skia 的 PNG 编码器
-            //      支持，compress() 返回 false 且一个字节都不写，完全静默，
-            //      结果是文件被创建但大小是 0。
-            //   ② 改用 ARGB_8888 之后能出图了，但 4 字节/像素让每帧编码耗时
-            //      超过 100ms，写盘线程跟不上 30fps，丢帧率飙到 65%。
-            //
-            // 手写编码器是 1 字节/像素，数据量小 4 倍，而且产物是真正的
-            // 8-bit grayscale。详见 GrayPng.kt。
+            // 直接写灰度 PNG，无法使用 Bitmap 的灰度编码，见 GrayPng.kt。
             FileOutputStream(file).use { out ->
                 GrayPng.encode(f.gray, f.w, f.h, out)
             }
 
-            // 仍然保留这道校验：文件系统写满、编码器内部异常等都可能留下
-            // 空文件。宁可计一个失败，也不要往 CSV 里记一条指向空图的记录。
+            // 磁盘写满或编码异常可能留下空文件；计入失败，不写入 CSV。
             if (file.length() == 0L) {
                 file.delete()
                 framesFailed.incrementAndGet()
@@ -233,7 +193,7 @@ class SessionWriter(val sessionDir: File) {
             camCsv.write("${f.tsNs},$name\n")
             val written = framesWritten.incrementAndGet()
             if (firstFrameTsNs == 0L) firstFrameTsNs = f.tsNs
-            if (written % 30 == 0L) camCsv.flush()  // 每秒刷一次，崩溃时少丢数据
+            if (written % 30 == 0L) camCsv.flush()  // 每秒刷一次
         } catch (e: Exception) {
             framesFailed.incrementAndGet()
             Log.e(TAG, "写帧失败 ts=${f.tsNs}", e)
@@ -251,10 +211,7 @@ class SessionWriter(val sessionDir: File) {
         }
     }
 
-    /**
-     * 关掉两个 CSV。**对"可能根本没打开成功"是安全的**——[start] 失败时
-     * 会在中途抛出来，那时只有一部分文件被打开。
-     */
+    /** 关闭两个 CSV；允许部分文件尚未成功打开。 */
     private fun closeFiles() {
         try { if (::camCsv.isInitialized) { camCsv.flush(); camCsv.close() } } catch (_: Exception) {}
         try { if (::imuCsv.isInitialized) { imuCsv.flush(); imuCsv.close() } } catch (_: Exception) {}
@@ -263,7 +220,7 @@ class SessionWriter(val sessionDir: File) {
     private fun closeQuietly() {
         closeFiles()
 
-        // 写一份元数据，阶段三/四用得上
+        // 写入元数据
         try {
             val elapsedS = (System.nanoTime() - startedAtNs) / 1e9
             File(sessionDir, "meta.json").writeText(
@@ -307,13 +264,12 @@ class SessionWriter(val sessionDir: File) {
         return buildString {
             append("已运行   : %.1f s\n".format(elapsed))
             append("相机     : %d 帧  掉 %d  丢帧率 %.2f%%\n".format(fw, fd, dropPct))
-            // 这一项必须为 0。不为 0 说明 PNG 编码失败，磁盘上会有 0 字节文件。
+            // 正常应为 0；不为 0 说明 PNG 编码失败。
             append("编码失败 : %d 帧\n".format(framesFailed.get()))
             append("实际帧率 : %.1f fps  (目标 30)\n".format(fps))
             append("IMU      : %d 条  丢 %d\n".format(imuWritten.get(), imuDropped.get()))
             append("IMU 频率 : %.1f Hz\n".format(if (elapsed > 0) imuWritten.get() / elapsed else 0.0))
-            // 均值才是主体，最大值只做参考。超 5ms 的次数接近 0 就说明
-            // 那个最大值只是偶发尖峰，不是系统性问题。
+            // 均值是主体，最大值仅作参考。
             append("配对偏差 : 均值 %.2f ms   最大 %.2f ms   超5ms %d 次\n"
                 .format(imuMeanPairGapMs(), imuMaxPairGapNs.get() / 1e6, imuGapOver5ms.get()))
         }

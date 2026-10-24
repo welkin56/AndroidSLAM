@@ -134,145 +134,119 @@ public:
     void Reset();
     void ResetActiveMap();
 
-    // add:`ResetActiveMap` 原地清空当前图，`Map::mnId` 不变 ——
-    // 所以 KF 数掉到 0 是「重置过」唯一的外部信号。
+    // add：ResetActiveMap 原地清空当前图，Map::mnId 不变，
+    // 因此关键帧数降到 0 是「发生过重置」的唯一外部信号。
     unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }
 
-    // add:当前图的**全部地图点**（`Atlas::GetAllMapPoints()` 的转发）。给 2D 地图的
-    // 点云快照用；`isBad()` 的过滤、抽稀、取坐标都在调用方做。
-    //
-    //  **只能从 tracking 线程调** —— 它直接读 `mpCurrentMap`，而唯一会读到失效指针的
-    //    窗口在 `Tracking::Reset()` 里（`clearAtlas()` 和 `CreateNewMap()` 之间），
-    //    那也正是跑在 tracking 线程上的。
+    // add：返回当前图的全部地图点，供 2D 点云快照使用。
+    // 只能从 tracking 线程调用：它直接读 mpCurrentMap。
     std::vector<MapPoint*> GetAllMapPoints();
 
     /**
-     * add:把当前 atlas **另存到** `<path>.osa`（`path` **不含**扩展名）。
-     *
-     * 不跟 `LoadAtlas` 一样走 yaml：yaml 是构造时读一次就定死的，而文件名要现取。
-     * 只在 SLAM 停止之后调 —— 它序列化整张 atlas。
+     * add：把当前 atlas 另存到 path + ".osa"（path 不含扩展名）。
+     * 文件名需要临时指定，因此不走 yaml；只在 SLAM 停止后调用。
      */
     void SaveAtlasTo(const std::string& path);
 
     /**
-     * add:在**进程内**把 atlas 换回 `<path>.osa` 的那份状态（`path` 空 = 清成一张空图）。
-     *
-     * **只能在 SLAM 线程、且没有帧在动的时候调** —— 它走 `Tracking::Reset()`，
-     * 那里面会阻塞等 LocalMapping / LoopClosing 应答；主线程调就是卡死界面。
-     * 读失败时留下一张空图（系统还能继续跑），返回 false。
+     * add：在进程内把 atlas 换回 path + ".osa" 的状态（path 为空表示空图）。
+     * 只能在 SLAM 线程且没有帧处理时调用；失败时留下空图并返回 false。
      */
     bool ReloadAtlasFrom(const std::string& path);
 
-    /** add：atlas 里现在有几张图 / 一共多少关键帧 / 多少地图点。给界面显示用。 */
+    /** add：返回 atlas 的图数、关键帧数和地图点数。 */
     void GetAtlasStats(int* maps, int* kfs, int* mps);
 
     /**
-     * add：atlas 里**有关键帧**的图（按 id 升序）。三条出参一一对应，返回实际写了几张。
-     * 给 2D 地图查看器的选图列表用；0 关键帧的空图不返回。
+     * add：返回 atlas 中有关键帧的图，按 id 升序；三组出参一一对应。
      */
     int GetMapList(long long* ids, int* kfs, int* mps, int cap);
 
     /**
-     * add：**任意一张图**的点云（该图自己的坐标系），stride 抽稀到 `cap/3` 个点，
-     * 写 `3n` 个 `x y z`。找不到这张图返回 0。
-     *
-     * 会拿 `mMutexMap` 拷一份指针表 —— 只给「选图 / 刷新」这种低频动作调，别每帧调。
+     * add：返回指定图的点云（该图自身坐标系），按 stride 抽稀到 cap/3 点，
+     * 写入 3n 个 x y z；找不到该图时返回 0。仅用于低频操作。
      */
     int GetMapCloud(long long mapId, float* out, int cap);
 
     /**
-     * add:这一趟的**相机轨迹**（地图坐标系的 `Twc`），每点 8 个：`t x y z qx qy qz qw`。
-     *
-     * `cap` = `out` 能装多少 float ⟹ 最多写 `cap/8` 个点。
-     * **超过就按 stride 抽稀**（覆盖全程、恒含最新点），**不是截断** ——
-     * 所以要「取全」就传一个 `≥ 8 × 总帧数` 的 `cap`。
-     *（和 `getPinned` 那个 `cap` 的语义**相反**：那个装不下就少给、靠扩容补全。）
-     *
-     * 数据来自 `mpTracker` 那份「相对参考关键帧」的列表，读时用关键帧当前的位姿重算
-     * ⟹ 回环/BA 改过地图之后仍然一致。和 `SaveTrajectoryEuRoC` 有两处故意不同，见 .cc。
+     * add：返回本趟相机轨迹（地图坐标系的 Twc），每点 8 个：t x y z qx qy qz qw。
+     * 超过 cap/8 点时按 stride 抽稀，覆盖全程并包含最新点。
+     * 数据由相对参考关键帧的位姿实时合成，BA 或回环后仍保持一致。
      */
     int GetFrameTrajectory(float* out, int cap);
 
-    /** 上游那份轨迹表里有多少帧（含跟丢的）。给状态栏的计数用 —— 不抽稀。 */
+    /** 上游轨迹表中的帧数（含跟丢的帧），不抽稀。 */
     int GetFrameTrajectorySize();
 
     /**
-     * add：这一趟**最后一段**轨迹属于哪张图（没有 → -1）。
-     *
-     * ⚠️ 判据必须和 `GetFrameTrajectory()` 完全一致（最后那个非空 reference 属于哪张图），
-     * 否则导出的轨迹和它落进的文件夹会对不上。
+     * add：返回本趟最后一段轨迹所属的图，没有时返回 -1。
+     * 判据必须与 GetFrameTrajectory() 一致。
      */
     long long GetTrajectoryMapId();
 
     /**
-     * add：本进程的合并链，每条 10 个 float
-     * `survivor absorbed s qx qy qz qw tx ty tz`，按发生顺序。**装不下就少给。**
+     * add：返回本进程的合并链，每条 10 个 float：
+     * survivor absorbed s qx qy qz qw tx ty tz，按发生顺序；装不下时少给。
      */
     int GetMergeRecords(float* out, int cap);
 
-    /** add：丢掉链里最前面的 n 条（已经随 `.osa` 落盘的）。返回实际丢了几条。 */
+    /** add：丢掉最前面的 n 条合并记录（已随 .osa 落盘），返回实际条数。 */
     int DropMergeRecords(int n);
 
     /**
-     * add：界面显示用的图 id —— 当前轨迹所属的图；没有轨迹（刚载入 / Reset 之后）
-     * 就取图集里 id 最大且有关键帧的那张。没有 → -1。
+     * add：返回界面显示使用的图 id：当前轨迹所属的图；没有轨迹时取 id 最大且
+     * 有关键帧的图；都没有时返回 -1。
      */
     long long GetDisplayMapId();
 
     /**
-     * add：`GetDisplayMapId()` 那张图所在坐标系里，每个文件夹 id 的累计变换。
-     * 每条 9 个：`id s qx qy qz qw tx ty tz`，**第一条固定是 displayMapId**。
+     * add：返回显示图所在坐标系中每个文件夹 id 的累计变换。
+     * 每条 9 个 float：id s qx qy qz qw tx ty tz；第一条固定为 displayMapId。
      */
     int GetDisplayTransforms(float* out, int cap);
 
     // ---------------- add：路径点 ----------------
     //
-    // 「记一个路径点」= 记下**此刻的相机位姿 + 一个名字**。它和轨迹用同一套存法：
-    // 锚在一个关键帧上、存相对位姿，读的时候现乘 —— 于是 BA / 回环 / 合并改了地图之后，
-    // 路径点自动跟着走，不用任何合并钩子。锚点被剔了就沿 `mTcp` 爬到活着的父帧；
-    // 只有 `GetMap() == nullptr`（`Map::clear()`，即地图被重置）才算失效。
+    // 路径点保存当前相机位姿和名字，锚定在关键帧上并保存相对位姿。
+    // 地图变化后自动跟随；锚点失效时沿 mTcp 上溯到存活帧。
 
     /**
-     * add：在当前相机位置记一个路径点（**SLAM 线程调** —— 要读 `mCurrentFrame`）。
-     * 当前图里还没有关键帧时返回 false。
+     * add：在当前相机位置记录路径点（SLAM 线程调用）。
+     * 当前图没有关键帧时返回 false。
      */
     bool AddWaypoint(const std::string& name);
-    /** 最后一次 `AddWaypoint` 失败的原因（空串 = 上次成功）。 */
+    /** 最后一次 AddWaypoint 失败的原因；成功时为空串。 */
     std::string GetWaypointError();
 
-    /** add：改名 / 删除 / 清空。**任意线程** —— 只碰字符串和容器。 */
+    /** add：改名、删除或清空路径点，任意线程可调。 */
     void RenameWaypoint(int id, const std::string& name);
     void DeleteWaypoint(int id);
     void ClearWaypoints();
 
-    /** add：路径点条数（任意线程）。 */
+    /** add：路径点条数，任意线程可调。 */
     int GetWaypointCount();
 
-    /** add：下一个会分配的 id（= 默认名字里的编号）。任意线程。 */
+    /** add：返回下一个路径点 id，任意线程可调。 */
     int GetNextWaypointId();
 
-    /** add：第 `i` 条的 id 与名字（任意线程）。找不到返回空串。 */
+    /** add：返回指定 id 的路径点名字，任意线程可调；找不到时返回空串。 */
     std::string GetWaypointName(int id);
 
     /**
-     * add：读路径点的世界坐标（**主线程调**）。
-     *
-     * `pos` 每点 3 个 float（`x y z`），`meta` 每点 4 个：
-     * `id, mapId, frameId, flags`（bit0 = 坐标有效 / bit1 = 在当前图）。
-     *
-     * ⚠️ 容量契约和 `getPinned` 一样：**装不下就少给，返回实际写了几个**，
-     * 调用方看到写满就扩容 —— 不能返回真实条数，那调用方会读到没写过的内存。
+     * add：读取路径点世界坐标（主线程调用）。
+     * pos 每点 3 个 float；meta 每点 4 个：id, mapId, frameId, flags
+     * （bit0 坐标有效 / bit1 在当前图）。装不下时少给，返回实际条数。
      */
     int GetWaypoints(float* pos, int posCap, long long* meta, int metaCap);
 
-    /** add：变一次就加一。给界面判断「要不要重建那层叠加」用。 */
+    /** add：路径点每变化一次加一，供界面判断是否重建叠加层。 */
     long long GetWaypointRevision();
 
-    /** add：存 / 读 sidecar（`<path>.waypoints.tsv`）。**SLAM 线程调**；空路径 = 只清空。 */
+    /** add：保存或读取 sidecar（path.waypoints.tsv），SLAM 线程调用；空路径表示只清空。 */
     bool SaveWaypoints(const std::string& path);
     bool LoadWaypoints(const std::string& path);
 
-    /** add：清空那份轨迹表。**一次运行 = 一份轨迹**，`start` 时调（否则会跨 run 累加）。 */
+    /** add：清空轨迹表。一次运行对应一份轨迹，start 时调用。 */
     void ClearFrameTrajectory();
 
     // All threads will be requested to finish.
@@ -338,7 +312,7 @@ private:
     void SaveAtlas(int type);
     bool LoadAtlas(int type);
 
-    // add:同 LoadAtlas，但路径现给，而且**读进现有的 Atlas**（不换指针）。
+    // add：与 LoadAtlas 相同，但路径由参数指定，并读入现有 Atlas（不替换指针）。
     bool LoadAtlasInto(const std::string& path, int type);
 
     string CalculateCheckSum(string filename, int type);
@@ -405,14 +379,13 @@ private:
 
     string mStrVocabularyFilePath;
 
-    // add：路径点。**只在 `System.cc` 里定义具体类型** —— 这个头文件只用前置声明，
-    // 免得为了一个 `Sophus::SE3f` 成员把它们拖进来。
+    // add：路径点。具体类型只在 System.cc 中定义，这里使用前置声明。
     struct Waypoint;
     std::vector<Waypoint*> mvpWaypoints;
     std::mutex mMutexWaypoints;
     long long mnWaypointRevision;
     int mnNextWaypointId;
-    /** 最后一次 `AddWaypoint` 失败的原因。空串 = 上次是成功的。 */
+    /** 最后一次 AddWaypoint 失败的原因；成功时为空串。 */
     std::string mstrWaypointError;
 
     Settings* settings_;

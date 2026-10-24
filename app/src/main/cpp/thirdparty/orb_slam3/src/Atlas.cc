@@ -20,7 +20,7 @@
 #include "Viewer.h"
 
 #include <algorithm> // std::min（GetMergeRecords）
-#include <map>       // 文件夹 id → 累计变换（GetDisplayTransforms）
+#include <map>       // 文件夹 id 到累计变换（GetDisplayTransforms）
 #include <utility>   // std::move（AdoptFrom）
 
 #include "GeometricCamera.h"
@@ -324,10 +324,9 @@ void Atlas::PreSave()
         }
     };
 
-    // ⚠️ 先清空再重建。同一进程里连续存图（跑一趟→存→再跑→存）时，这里会留着
-    //    上一次的列表：被合并掉的图还挂着**上一次**的备份数组，而里面的 KF/MP
-    //    早已搬到别的图去了 —— 写出去的文件自相矛盾，载入时 `PostLoad` 找不到 id。
-    //    空图 / 坏图也一并挡在列表外（它们没有意义，还可能是上面那种旧数组）。
+    // 先清空再重建。连续存图时旧列表会保留上一次的备份数组，
+    // 其中关键帧和地图点可能已移到别的图，导致写出的文件自相矛盾。
+    // 空图和坏图也一并排除。
     mvpBackupMaps.clear();
     vector<Map*> vMaps(mspMaps.begin(), mspMaps.end());
     sort(vMaps.begin(), vMaps.end(), compFunctor());
@@ -376,7 +375,7 @@ void Atlas::PostLoad()
     }
     mvpBackupMaps.clear();
 
-    // 链属于**被换掉的**那个 atlas：读进来的图各自是独立坐标系，旧链一条都不能留。
+    // 合并链属于被替换的 atlas，新载入的图各自独立，旧链需要清空。
     ClearMergeRecords();
 }
 
@@ -385,9 +384,8 @@ void Atlas::AdoptFrom(Atlas* p)
     if(!p)
         return;
 
-    // 只搬 `serialize` 装的那几个字段。`mspMaps` / `mpCurrentMap` 由调用方在
-    // `PostLoad()` + `CreateNewMap()` 里重建（这里动会踩到 reset 刚建的那张空图）。
-    // 静态 ID 计数器是 `serialize` 直接写的，已经在全局生效，不用搬。
+    // 只搬运 serialize 处理的字段。mspMaps 和 mpCurrentMap 由调用方重建，
+    // 静态 ID 计数器已经全局生效。
     unique_lock<mutex> lock(mMutexAtlas);
     mvpBackupMaps = std::move(p->mvpBackupMaps);
     mvpCameras = std::move(p->mvpCameras);
@@ -422,7 +420,7 @@ int Atlas::GetMergeRecords(float* out, int cap)
     {
         const MapMergeRecord& r = mvMerges[static_cast<size_t>(i)];
         float* o = out + 10 * i;
-        // id 走 float 传：一次会话里的 map id 远小于 2^24，精度够。
+        // map id 远小于 2^24，用 float 传递精度足够。
         o[0] = static_cast<float>(r.survivor);
         o[1] = static_cast<float>(r.absorbed);
         o[2] = r.s;
@@ -466,7 +464,7 @@ int Atlas::GetDisplayTransforms(long long displayId, float* out, int cap)
     if (out == nullptr || cap < 9 || displayId < 0)
         return 0;
 
-    // 只用 POD，不让 Eigen 类型进容器（对对齐有要求）。
+    // 只使用 POD 类型，避免 Eigen 类型的对齐问题。
     struct Xform
     {
         float s;
@@ -495,7 +493,7 @@ int Atlas::GetDisplayTransforms(long long displayId, float* out, int cap)
         const Eigen::Quaternionf q2(r.q[3], r.q[0], r.q[1], r.q[2]);
         const Eigen::Vector3f t2(r.t[0], r.t[1], r.t[2]);
 
-        // 幸存图那一族整体再乘一次 T_on：p' = s2·R2·(s1·R1·p + t1) + t2。
+        // 幸存图一族整体再乘一次 T_on：p' = s2*R2*(s1*R1*p + t1) + t2。
         for (auto& kv : m)
         {
             if (kv.second.owner != r.survivor)
@@ -510,7 +508,7 @@ int Atlas::GetDisplayTransforms(long long displayId, float* out, int cap)
             x.t[0] = t.x(); x.t[1] = t.y(); x.t[2] = t.z();
         }
 
-        // 被吸收图连同它已有的族并进幸存图；它自己的变换**不变**（本来就在最终系里）。
+        // 被吸收图连同已有族并入幸存图；其自身变换不变。
         for (auto& kv : m)
             if (kv.second.owner == r.absorbed)
                 kv.second.owner = r.survivor;
@@ -531,8 +529,7 @@ int Atlas::GetDisplayTransforms(long long displayId, float* out, int cap)
     };
 
     put(display, m[display]);
-    // 只给 display 那一族：链里可能还留着别的图（地图被重置后换过 current map）的合并，
-    // 那些图的坐标系和 display 无关，画上去是错的。
+    // 只输出 display 所在的族，其他图的坐标系与 display 无关。
     for (const auto& kv : m)
         if (kv.first != display && kv.second.owner == display && !put(kv.first, kv.second))
             break;

@@ -13,7 +13,7 @@
 #include <vector>
 #include <string>
 #include <sstream>
-#include <stdint.h>   // 原为 <stdint-gcc.h>：GCC 内部头，clang/libc++ 里没有
+#include <stdint.h>   // 原为 <stdint-gcc.h>，clang/libc++ 中没有该头
 
 #include "FORB.h"
 

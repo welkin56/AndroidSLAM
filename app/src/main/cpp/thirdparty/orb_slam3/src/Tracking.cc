@@ -1608,8 +1608,8 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
     vdORBExtract_ms.push_back(mCurrentFrame.mTimeORB_Ext);
 #endif
 
-    // add：0 个特征点的帧，上游的 `Frame` ctor 会提前 return、一堆成员没赋上值
-    //（`mpMutexImu` 是裸指针 ⟹ `PreintegrateIMU` 崩在 0x0）。丢掉；返回**上一帧**的位姿，它自己的 pose 也是垃圾。
+    // add：没有特征点的帧会被 Frame 构造函数提前返回，部分成员未初始化。
+    // 直接跳过，返回上一帧位姿。
     if(mCurrentFrame.N == 0)
     {
         Verbose::PrintMess("Empty frame (0 keypoints), skipped", Verbose::VERBOSITY_NORMAL);
@@ -2316,8 +2316,7 @@ void Tracking::Track()
 
     if(mState==OK || mState==RECENTLY_LOST)
     {
-        // add：另一个线程（2D 地图，4Hz）会在跑的时候读这四张表。
-        //    临界区只有四个 push_back，很短。
+        // add：2D 地图线程会在运行中读取这四个列表，临界区只有四个 push_back。
         unique_lock<mutex> lockTraj(mMutexTraj);
 
         // Store frame pose information to retrieve the complete camera trajectory afterwards.
@@ -3841,7 +3840,7 @@ void Tracking::Reset(bool bLocMap)
     mbReadyToInitializate = false;
     mbSetInit=false;
 
-    // 主线程随时可能从 `GetFrameTrajectory` 读这四张表 ⟹ 清的时候要拿同一把锁。
+    // 主线程可能通过 GetFrameTrajectory 读取这些列表，清空时需要持同一把锁。
     {
         unique_lock<mutex> lockTraj(mMutexTraj);
         mlRelativeFramePoses.clear();
@@ -3856,8 +3855,7 @@ void Tracking::Reset(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
 
-    // IMU 预积分也属于上一张图：`CreateInitialMapMonocular` 会把它直接挂到
-    // 新图的第一对 KF 上。不清的话，那段预积分带着旧会话的运动。
+    // IMU 预积分属于上一张图，必须重建，避免带入旧会话的运动。
     if(mpImuPreintegratedFromLastKF)
         delete mpImuPreintegratedFromLastKF;
     mpImuPreintegratedFromLastKF = new IMU::Preintegrated(IMU::Bias(), *mpImuCalib);

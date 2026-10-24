@@ -967,7 +967,7 @@ void KeyFrame::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsi
     for(map<long unsigned int, int>::const_iterator it = mBackupConnectedKeyFrameIdWeights.begin(), end = mBackupConnectedKeyFrameIdWeights.end();
         it != end; ++it)
     {
-        // 自检（`CheckBackupConsistency`）应该已经挡住了；这里只是不让坏文件把 App 带走。
+        // 自检通常已拦住；这里跳过无效引用，避免坏文件导致崩溃。
         KeyFrame* pKFi = mpKFid[it->first];
         if(pKFi)
             mConnectedKeyFrameWeights[pKFi] = it->second;

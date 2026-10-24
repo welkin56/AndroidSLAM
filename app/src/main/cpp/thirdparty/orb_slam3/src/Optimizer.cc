@@ -3139,9 +3139,8 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
         {
             if(pKFi->isBad() || pKFi->mPrevKF->mnId>maxKFid)
                 continue;
-            // ⚠️ 我们改的（上游 bug，和 README 第 10 条同源）：原句只打印一句，**没有 continue**，
-            //    下一行照样解引用空指针 —— 必崩（真机 tombstone: pthread_mutex_lock / fault 0x8a8）。
-            //    没有预积分就没法参与惯性优化，跳过这个关键帧和上面按 isBad()/mnId 过滤是同一套逻辑。
+            // 上游只打印错误后继续解引用，这里补上 continue：没有预积分的关键帧
+            // 无法参与惯性优化。
             if(!pKFi->mpImuPreintegrated)
                 continue;
 
@@ -3464,9 +3463,8 @@ void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &sc
             g2o::HyperGraph::Vertex* VS = optimizer.vertex(4*(maxKFid+1)+1);
             if(!VP1 || !VV1 || !VG || !VA || !VP2 || !VV2 || !VGDir || !VS)
             {
-                // ⚠️ 我们改的（上游 bug）：原句在**已经判定有 nullptr 之后**还逐个 `->id()`
-                // 去拼错误串 —— 走到这里必崩（空指针 + 偏移 8）。分支本来就是 continue，
-                // 所以只删这句，**计算路径一个字没变**。见 thirdparty/README.md 第 10 条。
+                // 上游在此处逐个调用 id() 拼接错误信息，但顶点可能为空。
+                // 这里只打印固定信息，随后 continue。
                 Verbose::PrintMess("Error: missing vertex, skip edge", Verbose::VERBOSITY_NORMAL);
 
                 continue;
@@ -4040,10 +4038,8 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
 
     int N = vpOptimizableKFs.size();
 
-    // ⚠️ 两条时间链可能**重叠**：当前 KF 往前追、合并目标 KF 往前追/往后追，
-    //    会走到同一个 KF 上。重复进 `vpOptimizableKFs` 就是同一个 `mnId` 被
-    //    `addVertex` 两次 —— g2o 只打一行 FATAL，图已经坏了，合并后整张图不刷新。
-    //    这里按对象去重，保留首次出现的顺序。
+    // 两条时间链可能重叠，同一关键帧会被加入 vpOptimizableKFs 两次，
+    // 导致重复 addVertex。这里按对象去重并保留首次出现的顺序。
     {
         std::set<KeyFrame*> seen;
         size_t w = 0;
@@ -4181,7 +4177,7 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
     }
 
     // Set Fixed KeyFrame vertices
-    // ⚠️ 去重：可能和上面两个优化集里的 KF 是同一个，重复 `addVertex` 会毁掉这张图。
+    // 去掉与两个优化集中重复的关键帧，避免重复 addVertex。
     {
         std::set<KeyFrame*> seen(vpOptimizableKFs.begin(), vpOptimizableKFs.end());
         seen.insert(vpOptimizableCovKFs.begin(), vpOptimizableCovKFs.end());

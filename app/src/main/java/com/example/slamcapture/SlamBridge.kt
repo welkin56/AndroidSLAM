@@ -1,10 +1,10 @@
 package com.example.slamcapture
 
 /**
- * JNI 声明层：只做「Kotlin ↔ C++」的契约，不写业务。
+ * JNI 声明层：只定义 Kotlin 与 C++ 的调用契约，不写业务。
  *
- * C++ 侧符号必须是 `Java_com_example_slamcapture_SlamBridge_<方法名>`。
- * C++ 那边的 `cout` / `printf` 去处是 **logcat（tag `slam`）**，不是 Run 窗口。
+ * C++ 符号必须是 Java_com_example_slamcapture_SlamBridge_<方法名>。
+ * C++ 的 cout/printf 输出到 logcat（tag slam）。
  */
 object SlamBridge {
 
@@ -12,83 +12,73 @@ object SlamBridge {
         System.loadLibrary("slam_jni")
     }
 
-    // —— M4：构造 ORB_SLAM3::System ——
+    // M4：构造 ORB_SLAM3::System
 
     /**
-     * **只生效一次**，重复调用会被忽略（构造要几十秒，不能重来）。
+     * 只生效一次，重复调用会被忽略。同步只保存路径并置为加载中，构造在后台线程完成。
      *
-     * 只做「存路径 + 置加载中」就返回，真正的构造在别的线程上 —— 否则「启动」按钮卡死。
-     *
-     * 两条路径必须存在：路径不对时 ORB-SLAM3 用 `exit(-1)`，表现是 App 直接没了、
-     * logcat 里什么都没有。
-     *
-     * @param loadFromFile 载入哪张旧图（绝对路径，**不带 `.osa`**）。null = 新建地图。
+     * @param loadFromFile 要载入的旧图绝对路径（不带 .osa）；null 表示新建地图。
      */
     external fun nativeInit(vocabPath: String, settingsPath: String, loadFromFile: String?)
 
-    /** 构造状态：0=没开始 1=加载中 2=就绪 3=失败。四态是必需的：「失败」得能显示出来。 */
+    /** 构造状态：0 未开始 / 1 加载中 / 2 就绪 / 3 失败。 */
     external fun nativeState(): Int
 
     external fun nativeIsReady(): Boolean
 
-    /** 词袋加载了多久（毫秒），不在加载中时返回 0。**别自己掐表** —— Activity 重建会归零，而构造是进程级的。 */
+    /** 已加载的毫秒数，不在加载中时返回 0。由 C++ 计时，Activity 重建不会归零。 */
     external fun nativeElapsedMs(): Long
 
-    // —— M5：喂帧、喂 IMU、位姿 ——
+    // M5：喂帧、喂 IMU、位姿
 
-    /** 每帧一次。**跑在相机线程上，里面绝不能阻塞** —— 实现里只是拷进队列。 */
+    /** 每帧调用一次，运行在相机线程上，不能阻塞；实现只拷贝进队列。 */
     external fun nativePushImage(tsNs: Long, gray: ByteArray, w: Int, h: Int)
 
     /**
-     * 一个完整样本调一次：**角速度在前、加速度在后**。
-     *
-     * 和 `ImuItem` 的顺序相反，分开传很容易写反 —— 而**写反不报错、只是跟踪整个乱掉**。
+     * 一个完整样本调用一次：角速度在前、加速度在后。
+     * 与 ImuItem 的顺序相反，写反不会报错，但会导致跟踪异常。
      */
     external fun nativePushImu(tsNs: Long, wx: Float, wy: Float, wz: Float,
                                ax: Float, ay: Float, az: Float)
 
-    /** 开始吃帧。**不销毁 `System`** —— 停止之后再启动是立刻可用的。 */
+    /** 开始吃帧，不销毁 System。 */
     external fun nativeStart()
 
-    /** 停止吃帧，并清空积压的队列（否则下次启动会吃到旧帧）。`System` 保留。 */
+    /** 停止吃帧并清空队列，System 保留。 */
     external fun nativeStop()
 
-    /** 4x4 **列主序**。返回 false = 还没有位姿。`out` 必须 ≥ 16 个元素。 */
+    /** 4x4 列主序；返回 false 表示还没有位姿。out 至少 16 个元素。 */
     external fun nativeGetPose(out: FloatArray): Boolean
 
-    /** ORB-SLAM3 的 `eTrackingState`：-1 没准备好 / 0 一帧没进来 / 1 惯性初始化中 / 2 OK / 3 刚丢 / 4 全丢。 */
+    /** eTrackingState：-1 未就绪 / 0 无帧 / 1 惯性初始化 / 2 OK / 3 刚丢 / 4 完全丢。 */
     external fun nativeGetTrackingState(): Int
 
-    /** 本次运行「地图被重置」的次数。[nativeStart] 归零。 */
+    /** 本次运行的地图重置次数，[nativeStart] 归零。 */
     external fun nativeResetCount(): Int
 
-    /** 当前轨迹有多少条。 */
+    /** 当前轨迹的点数。 */
     external fun nativeTrajSize(): Int
 
     /**
-     * 2D 地图的轨迹：`out` 收 `3n` 个 float（世界米 `x y z`），返回点数。
-     *
-     * **stride 抽稀，不是截断**（覆盖全程、恒含最新点）—— 要的是形状，**别扩容取全**。
+     * 2D 地图轨迹：out 收 3n 个 float（世界坐标 x y z），返回点数。
+     * 按 stride 抽稀，覆盖全程并包含最新点。
      */
     external fun nativeGetTrajectory(out: FloatArray): Int
 
     /**
-     * 2D 地图的点云：`out` 收 `3n` 个 float（世界米 `x y z`），返回点数。
-     *
-     * 是 SLAM 线程**每秒重建一次的快照**，不是现读地图（全图枚举要抱地图的锁）。
-     * 和 [nativeGetTrajectory] 一样抽稀（上限 5000），**同样别扩容取全**。
+     * 2D 地图点云：out 收 3n 个 float（世界坐标 x y z），返回点数。
+     * 数据是 SLAM 线程每秒重建的快照，上限 5000 点。
      */
     external fun nativeGetMapPoints(out: FloatArray): Int
 
-    /** 小地图开关。关掉时 SLAM 线程连点云快照都不重建；重开时下一个空隙立刻重建。 */
+    /** 小地图开关。关闭时 SLAM 线程不重建点云快照。 */
     external fun nativeSetMapCloudEnabled(on: Boolean)
 
-    // —— 存图 / 载图 ——
+    // 存图 / 载图
 
     /**
-     * 把当前地图另存到 `path + ".osa"`（**不含扩展名**）。**只在 SLAM 停止之后调。**
-     *
-     * 只发请求就返回 —— 序列化整张 atlas 要几秒，卡主线程就是 ANR。进度看 [nativeSaveState]。
+     * 把当前地图另存到 path + ".osa"（不含扩展名），只在 SLAM 停止后调用。
+     * 只发请求，序列化在后台完成；进度看 [nativeSaveState]。
      */
     external fun nativeRequestSaveMap(path: String)
 
@@ -96,10 +86,8 @@ object SlamBridge {
     external fun nativeSaveState(): Int
 
     /**
-     * 把 atlas 恢复成「上一次保存」的样子 —— 目标：最近一次成功存图的文件；
-     * 没存过就用构造时载入的那张；都没有（新建地图）就清成一张空图。
-     *
-     * 一趟结束但没保存时调。**只发请求就返回**，进度看 [nativeRestoreState]。
+     * 把 atlas 恢复到上一次保存的状态：优先最近一次成功存图，其次构造时载入的图，
+     * 都没有则清成空图。一趟结束但未保存时调用，进度看 [nativeRestoreState]。
      */
     external fun nativeRequestRestoreMap()
 
@@ -107,65 +95,56 @@ object SlamBridge {
     external fun nativeRestoreState(): Int
 
     /**
-     * 把 atlas 换成 [path] 指向的那张（**不含扩展名**；空串 = 空图）。
-     *
-     * 入口页每次重新选都要调：`System` 只能构造一次，不换的话「新建地图」只是
-     * 又开一张当前图，旧 atlas 原样留着。**只发请求**，进度同样看 [nativeRestoreState]。
+     * 把 atlas 换成 [path] 指定的图（不含扩展名，空串表示空图）。
+     * 入口页重新选择时调用，只发请求；进度看 [nativeRestoreState]。
      */
     external fun nativeRequestLoadAtlas(path: String)
 
-    /** atlas 现在装的是哪一份（不含扩展名）。空串 = 新建 / 空图。 */
+    /** atlas 当前对应的路径（不含 .osa）；空串表示新建或空图。 */
     external fun nativeLoadedMap(): String
 
-    /**
-     * atlas 有多大。`out` 要 ≥ 3，收 `[图数, 关键帧数, 地图点数]`。
-     *
-     * 载图之后这是界面上**唯一**看得出「图进来了」的地方 —— 载进来的图不是当前图，
-     * 小窗、轨迹、测距都看不到它。
-     */
+    /** atlas 规模。out 至少 3 个，依次为图数、关键帧数、地图点数。 */
     external fun nativeAtlasStats(out: IntArray)
 
     /**
-     * atlas 里**有关键帧**的图（按 id 升序）。三组出参一一对应，返回写了几张。
-     * 数组装不下就少给 —— 看到返回 == 数组长度就扩容重来（同 `nativeGetWaypoints`）。
+     * atlas 中有关键帧的图（按 id 升序）。三组出参一一对应，返回实际写入数。
+     * 数组装不下时少给；返回值等于数组长度时应扩容重读。
      */
     external fun nativeMapList(ids: LongArray, kfs: IntArray, mps: IntArray): Int
 
     /**
-     * **任意一张图**的点云（该图自己的坐标系）。`out` 收 `3n` 个 float，返回点数。
-     * **stride 抽稀到 `out.size / 3`**，不是截断。只在选图 / 刷新时调。
+     * 指定图的点云（该图自己的坐标系）。out 收 3n 个 float，返回点数。
+     * 按 stride 抽稀到 out.size / 3，只在选图和刷新时调用。
      */
     external fun nativeMapCloud(mapId: Long, out: FloatArray): Int
 
     /**
-     * 当前轨迹**此刻**属于哪张图（-1 = 没有）。和 [nativeLastTrajMapId] 不同：
-     * 这个跑着的时候也是实时值，那个是 `stop()` 的快照。
+     * 当前轨迹此刻所属的图，-1 表示没有。
+     * 与 [nativeLastTrajMapId] 不同：这里是实时值。
      */
     external fun nativeTrajectoryMapId(): Long
 
-    /** 构造失败的细分：0 没失败 / 1 载图失败 / 2 别的。 */
+    /** 构造失败细分：0 没失败 / 1 载图失败 / 2 其他。 */
     external fun nativeFailureCode(): Int
 
-    /** 把这一趟的位姿历史写成文件（TUM 格式）。**一次运行一份** —— [nativeStart] 会清掉上一趟。 */
+    /** 把本趟位姿历史写成 TUM 格式文件。 */
     external fun nativeDumpTrajectory(path: String)
 
-    // —— M6：画面中心的距离读数 ——
+    // M6：画面中心的距离读数
 
-    /** 抽屉里那个开关。关掉时 C++ 连算都不算，但**不影响 SLAM 跟踪**。 */
+    /** 实时测距开关。关闭时只停止计算，不影响 SLAM 跟踪。 */
     external fun nativeSetMeasuring(on: Boolean)
 
-    /** `out` **必须 ≥ 7**（短了返回「不可测」）：`[0]`距离 `[1..3]`世界xyz `[4][5]`图像xy `[6]`附近特征点数。 */
+    /** out 至少 7 个：[0] 距离、[1..3] 世界 xyz、[4][5] 图像 xy、[6] 附近特征点数。 */
     external fun nativeGetMeasure(out: FloatArray): Int
 
-    // —— 多点折线 ——
+    // 多点折线
     //
-    // 折线整个存在 C++ 侧，因为它要存 `MapPoint*`。存坐标快照不行：BA 一直在挪地图点，
-    // 走一圈之后快照就和地图差开 —— 标记飘到空中，**长度数字也跟着错**。
+    // 折线保存在 C++ 侧，因为需要保存 MapPoint*；坐标会随 BA 变化。
 
     /**
-     * 把当前读数钉成一个点。没有有效读数返回 false。
-     *
-     * `snapTo >= 0` = 复制第 `snapTo` 个点的**身份**；-1 = 用十字当前的读数。
+     * 把当前读数钉成一个点，没有有效读数时返回 false。
+     * snapTo >= 0 时复制第 snapTo 个点的身份；-1 表示使用十字当前读数。
      */
     external fun nativeAddPinned(snapTo: Int): Boolean
 
@@ -173,33 +152,30 @@ object SlamBridge {
 
     external fun nativeClearPinned()
 
-    /** 「断开」：最后一个点之后不再拉橡皮筋，下一个点会另起一条折线。 */
+    /** 断开折线：下一个点另起一条，不再拉橡皮筋。 */
     external fun nativeClosePinnedChain()
 
     /**
-     * 读折线。**刷新坐标、投影、算长度全在 C++ 做完**，这一侧只管画。
+     * 读折线；刷新坐标、投影和长度计算都在 C++ 完成。
      *
-     * `out` 要 ≥ `8n + 1`，返回**实际写了几个点**（可能小于真实点数 —— 那时扩容后下一帧再来）。
-     *
-     * ```
-     * out[0] = n
-     * 每点 3 个：px py flags
-     * 每段 5 个：x0 y0 x1 y1 len        len < 0 表示这条不画
-     * 最后 5 个：x0 y0 x1 y1 liveLen    liveLen < 0 表示没有橡皮筋
-     * ```
-     *
-     * `flags` 的位：bit0 在相机前方 / bit1 之后断开 / bit2 不太准。
+     * out 至少 8n + 1，返回实际写入点数（装不下时少给）。
+     * 布局：
+     *   out[0] = n
+     *   每点 3 个：px py flags
+     *   每段 5 个：x0 y0 x1 y1 len（len 小于 0 表示不画）
+     *   最后 5 个：x0 y0 x1 y1 liveLen（小于 0 表示没有橡皮筋）
+     * flags：bit0 在相机前方 / bit1 之后断开 / bit2 不太准。
      */
     external fun nativeGetPinned(out: FloatArray): Int
 
-    // —— 路径点 ——
+    // 路径点
     //
-    // 锚在关键帧上、存相对位姿，和轨迹同一套：BA / 回环 / 合并改了地图之后自动跟着走。
+    // 锚定在关键帧上并保存相对位姿，地图变化后会自动跟随。
 
-    /** 在当前位置记一个路径点。**发请求就返回**，下一帧在 SLAM 线程执行。 */
+    /** 在当前位置记录路径点；发请求即返回，下一帧在 SLAM 线程执行。 */
     external fun nativeRequestAddWaypoint(name: String)
 
-    /** 加路径点的结果：0 没试过 / 1 排队 / 2 成功 / 3 失败。 */
+    /** 加路径点状态：0 没试过 / 1 排队 / 2 成功 / 3 失败。 */
     external fun nativeWaypointState(): Int
 
     /** 失败原因。成功时是空串。 */
@@ -209,55 +185,48 @@ object SlamBridge {
 
     external fun nativeDeleteWaypoint(id: Int)
 
-    /** 变一次加一 —— 只在它变了之后重建小地图那层。 */
+    /** 每次变化加一，界面据此重建图层。 */
     external fun nativeWaypointRevision(): Long
 
-    /** 路径点总条数（含失效的）。 */
+    /** 路径点总条数，包含失效的。 */
     external fun nativeWaypointCount(): Int
 
-    /** 下一个路径点 id —— 默认名字用它的编号，**单调递增**，删过点也不会重名。 */
+    /** 下一个路径点 id，单调递增，删除后也不会复用。 */
     external fun nativeNextWaypointId(): Int
 
     /**
-     * 读路径点。`pos` 每点 3 个 float，`meta` 每点 `id, mapId, kfId, flags`
-     * （bit0 坐标有效 / bit1 在当前图），`names` 收名字。
-     *
-     * 返回**实际写了几条**（装不下就少给）—— 和 [nativeGetPinned] 同一个契约。
-     * 名字元素可为 null（JNI 侧本来就只认 `jobjectArray`，可空性签名不参与链接）。
+     * 读取路径点。pos 每点 3 个 float；meta 每点 id, mapId, kfId, flags
+     * （bit0 坐标有效 / bit1 在当前图）；names 接收名字。
+     * 返回实际写入条数，装不下时少给。名字元素可以为 null。
      */
     external fun nativeGetWaypoints(pos: FloatArray, meta: LongArray, names: Array<String?>): Int
 
-    // —— 轨迹归属 / 合并链 ——
+    // 轨迹归属 / 合并链
 
-    /**
-     * 本趟最后一段轨迹属于哪张图（-1 = 没有）。
-     * **`nativeStop()` 之后立刻读** —— 快照就在 `slam::stop()` 里做的。
-     */
+    /** 本趟最后一段轨迹所属的图（-1 表示没有）。应在 nativeStop() 之后立即读取。 */
     external fun nativeLastTrajMapId(): Long
 
-    /** 本趟的合并链：每条 10 个 float `survivor absorbed s qx qy qz qw tx ty tz`。 */
+    /** 本趟合并链：每条 10 个 float，survivor absorbed s qx qy qz qw tx ty tz。 */
     external fun nativeLastMerges(out: FloatArray): Int
 
     /**
-     * 把一个轨迹文件按合并变换写到 [dst]。8 列：`time tx ty tz qx qy qz qw`（Twc）。
-     * 写的是**副本** —— 调用方负责「全部写完再统一 rename」。
+     * 把轨迹文件按合并变换写入 [dst]。格式为 8 列：time tx ty tz qx qy qz qw（Twc）。
+     * 写入副本，调用方负责全部成功后再统一重命名。
      */
     external fun nativeTransformTrajFile(src: String, dst: String,
                                          s: Float, qx: Float, qy: Float, qz: Float, qw: Float,
                                          tx: Float, ty: Float, tz: Float): Boolean
 
     /**
-     * 小地图显示历史轨迹用的坐标系信息：每条 9 个 float
-     * `id, s, qx, qy, qz, qw, tx, ty, tz`。**第一条的 id 就是显示用的图**（没有图时返回 0）。
-     *
-     * 被吸收的图原样（变换是单位），幸存图那一族带合并的 `T_on`；多跳已经合成。
-     * `out` 要 ≥ `9 × 期望条数`。
+     * 历史轨迹显示所需的坐标系信息：每条 9 个 float，
+     * id, s, qx, qy, qz, qw, tx, ty, tz。第一条的 id 是显示用图（没有图时返回 0）。
+     * 多跳合并已经合成；out 至少 9 乘以期望条数。
      */
     external fun nativeDisplayTransforms(out: FloatArray): Int
 
     /**
-     * 读一个已归档的轨迹文件、按上面那个变换换算，`out` 收 `3n` 个 float（world xyz）。
-     * 返回点数；**stride 抽稀**到 `out.size / 3`，不是截断。
+     * 读取已归档轨迹并按上述变换换算，out 收 3n 个 float（世界 xyz），返回点数。
+     * 按 stride 抽稀到 out.size / 3。
      */
     external fun nativeReadTrajFile(path: String,
                                     s: Float, qx: Float, qy: Float, qz: Float, qw: Float,

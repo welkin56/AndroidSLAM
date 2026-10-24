@@ -6,28 +6,15 @@ import java.util.zip.CRC32
 import java.util.zip.Deflater
 
 /**
- * 极简 8 位灰度 PNG 编码器（手写，不走 Bitmap）。
+ * 极简 8 位灰度 PNG 编码器，手写实现，不走 Bitmap。
  *
- * 为什么不用 Bitmap.compress()：
- *
- *   Bitmap 根本没有 1 字节的灰度格式。最接近的 ALPHA_8 是"纯 alpha"，
- *   Skia 的 PNG 编码器不支持（返回 false 且静默写出 0 字节）。
- *   唯一能用的 ARGB_8888 是 **4 字节/像素**——灰度数据本来只有 1 字节，
- *   等于让 deflate 去压 4 倍的数据量。实测手机上每帧要 100ms 以上，
- *   30fps 根本跟不上，写盘线程成为瓶颈，队列秒满、疯狂丢帧。
- *
- *   直接按 PNG 规范写灰度，输出数据量小 4 倍，编码耗时降到 ~15ms。
- *   顺带的好处是产物是真正的 `8-bit grayscale`，和 EuRoC / 标定工具的
- *   预期一致。
+ * Bitmap 没有 1 字节灰度格式：ALPHA_8 不被 Skia 的 PNG 编码器支持，
+ * ARGB_8888 又是 4 字节/像素。直接写灰度可以减少 4 倍数据量。
  *
  * PNG 结构（灰度 8 位，无隔行）：
- *
  *   签名(8 字节) + IHDR + IDAT + IEND
- *
- *   每个 chunk = 长度(4) + 类型(4) + 数据 + CRC32(4)，全部大端。
- *   IDAT 里装的是一个 **zlib 流**（不是裸 deflate），内容是逐行的：
- *     [滤波器字节] [该行的 width 个像素]
- *   滤波器用 0（None）最省事，灰度图压缩率也够看。
+ * 每个 chunk = 长度(4) + 类型(4) + 数据 + CRC32(4)，均为大端。
+ * IDAT 是 zlib 流，内容逐行为：[滤波器字节] [该行像素]，滤波器固定为 0。
  */
 object GrayPng {
 
@@ -36,8 +23,8 @@ object GrayPng {
     )
 
     /**
-     * 把 [gray]（长度至少 width*height，逐行排列）编码成灰度 PNG 写到 [out]。
-     * 出错会抛异常——调用方必须处理，不要静默吞掉。
+     * 把 [gray]（长度至少 width*height，逐行排列）编码成灰度 PNG 写入 [out]。
+     * 出错时抛异常，调用方需要处理。
      */
     fun encode(gray: ByteArray, width: Int, height: Int, out: OutputStream) {
         require(width > 0 && height > 0) { "尺寸非法 ${width}x$height" }
@@ -58,7 +45,7 @@ object GrayPng {
         putInt(b, 0, w)
         putInt(b, 4, h)
         b[8] = 8   // bit depth
-        b[9] = 0   // color type 0 = 灰度（这就是我们要的）
+        b[9] = 0   // 色彩类型 0：灰度
         b[10] = 0  // compression method = deflate
         b[11] = 0  // filter method = 0
         b[12] = 0  // interlace = none
@@ -74,11 +61,8 @@ object GrayPng {
             System.arraycopy(gray, y * w, raw, dst + 1, w)
         }
 
-        // ② zlib 压缩。Deflater 默认输出 zlib 流（带 2 字节头和 adler32
-        //    尾），正是 PNG 要的；不要用 nowrap=true。
-        //
-        //    用 BEST_SPEED 而不是默认的 DEFAULT_COMPRESSION：帧率是硬指标，
-        //    文件大小不是。灰度 640x480 用 BEST_SPEED 也能压到 ~50%。
+        // ② zlib 压缩。Deflater 默认输出带 zlib 头和 adler32 尾的流，符合 PNG 要求。
+        //    使用 BEST_SPEED，优先保证帧率。
         val deflater = Deflater(Deflater.BEST_SPEED)
         try {
             deflater.setInput(raw)
@@ -89,7 +73,7 @@ object GrayPng {
             while (!deflater.finished()) {
                 val n = deflater.deflate(buf)
                 if (n > 0) out.write(buf, 0, n)
-                else if (deflater.needsInput()) break  // 理论到不了，防死循环
+                else if (deflater.needsInput()) break  // 防止死循环
             }
             return out.toByteArray()
         } finally {
@@ -110,7 +94,7 @@ object GrayPng {
         crc.update(typeBytes)
         crc.update(data)
         val crcBytes = ByteArray(4)
-        putInt(crcBytes, 0, crc.value.toInt())   // 低 32 位就是 CRC
+        putInt(crcBytes, 0, crc.value.toInt())   // 取低 32 位
         out.write(crcBytes)
     }
 

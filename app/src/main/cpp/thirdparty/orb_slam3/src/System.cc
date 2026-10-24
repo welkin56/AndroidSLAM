@@ -165,7 +165,7 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
         if(!isRead)
         {
             cout << "Error to load the file, please try with other session file or vocabulary file" << endl;
-            // 上游是 exit(-1)：在安卓上就是 App 直接没了、不给任何提示。抛出去让调用方接。
+            // 上游使用 exit(-1)；这里改为抛异常，由调用方处理。
             throw std::runtime_error("LoadAtlas failed: " + mStrLoadAtlasFromFile + ".osa");
         }
         //mpKeyFrameDatabase = new KeyFrameDatabase(*mpVocabulary);
@@ -796,7 +796,7 @@ long long System::GetTrajectoryMapId()
     if (mpTracker == nullptr)
         return -1;
 
-    // 判据和 `GetFrameTrajectory()` 逐字一致 —— 那边也是这么挑 `pMap` 的。
+    // 判据与 GetFrameTrajectory() 一致。
     unique_lock<mutex> lockTraj(mpTracker->mMutexTraj);
     Map* pMap = nullptr;
     for (list<KeyFrame*>::const_reverse_iterator it = mpTracker->mlpReferences.rbegin();
@@ -847,8 +847,7 @@ int System::GetFrameTrajectory(float* out, int cap)
     if (out == nullptr || mpTracker == nullptr)
         return 0;
 
-    // ⚠️ 必须拿这把锁：`Tracking` 线程正在往这四张表里 push，而 `System::mMutexState`
-    //    不包括它们（那个只保护三个快照字段）。
+    // Tracking 线程会同时写入四个列表，必须持这把锁。
     unique_lock<mutex> lockTraj(mpTracker->mMutexTraj);
 
     const list<Sophus::SE3f>& vRel = mpTracker->mlRelativeFramePoses;
@@ -856,7 +855,7 @@ int System::GetFrameTrajectory(float* out, int cap)
     const list<double>& vT = mpTracker->mlFrameTimes;
     const list<bool>& vLost = mpTracker->mlbLost;
 
-    // 四张表平行；短的那个当上界。
+    // 四个列表平行，取最短长度作为上界。
     size_t n = vRel.size();
     n = std::min(n, vRef.size());
     n = std::min(n, vT.size());
@@ -867,25 +866,20 @@ int System::GetFrameTrajectory(float* out, int cap)
     const size_t maxPts = std::min<size_t>(cap / 8, 4096);
     const size_t stride = std::max<size_t>(1, (n + maxPts - 1) / maxPts);
 
-    // ⚠️ 不用 `mpAtlas->GetCurrentMap()` —— 它在坏图窗口里是 `while(IsBad()) usleep(3000)`，
-    //    从主线程调会**冻死界面**。改用「最后一个有效参考帧属于哪张图」，语义一样、不会挂。
-    //    附带好处：重置之后老帧的参考帧在旧图上 ⟹ **自动被滤掉**，不用自己清轨迹。
+    // 不使用 GetCurrentMap()，它可能在坏图状态下自旋。
+    // 改用最后一个有效参考帧所属的图；重置后的旧帧会被自动过滤。
     Map* pMap = nullptr;
     for (list<KeyFrame*>::const_reverse_iterator it = vRef.rbegin(); it != vRef.rend(); ++it)
         if (*it) { pMap = (*it)->GetMap(); break; }
     if (pMap == nullptr)
         return 0;
 
-    // 一帧的拼装。`rel` 是「相对 `pKF`」的位姿（当场记的，**不变**），
-    // `pKF->GetPose()` 是**会变**的（BA 一直在优化它）—— 现乘 ⟹ 轨迹自动跟着优化走。
-    // ⚠️ 和上游 `SaveTrajectoryEuRoC` 有两处**故意不同**：
-    //    · **不乘 `pKF->mImuCalib.mTbc`** —— 那会转到 body/IMU 系，而实时位姿是**相机系**；
-    //    · **不乘首帧偏移 `Twb`** —— 那会挪到 EuRoC 的真值系，而我们要的是**地图坐标系**。
-    //    两条都是为了「轨迹和当前位置（`poseBuf`）在同一个系里」，否则两者会错开。
+    // 用相对参考帧的位姿和关键帧当前位姿合成，BA 后轨迹会自动更新。
+    // 与上游 SaveTrajectoryEuRoC 有两处不同：不乘 mTbc，也不乘首帧偏移 Twb，
+    // 以保证轨迹和实时位姿处于同一坐标系。
     auto compose = [&](const Sophus::SE3f& rel, KeyFrame* pKF, double t, float* o) -> bool {
         if (pKF == nullptr) return false;
-        // 参考帧被剔了就沿生成树往上爬（上游原样）。
-        // ⚠️ 上游这个循环**没有上界** —— 链坏了（成环 / 爬到 null）就转不出来。加一个。
+        // 参考帧失效时沿生成树上溯；增加跳数上限，避免链损坏时死循环。
         Sophus::SE3f Trw;
         int hops = 0;
         while (pKF->isBad())
@@ -895,7 +889,7 @@ int System::GetFrameTrajectory(float* out, int cap)
             pKF = pKF->GetParent();
             if (pKF == nullptr) return false;
         }
-        if (pKF->GetMap() != pMap) return false;   // 别的图的帧（重置之前那些）
+        if (pKF->GetMap() != pMap) return false;   // 其他图的帧
 
         const Sophus::SE3f Twc = (rel * Trw * pKF->GetPose()).inverse();
         const Eigen::Quaternionf q = Twc.unit_quaternion();
@@ -906,36 +900,32 @@ int System::GetFrameTrajectory(float* out, int cap)
         return true;
     };
 
-    // ⚠️ 四个迭代器**一起推** —— 关联的是「位置」，不是「算过没算」。
-    //    所以跳过一万条不拼装，「rel[i] 配 refs[i]」也永远不破。
+    // 四个迭代器同步前进，保持位置对应。
     list<Sophus::SE3f>::const_iterator itRel = vRel.begin();
     list<KeyFrame*>::const_iterator itRef = vRef.begin();
     list<double>::const_iterator itT = vT.begin();
     list<bool>::const_iterator itLost = vLost.begin();
 
     int m = 0;                     // 已写出的点数
-    size_t emitted = 0;            // 走过的**有效**帧数（跟丢的不算）
-    Sophus::SE3f lastRel;          // 最后一个有效帧的那几个值 —— 存下来很便宜
+    size_t emitted = 0;            // 已处理的有效帧数
+    Sophus::SE3f lastRel;          // 最后一个有效帧的位姿
     KeyFrame* lastKF = nullptr;
     double lastT = 0;
     bool hasLast = false;
 
     for (size_t i = 0; i < n; ++i, ++itRel, ++itRef, ++itT, ++itLost)
     {
-        if (*itLost) continue;     // 跟丢的帧不存（上游也这么干）
+        if (*itLost) continue;     // 跳过跟丢的帧
         lastRel = *itRel; lastKF = *itRef; lastT = *itT; hasLast = true;
 
-        // ⚠️ 按**有效帧**计数，不按 list 下标 —— 按下标的话，跟丢一帧后面整条网格就错位了。
-        // ⚠️ `continue` **在 `compose` 之前** —— 这才是抽稀的意义：
-        //    走列表只是推指针（便宜），矩阵乘只做选中的那 ≤maxPts 个。
+        // 按有效帧计数；在 compose 前 continue，只对选中的点做矩阵运算。
         const size_t slot = emitted++;
         if (slot % stride != 0) continue;
         if (m * 8 + 8 > cap) break;
         if (compose(lastRel, lastKF, lastT, out + 8 * m)) ++m;
     }
 
-    // 补最后一个**有效帧**，让轨迹的头贴着当前位置
-    //（它不在网格上时才补 —— 在的话上面已经写过了，再补就重复）。
+    // 补上最后一个有效帧，使轨迹延伸到当前位置。
     if (hasLast && m > 0 && (emitted - 1) % stride != 0 && (m + 1) * 8 <= cap)
         if (compose(lastRel, lastKF, lastT, out + 8 * m)) ++m;
 
@@ -955,25 +945,21 @@ struct System::Waypoint
 {
     int id = 0;
     std::string name;
-    KeyFrame* pAnchor = nullptr;   // 非拥有；只在图集合里取
-    Sophus::SE3f T_rel;            // `Tcw_此刻 * Twc_锚点`
+    KeyFrame* pAnchor = nullptr;   // 不拥有，只从图集合中获取
+    Sophus::SE3f T_rel;            // Tcw_当前 * Twc_锚点
 };
 
 namespace {
 
 /**
- * 把「锚在 `pKF` 上的路径点」解到世界坐标。
- *
- * 和 `GetFrameTrajectory()` 里那个 `compose` 是**同一套算法**：
- * 锚点坏了就沿 `mTcp`（它标坏那一刻记下的「相对父帧」）往上爬，爬到活着的祖先。
- * 所以关键帧被正常剔除**不影响坐标**；只有 `GetMap() == nullptr`
- * （`Map::clear()`，即地图被重置）才算失效 —— 那时坐标系真的没了。
+ * 把锚定在 pKF 上的路径点解算到世界坐标。
+ * 锚点失效时沿 mTcp 上溯到存活祖先；只有所属图为空才算失效。
  *
  * @param T_rel  路径点相对锚点的位姿
  * @param pKF    锚点
- * @param Tcw    出参：路径点在世界里的 `Tcw`
- * @param mapId  出参：解析到的**活着的**祖先落在哪张图
- * @return false = 这个路径点现在没有有效坐标
+ * @param Tcw    输出：路径点的世界位姿
+ * @param mapId  输出：存活祖先所属的图
+ * @return false 表示当前没有有效坐标
  */
 bool ResolveWaypoint(const Sophus::SE3f& T_rel, KeyFrame* pKF,
                      Sophus::SE3f& Tcw, unsigned long& mapId)
@@ -985,7 +971,7 @@ bool ResolveWaypoint(const Sophus::SE3f& T_rel, KeyFrame* pKF,
     int hops = 0;
     while (pKF->isBad())
     {
-        if (++hops > 64)        // 上游那个循环没有上界；链坏了（成环 / 爬到 null）就转不出来
+        if (++hops > 64)        // 防止链损坏时死循环
             return false;
         Trw = Trw * pKF->mTcp;
         pKF = pKF->GetParent();
@@ -1002,7 +988,7 @@ bool ResolveWaypoint(const Sophus::SE3f& T_rel, KeyFrame* pKF,
     return true;
 }
 
-/** `T_rel` 里那个 `\t` / `\n` / `\\` 的转义。名字是用户输入的，会带空格。 */
+/** 转义名字中的制表符、换行符和反斜杠。 */
 std::string EscapeWpName(const std::string& s)
 {
     std::string out;
@@ -1028,7 +1014,7 @@ bool UnescapeWpName(const std::string& s, std::string& out)
         if (s[i] == '\\') out += '\\';
         else if (s[i] == 't') out += '\t';
         else if (s[i] == 'n') out += '\n';
-        else { out += '\\'; out += s[i]; }   // 不认识的转义原样留着
+        else { out += '\\'; out += s[i]; }   // 未知转义原样保留
     }
     return true;
 }
@@ -1040,8 +1026,7 @@ bool System::AddWaypoint(const std::string& name)
     if (mpAtlas == nullptr || mpTracker == nullptr)
         return false;
 
-    // 用 `PeekCurrentMap()`：`GetCurrentMap()` 在图被标坏的窗口里会抱着 atlas 锁
-    // `usleep` 自旋，而这里是 SLAM 线程，卡住等于整个 App 不跟手。
+    // 使用 PeekCurrentMap()，避免 GetCurrentMap() 在坏图状态下自旋。
     Map* pMap = mpAtlas->PeekCurrentMap();
     if (pMap == nullptr)
     {
@@ -1050,8 +1035,7 @@ bool System::AddWaypoint(const std::string& name)
         return false;
     }
 
-    // ⚠️ 锚点必须**已经在图集合里**：还在 `LocalMapping` 队列里的 KF 会被
-    //    `Release()` 直接 delete，拿它做锚点就是悬空指针。
+    // 锚点必须已在图集合中；LocalMapping 队列里的关键帧可能被 Release() 删除。
     KeyFrame* pAnchor = pMap->GetLatestKeyFrame();
     if (pAnchor == nullptr)
     {
@@ -1158,21 +1142,18 @@ int System::GetWaypoints(float* pos, int posCap, long long* meta, int metaCap)
     if (pos == nullptr || meta == nullptr)
         return 0;
 
-    // 两条出参与原来一样「装不下就少给」：返回**实际写了几个**。
-    //    调用方看到写满就扩容，下一拍再来 —— 不能返回真实条数。
+    // 装不下时少给，返回实际写入条数；调用方看到写满后扩容重读。
     const int canPos = posCap / 3;
     const int canMeta = metaCap / 4;
     const int cap = std::min(canPos, canMeta);
     if (cap <= 0)
         return 0;
 
-    // 用 `PeekCurrentMap()` 而不是 `GetCurrentMap()` —— 后者在坏图窗口里
-    //    会 `while(IsBad()) usleep(3000)` 抱着 atlas 锁睡。这条是从主线程读的。
+    // 使用 PeekCurrentMap()，避免 GetCurrentMap() 在坏图状态下自旋。
     Map* pCur = mpAtlas == nullptr ? nullptr : mpAtlas->PeekCurrentMap();
     const unsigned long curId = pCur == nullptr ? 0 : pCur->GetId();
 
-    // 持 `mMutexWaypoints` 期间会去拿 KF 自己的锁（`isBad` / `GetPose` / `GetMap`）。
-    //    只有一个方向（waypoints → KF），没有反向路径。
+    // 持 mMutexWaypoints 期间会获取关键帧的锁，锁顺序固定为 waypoints 到关键帧。
     unique_lock<mutex> lock(mMutexWaypoints);
 
     int m = 0;
@@ -1230,7 +1211,7 @@ bool System::SaveWaypoints(const std::string& path)
     int saved = 0, skipped = 0;
     for (Waypoint* p : mvpWaypoints)
     {
-        // 沿坏链爬到活着的祖先：存**祖先 id + 修正后的 T_rel**，读的时候不用再爬。
+        // 上溯到存活祖先，保存祖先 id 和修正后的 T_rel。
         KeyFrame* pKF = p->pAnchor;
         if (pKF == nullptr) { ++skipped; continue; }
 
@@ -1244,7 +1225,7 @@ bool System::SaveWaypoints(const std::string& path)
             pKF = pKF->GetParent();
             if (pKF == nullptr) { ok = false; break; }
         }
-        if (!ok || pKF->GetMap() == nullptr) { ++skipped; continue; }   // 失效的不落盘
+        if (!ok || pKF->GetMap() == nullptr) { ++skipped; continue; }   // 跳过失效项
 
         const Sophus::SE3f T_rel = p->T_rel * Trw;
         const Eigen::Quaternionf q = T_rel.unit_quaternion();
@@ -1287,8 +1268,8 @@ bool System::LoadWaypoints(const std::string& path)
     if (!f.is_open())
         return true;   // 没有 sidecar 是正常情况（这张图从没加过路径点）
 
-    // kfId → KeyFrame*。⚠️ 不能用 `Atlas::GetAtlasKeyframes()` —— 那个读的是
-    // `mvpBackupMaps`，`PostLoad()` 之后已经清空了。
+    // 建立 kfId 到 KeyFrame 的映射。不能使用 GetAtlasKeyframes()，
+    // 它读取的 mvpBackupMaps 在 PostLoad 后已清空。
     std::map<unsigned long, KeyFrame*> byId;
     if (mpAtlas != nullptr)
     {
@@ -1343,8 +1324,7 @@ bool System::LoadWaypoints(const std::string& path)
         }
         else
         {
-            // 锚点不在这份 atlas 里（覆盖保存过、或那张图被剔掉了）。**保留名字、标失效**，
-            // 让用户能在管理界面看到并手动删 —— 不猜、不静默改写成别的锚点。
+            // 锚点不在当前 atlas 中：保留名字并标记为失效，由用户手动处理。
             p->pAnchor = nullptr;
             ++missing;
         }
@@ -1367,10 +1347,10 @@ bool System::LoadWaypoints(const std::string& path)
 
 void System::SaveAtlasTo(const std::string& path)
 {
-    // 文件名现取：塞进那个成员再走上游那条路（SaveAtlas 只认成员，不带路径参数）。
+    // SaveAtlas 只读取成员变量，因此先把路径写入成员。
     mStrSaveAtlasToFile = path;
 
-    // 先停 LocalMapping：它正在建点的话，序列化会读到半张图。停不动就别死等，直接存。
+    // 先停止 LocalMapping，避免序列化过程中地图继续变化；等待有上限。
     if (mpLocalMapper != nullptr)
     {
         mpLocalMapper->RequestStop();
@@ -1389,18 +1369,17 @@ bool System::ReloadAtlasFrom(const std::string& path)
     if(mpTracker == nullptr || mpAtlas == nullptr)
         return false;
 
-    // 路径点属于旧 atlas：换掉之前先清空。失败时也不能留着（坐标已经没有意义）。
+    // 路径点属于旧 atlas，先清空。
     ClearWaypoints();
-    // 合并链同理：后面 `LoadAtlasInto` 成功时 `PostLoad()` 也会清，这里兜住失败那条路。
+    // 合并链同样清空，覆盖载入失败的分支。
     mpAtlas->ClearMergeRecords();
 
-    // 清当前图、轨迹和倒排表；KeyFrame / Frame 的 ID 计数器归零
-    //（紧接着的 LoadAtlasInto 会把它们恢复成文件里的值）。
-    // ⚠️ 这一步会阻塞等 LocalMapping / LoopClosing 应答，所以只能从 SLAM 线程调。
+    // 清空当前图、轨迹和倒排表，并重置 ID 计数器。
+    // 该步骤会阻塞等待 LocalMapping 和 LoopClosing，只能从 SLAM 线程调用。
     mpTracker->Reset();
 
     if(path.empty())
-        return true;   // 上面那次 Reset 已经留了一张空图
+        return true;   // Reset 已保留一张空图
 
     if(!LoadAtlasInto(path, FileType::BINARY_FILE))
     {
@@ -1408,7 +1387,7 @@ bool System::ReloadAtlasFrom(const std::string& path)
         return false;
     }
 
-    // Reset 建的那张空图不在新读进来的 mspMaps 里了 ⟹ 换一张干净的当前图。
+    // Reset 创建的空图不在新载入的 mspMaps 中，创建一张新的当前图。
     mpAtlas->CreateNewMap();
     mpAtlas->SetInertialSensor();
     return true;
@@ -1422,8 +1401,7 @@ void System::GetAtlasStats(int* maps, int* kfs, int* mps)
     if (mpAtlas == nullptr)
         return;
 
-    // `GetAllMaps()` 拿 `mMutexAtlas`、`KeyFramesInMap()`/`MapPointsInMap()` 拿 `mMutexMap`
-    // ⟹ 从任意线程调都安全（不碰 `mpCurrentMap`，所以也不会撞上 `GetCurrentMap()` 那个睡眠）。
+    // 这些接口各自加锁，可从任意线程调用。
     for (Map* pMap : mpAtlas->GetAllMaps())
     {
         if (pMap == nullptr)
@@ -1439,7 +1417,7 @@ int System::GetMapList(long long* ids, int* kfs, int* mps, int cap)
     if (ids == nullptr || kfs == nullptr || mps == nullptr || cap <= 0 || mpAtlas == nullptr)
         return 0;
 
-    // `GetAllMaps()` 已经按 id 排好序；只给**有关键帧**的图（空图没什么好看）。
+    // GetAllMaps() 已按 id 排序；只返回有关键帧的图。
     int n = 0;
     for (Map* pMap : mpAtlas->GetAllMaps())
     {
@@ -1482,7 +1460,7 @@ int System::GetMapCloud(long long mapId, float* out, int cap)
     if (maxPts <= 0 || vpMPs.empty())
         return 0;
 
-    // 和 `slam_engine.cpp` 的点云快照同一个抽稀规则：stride 覆盖全程，不是截断。
+    // 与 slam_engine.cpp 的点云快照相同：按 stride 抽稀，覆盖全程。
     const size_t stride = std::max<size_t>(1, (vpMPs.size() + maxPts - 1) / maxPts);
     int n = 0;
     for (size_t i = 0; i < vpMPs.size() && n < maxPts; i += stride)
@@ -2131,7 +2109,7 @@ void System::SaveAtlas(int type){
         // Save the current session
         mpAtlas->PreSave();
 
-        // 上游这里硬拼了 "./" 前缀，会把绝对路径变成相对的（安卓的 CWD 是 `/`，不可写）。
+        // 去掉上游的 "./" 前缀，避免绝对路径被解析为相对路径。
         string pathSaveFileName = mStrSaveAtlasToFile + ".osa";
 
         string strVocabularyChecksum = CalculateCheckSum(mStrVocabularyFilePath,TEXT_FILE);
@@ -2169,7 +2147,7 @@ bool System::LoadAtlas(int type)
     string strFileVoc, strVocChecksum;
     bool isRead = false;
 
-    // 同 SaveAtlas：那个 "./" 前缀会把绝对路径变成相对的。
+    // 同 SaveAtlas：去掉 "./" 前缀。
     string pathLoadFileName = mStrLoadAtlasFromFile + ".osa";
 
     if(type == TEXT_FILE) // File text
@@ -2207,7 +2185,7 @@ bool System::LoadAtlas(int type)
 
     if(isRead)
     {
-        // 引用对不上就到此为止：`PostLoad()` 会往连接表里塞 nullptr，下一句就崩。
+        // 引用不一致时直接失败，避免 PostLoad() 写入空指针。
         if(!mpAtlas->CheckBackupConsistency())
         {
             cout << "载图失败：文件内部引用不一致（旧版本在同一个进程里连续存图留下的）" << endl;
@@ -2287,7 +2265,7 @@ bool System::LoadAtlasInto(const std::string& path, int type)
         return false;
     }
 
-    // 引用对不上就到此为止（和构造时那条路一样）。
+    // 引用不一致时直接失败，与构造时的检查一致。
     if(!pLoaded->CheckBackupConsistency())
     {
         cout << "载图失败：文件内部引用不一致（旧版本在同一个进程里连续存图留下的）" << endl;
@@ -2305,10 +2283,9 @@ bool System::LoadAtlasInto(const std::string& path, int type)
         return false;
     }
 
-    // 关键差别：不 `mpAtlas = pLoaded`（那会让各线程手里的指针失效），
-    // 而是把内容搬进现有的 Atlas。
+    // 不替换 mpAtlas 指针，而是把内容搬入现有 Atlas。
     mpAtlas->AdoptFrom(pLoaded);
-    delete pLoaded;   // 内容已搬走，只剩空壳（`mspMaps` 还是空的）
+    delete pLoaded;   // 内容已搬走，仅剩空壳
 
     mpAtlas->SetKeyFrameDababase(mpKeyFrameDatabase);
     mpAtlas->SetORBVocabulary(mpVocabulary);

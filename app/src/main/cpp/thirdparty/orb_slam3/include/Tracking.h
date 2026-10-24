@@ -154,13 +154,11 @@ public:
     list<double> mlFrameTimes;
     list<bool> mlbLost;
 
-    // add：保上面四个列表的锁。
-    // `System::mMutexState` **不包括**它们（那个锁是在 `GrabImageMonocular` 返回**之后**
-    // 才拿的，只保护三个快照字段）—— 上游只在 `Shutdown()` 之后才读这四张表，所以它不用锁。
-    // **我们要在跑的时候从别的线程读**（2D 地图每帧拉），必须自己加一把。
+    // add：保护上面四个列表。上游只在 Shutdown() 后读取，
+    // 本工程会在运行中从其他线程读取，因此需要单独加锁。
     std::mutex mMutexTraj;
 
-    /** add：清空上面那四张表（`mMutexTraj` 内）。一次运行 = 一份轨迹，`start` 时调。 */
+    /** add：清空上述四个列表（持 mMutexTraj）。一次运行对应一份轨迹。 */
     void ClearTrajectory();
 
     // frames with estimated pose
