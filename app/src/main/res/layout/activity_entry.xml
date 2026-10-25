@@ -65,12 +65,12 @@
             android:textAppearance="?attr/textAppearanceLabelLarge"
             android:textColor="?attr/colorPrimary" />
 
-        <!-- 删除是长按，藏起来的东西没人点，留一行提示。空列表时随列表一起收起。 -->
+        <!-- 重命名/删除都在长按菜单里，藏起来的东西没人点，留一行提示。空列表时随列表一起收起。 -->
         <TextView
             android:id="@+id/tvListHint"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="长按删除"
+            android:text="长按重命名 / 删除"
             android:textAppearance="?attr/textAppearanceLabelMedium"
             android:textColor="?attr/colorOnSurfaceVariant"
             android:visibility="gone" />

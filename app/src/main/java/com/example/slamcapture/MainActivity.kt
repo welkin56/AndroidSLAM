@@ -27,7 +27,6 @@ import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
-import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.R as MaterialR
 import java.io.File
 import java.io.IOException
@@ -1400,22 +1399,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 单行文字输入弹窗；空输入交给调用方决定怎么兜底。 */
-    private fun textInputDialog(title: String, initial: String, onOk: (String) -> Unit) {
-        val v = layoutInflater.inflate(R.layout.dialog_text_input, null)
-        val input = v.findViewById<TextInputEditText>(R.id.input)
-        input.setText(initial)
-        input.setSelection(initial.length)
-        MaterialAlertDialogBuilder(this)
-            .setTitle(title)
-            .setView(v)
-            .setPositiveButton("确定") { _, _ ->
-                onOk(input.text?.toString()?.trim().orEmpty())
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
     /** 路径点管理界面，包含不在当前图和已失效的条目。 */
     private fun showWaypointManager() {
         val total = SlamBridge.nativeWaypointCount()
@@ -2163,13 +2146,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 一次新建或打开地图对应一个目录：files/maps/<yyyyMMdd-HHmmss>/。
-     * 使用时间戳而不是 mapId，因为后者会随进程和地图变化。
+     * 一次新建或打开地图对应一个目录：files/maps/<名字>/。
+     * 没给名字时用时间戳 —— 不用 mapId，因为后者会随进程和地图变化。
      */
-    private fun newSessionDir(): File {
+    private fun newSessionDir(name: String? = null): File {
         // getExternalFilesDir 可能返回 null（外部存储没挂载）。这时退到内部存储，
         // 不能把 null 传给 File 构造器，否则路径会落到进程当前目录。
         val maps = File(getExternalFilesDir(null) ?: filesDir, "maps")
+        val clean = name?.let { TrajectoryStore.cleanMapName(it) }.orEmpty()
+        if (clean.isNotEmpty()) return TrajectoryStore.uniqueMapDir(maps, clean).apply { mkdirs() }
         // 时间戳只到秒，同一秒里连开两次会撞名 —— 而撞了就会有两个 .osa 落进同一目录。
         val s = stamp()
         var d = File(maps, s)
@@ -2284,9 +2269,20 @@ class MainActivity : AppCompatActivity() {
                 }
             )
             .setView(copyRec)
+        // 这一趟不要了：把 atlas 退回上一次保存的样子。
+        // 不退回的话，这趟建的图会一直留在内存里，下一趟的回环检测还能匹配到它。
+        val dropRun = {
+            Log.i(TAG, "这一趟不存图 → 请求恢复 atlas")
+            atlasSwitching = false
+            SlamBridge.nativeRequestRestoreMap()
+            uiQueueTicker()   // 恢复的进度和结果要靠 ticker 刷
+        }
+
         // 用户到底选没选「存」。三个肯定按钮都要置 true ——
         // 只有「不保存」和直接关掉（返回键 / 点外面）才该丢图。
         var willSave = false
+        // 命名弹窗会接着弹，轨迹的问题等它结束再问，免得两个弹窗叠在一起。
+        var naming = false
         if (existing != null) {
             b.setPositiveButton("覆盖") { _, _ ->
                 willSave = true
@@ -2294,30 +2290,84 @@ class MainActivity : AppCompatActivity() {
             }
                 .setNeutralButton("另存为") { _, _ ->
                     willSave = true
-                    saveMapAs(copyRec.isChecked)
+                    naming = true
+                    askMapName(stamp()) { name ->
+                        if (name == null) {
+                            willSave = false
+                            dropRun()
+                        } else {
+                            saveMapAs(copyRec.isChecked, name)
+                        }
+                        askKeepRun(trajBase)
+                    }
                 }
                 .setNegativeButton("不保存", null)
         } else {
             b.setPositiveButton("保存") { _, _ ->
                 willSave = true
-                startMapSave(File(dir, stamp()).absolutePath)
+                naming = true
+                askMapName(dir.name) { name ->
+                    if (name == null) {
+                        willSave = false
+                        dropRun()
+                    } else {
+                        // 先改名再存：pendingArchive 拿的是 sessionDir，存完再改就对不上了。
+                        val dst = renameSessionDir(dir, name)
+                        if (dst == null) uiMessage = "目录改名失败，已按原名保存"
+                        val target = dst ?: dir
+                        sessionDir = target
+                        startMapSave(File(target, target.name).absolutePath)
+                    }
+                    askKeepRun(trajBase)
+                }
             }
                 .setNegativeButton("不保存", null)
         }
         val dlg = b.create()
         // 挂在「弹窗消失」上：两个轴互不影响，问完接着问轨迹。
         dlg.setOnDismissListener {
-            if (!willSave) {
-                // 这一趟不要了：把 atlas 退回上一次保存的样子。
-                // 不退回的话，这趟建的图会一直留在内存里，下一趟的回环检测还能匹配到它。
-                Log.i(TAG, "这一趟不存图 → 请求恢复 atlas")
-                atlasSwitching = false
-                SlamBridge.nativeRequestRestoreMap()
-                uiQueueTicker()   // 恢复的进度和结果要靠 ticker 刷
-            }
-            askKeepRun(trajBase)
+            if (!willSave) dropRun()
+            if (!naming) askKeepRun(trajBase)
         }
         dlg.show()
+    }
+
+    /**
+     * 地图命名弹窗。取消返回 null（= 这次保存作废）；留空则用 [fallback]。
+     * 名字里的路径分隔符会被替换，重名由 [TrajectoryStore.uniqueMapDir] 加后缀。
+     */
+    private fun askMapName(fallback: String, onResult: (String?) -> Unit) {
+        textInputDialog("给这张地图起个名字", fallback, onCancel = { onResult(null) }) { raw ->
+            onResult(TrajectoryStore.cleanMapName(raw).ifEmpty { fallback })
+        }
+    }
+
+    /** 把会话目录改名为 name；名字没变就原样返回，改名失败返回 null。 */
+    private fun renameSessionDir(dir: File, name: String): File? {
+        val clean = TrajectoryStore.cleanMapName(name)
+        if (clean.isEmpty() || clean == dir.name) return dir
+        val parent = dir.parentFile ?: return null
+        val dst = TrajectoryStore.uniqueMapDir(parent, clean)
+        if (!dir.renameTo(dst)) {
+            Log.e(TAG, "会话目录改名失败：${dir.absolutePath} → ${dst.absolutePath}")
+            return null
+        }
+        Log.i(TAG, "会话目录改名：${dir.name} → ${dst.name}")
+        rebaseSessionPaths(dir, dst)
+        return dst
+    }
+
+    /** 目录改名后，把还指向旧路径的内存句柄换到新目录下。 */
+    private fun rebaseSessionPaths(old: File, new: File) {
+        val prefix = old.absolutePath + "/"
+        fun rebase(f: File?): File? = f?.let {
+            if (it.absolutePath.startsWith(prefix))
+                File(new, it.absolutePath.removePrefix(prefix))
+            else it
+        }
+        curTrajBase = rebase(curTrajBase)
+        curRecDir = rebase(curRecDir)
+        lastRunDir = rebase(lastRunDir)
     }
 
     /** 让 SLAM 线程把地图保存为 path + ".osa"（path 不含扩展名）。 */
@@ -2338,9 +2388,9 @@ class MainActivity : AppCompatActivity() {
      * 另存：新开一个文件夹，把已经归档的图目录、还没归档的松轨迹拷过去，
      * 当前这趟也算在新图里。录像只在勾了的时候带（见 [askMapSave]）。
      */
-    private fun saveMapAs(copyRecordings: Boolean) {
+    private fun saveMapAs(copyRecordings: Boolean, name: String) {
         val src = sessionDir ?: return
-        val dst = newSessionDir()
+        val dst = newSessionDir(name)
         File(src, "session.json").takeIf { it.isFile }
             ?.copyTo(File(dst, "session.json"), overwrite = true)
 

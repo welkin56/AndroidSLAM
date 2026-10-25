@@ -101,7 +101,7 @@ class EntryActivity : AppCompatActivity() {
                     open(f.absolutePath)
                 }
                 setOnLongClickListener {
-                    askDeleteMap(f)
+                    showMapActions(f)
                     true
                 }
             }
@@ -130,6 +130,52 @@ class EntryActivity : AppCompatActivity() {
     }
 
     private fun mapsDir(): File = File(getExternalFilesDir(null) ?: filesDir, MAPS_DIR)
+
+    /** 长按菜单。改名和删除都会动磁盘，先让用户挑。 */
+    private fun showMapActions(osa: File) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(mapTitle(osa))
+            .setItems(arrayOf("重命名", "删除")) { _, which ->
+                if (which == 0) askRenameMap(osa) else askDeleteMap(osa)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 列表上的名字就是会话目录名，改名同时改目录和目录里唯一的 .osa。
+     * 目录里有多份 .osa 时只改目录，文件名留作区分。
+     */
+    private fun askRenameMap(osa: File) {
+        val dir = osa.parentFile ?: return
+        textInputDialog("重命名地图", dir.name) { raw ->
+            val name = TrajectoryStore.cleanMapName(raw)
+            if (name.isEmpty()) {
+                Toast.makeText(this, "名字不能为空", Toast.LENGTH_SHORT).show()
+                return@textInputDialog
+            }
+            renameMap(dir, name)
+        }
+    }
+
+    private fun renameMap(dir: File, name: String) {
+        if (name == dir.name) return
+        val target = TrajectoryStore.uniqueMapDir(dir.parentFile ?: return, name)
+        val osas = dir.listFiles { f -> f.isFile && f.name.endsWith(EXT) } ?: emptyArray()
+        if (!dir.renameTo(target)) {
+            Log.e(TAG, "目录改名失败：${dir.absolutePath} → ${target.absolutePath}")
+            Toast.makeText(this, "重命名失败", Toast.LENGTH_LONG).show()
+            return
+        }
+        Log.i(TAG, "地图改名：${dir.name} → ${target.name}")
+        // 旧 File 已经指向不存在的路径，得从改名后的目录里重新取。
+        if (osas.size == 1 && osas[0].name.removeSuffix(EXT) != target.name) {
+            val f = File(target, osas[0].name)
+            if (!f.renameTo(File(target, target.name + EXT)))
+                Log.e(TAG, "地图文件改名失败：${f.absolutePath}")
+        }
+        refreshMapList()
+    }
 
     /**
      * 删整个会话目录。一行地图背后是一个目录：地图本体、按图归档的轨迹、录像都在里面。
