@@ -673,6 +673,28 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
     e.imus.push_back(Imu{tsNs, wx, wy, wz, ax, ay, az});
 }
 
+void setIntrinsics(float fx, float fy, float cx, float cy,
+                   float k1, float k2, float p1, float p2) {
+    Engine& e = engine();
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (sys == nullptr) {
+        printf("[M5] setIntrinsics：System 还没构造好，忽略\n");
+        fflush(stdout);
+        return;
+    }
+    if (e.running.load()) {
+        // 上游的 LocalMapping / LoopClosing 读这些量没有加锁，跑着改会出事。
+        printf("[M5] setIntrinsics 在吃帧状态下被调用，忽略\n");
+        fflush(stdout);
+        return;
+    }
+    sys->SetCameraIntrinsics(fx, fy, cx, cy, k1, k2, p1, p2);
+    updateIntrinsics(fx, fy, cx, cy);
+    printf("[M5] 内参注入 fx=%.3f fy=%.3f cx=%.3f cy=%.3f k1=%.5f k2=%.5f\n",
+           fx, fy, cx, cy, k1, k2);
+    fflush(stdout);
+}
+
 void start() {
     Engine& e = engine();
     // 一次运行对应一份轨迹；上游轨迹表从不清理，需要手动清。

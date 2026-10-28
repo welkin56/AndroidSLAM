@@ -76,4 +76,7 @@ void initIntrinsics(const std::string& settingsPath);
 /** 取内参给调用方自行投影。initIntrinsics 未成功时返回 false。 */
 bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy);
 
+/** 覆盖缓存的内参。App 侧注入真实内参后必须调一次，否则投影还用 yaml 里的占位值。 */
+void updateIntrinsics(float fx, float fy, float cx, float cy);
+
 }  // namespace slam

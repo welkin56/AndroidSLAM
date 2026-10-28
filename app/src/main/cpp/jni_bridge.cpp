@@ -113,6 +113,18 @@ Java_com_example_slamcapture_SlamBridge_nativePushImu(JNIEnv* /*env*/, jobject /
     }
 }
 
+// 只允许在 nativeStart() 之前调用；跑着帧时会被忽略。
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeSetIntrinsics(
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jfloat fx, jfloat fy, jfloat cx, jfloat cy,
+        jfloat k1, jfloat k2, jfloat p1, jfloat p2) {
+    try {
+        slam::setIntrinsics(fx, fy, cx, cy, k1, k2, p1, p2);
+    } catch (...) {
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeStart(JNIEnv* /*env*/, jobject /*thiz*/) {
     try {

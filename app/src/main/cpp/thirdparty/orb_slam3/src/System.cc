@@ -519,6 +519,12 @@ void System::ResetActiveMap()
     mbResetActiveMap = true;
 }
 
+void System::SetCameraIntrinsics(float fx, float fy, float cx, float cy,
+                                 float k1, float k2, float p1, float p2)
+{
+    mpTracker->SetCameraIntrinsics(fx, fy, cx, cy, k1, k2, p1, p2);
+}
+
 void System::Shutdown()
 {
     {

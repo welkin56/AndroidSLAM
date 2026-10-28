@@ -25,6 +25,18 @@ class SessionWriter(val sessionDir: File) {
         private const val IMU_QUEUE_SIZE = 8192
     }
 
+    /** 这一段的相机内参与对焦状态，写进 meta.json。由调用方在 start() 前填。 */
+    class CalibSnapshot(
+        val focusMode: String,
+        val diopter: Float,
+        val source: String,
+        val fx: Float, val fy: Float, val cx: Float, val cy: Float, val k1: Float,
+    )
+
+    /** 采集时实际用的内参；null 表示调用方没给（录制模式）。 */
+    @Volatile
+    var calib: CalibSnapshot? = null
+
     class FrameItem(val tsNs: Long, val gray: ByteArray, val w: Int, val h: Int)
 
     class ImuItem(
@@ -223,6 +235,16 @@ class SessionWriter(val sessionDir: File) {
         // 写入元数据
         try {
             val elapsedS = (System.nanoTime() - startedAtNs) / 1e9
+            // 内参用 JSONObject 拼，避免手写引号出错。
+            val c = calib
+            val calibJson = if (c == null) "null" else org.json.JSONObject()
+                .put("focus_mode", c.focusMode)
+                .put("focus_diopter", c.diopter.toDouble())
+                .put("source", c.source)
+                .put("fx", c.fx.toDouble()).put("fy", c.fy.toDouble())
+                .put("cx", c.cx.toDouble()).put("cy", c.cy.toDouble())
+                .put("k1", c.k1.toDouble())
+                .toString()
             File(sessionDir, "meta.json").writeText(
                 """
                 {
@@ -238,8 +260,8 @@ class SessionWriter(val sessionDir: File) {
                   "imu_max_pair_gap_ns": ${imuMaxPairGapNs.get()},
                   "imu_mean_pair_gap_ns": ${(imuMeanPairGapMs() * 1e6).toLong()},
                   "imu_gap_over_5ms": ${imuGapOver5ms.get()},
-                  "calibrated": false,
-                  "note": "未标定。内参和相机-IMU外参见阶段四。"
+                  "calib": $calibJson,
+                  "note": "内参见 calib；相机-IMU 平移仍未标定。"
                 }
                 """.trimIndent()
             )

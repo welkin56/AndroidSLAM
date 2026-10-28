@@ -41,6 +41,13 @@ object SlamBridge {
     external fun nativePushImu(tsNs: Long, wx: Float, wy: Float, wz: Float,
                                ax: Float, ay: Float, az: Float)
 
+    /**
+     * 注入相机内参。**必须在 [nativeStart] 之前**，跑着帧时调用会被忽略。
+     * 一张地图只用一套内参，切换内参要重开一张图。
+     */
+    external fun nativeSetIntrinsics(fx: Float, fy: Float, cx: Float, cy: Float,
+                                     k1: Float, k2: Float, p1: Float, p2: Float)
+
     /** 开始吃帧，不销毁 System。 */
     external fun nativeStart()
 

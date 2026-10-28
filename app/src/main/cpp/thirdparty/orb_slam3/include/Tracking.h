@@ -85,6 +85,11 @@ public:
     // The focal lenght should be similar or scale prediction will fail when projecting points
     void ChangeCalibration(const string &strSettingPath);
 
+    // add：直接给定内参，不经过 yaml。只在没有帧处理时调用（System::SetCameraIntrinsics 保证）。
+    // 相机参数和 mK/mK_/mDistCoef 必须一起换，否则 Frame 的去畸变和 Tracking 的投影会对不上。
+    void SetCameraIntrinsics(float fx, float fy, float cx, float cy,
+                             float k1, float k2, float p1, float p2);
+
     // Use this function if you have deactivated local mapping and you only want to localize the camera.
     void InformOnlyTracking(const bool &flag);
 

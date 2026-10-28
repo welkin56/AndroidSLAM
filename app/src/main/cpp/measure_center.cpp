@@ -428,6 +428,15 @@ void initIntrinsics(const std::string& settingsPath) {
     fflush(stdout);
 }
 
+void updateIntrinsics(float fx, float fy, float cx, float cy) {
+    gFx = fx;
+    gFy = fy;
+    gCx = cx;
+    gCy = cy;
+    printf("[M6] 内参更新 fx=%.3f fy=%.3f cx=%.3f cy=%.3f\n", gFx, gFy, gCx, gCy);
+    fflush(stdout);
+}
+
 bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy) {
     if (gFx == 0) return false;
     *fx = gFx;

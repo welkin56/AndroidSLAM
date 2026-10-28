@@ -38,6 +38,13 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
 
 // ---------------- 开关（主线程调）----------------
 
+/**
+ * 注入相机内参（主线程调）。只允许在 start() 之前：帧没在跑时上游没有并发读。
+ * 同时刷新测距侧缓存的投影内参。
+ */
+void setIntrinsics(float fx, float fy, float cx, float cy,
+                   float k1, float k2, float p1, float p2);
+
 /** 开始吃帧，不销毁 System。 */
 void start();
 

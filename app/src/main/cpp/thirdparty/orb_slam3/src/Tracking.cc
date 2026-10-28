@@ -4001,6 +4001,37 @@ void Tracking::ChangeCalibration(const string &strSettingPath)
     Frame::mbInitialComputations = true;
 }
 
+void Tracking::SetCameraIntrinsics(float fx, float fy, float cx, float cy,
+                                   float k1, float k2, float p1, float p2)
+{
+    // 共享的相机对象：Frame/KeyFrame 在构造时从这里取内参，所以必须一起改。
+    mpCamera->setParameter(fx, 0);
+    mpCamera->setParameter(fy, 1);
+    mpCamera->setParameter(cx, 2);
+    mpCamera->setParameter(cy, 3);
+
+    mK = cv::Mat::eye(3,3,CV_32F);
+    mK.at<float>(0,0) = fx;
+    mK.at<float>(1,1) = fy;
+    mK.at<float>(0,2) = cx;
+    mK.at<float>(1,2) = cy;
+
+    mK_.setIdentity();
+    mK_(0,0) = fx;
+    mK_(1,1) = fy;
+    mK_(0,2) = cx;
+    mK_(1,2) = cy;
+
+    mDistCoef = cv::Mat(4,1,CV_32F);
+    mDistCoef.at<float>(0) = k1;
+    mDistCoef.at<float>(1) = k2;
+    mDistCoef.at<float>(2) = p1;
+    mDistCoef.at<float>(3) = p2;
+
+    // 图像边界（mnMinX/mnMaxX 等）由 K 推出，必须让它重算。
+    Frame::mbInitialComputations = true;
+}
+
 void Tracking::InformOnlyTracking(const bool &flag)
 {
     mbOnlyTracking = flag;
