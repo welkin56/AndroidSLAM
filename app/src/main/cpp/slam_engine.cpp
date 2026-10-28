@@ -44,6 +44,9 @@ constexpr size_t kMaxImu = 2000;
 // 等帧超时，让循环定期检查 running。
 constexpr int kWaitMs = 100;
 
+// 两趟之间在时间轴上的间隔。必须远小于 ORB-SLAM3 的 1 秒跳变阈值。
+constexpr double kSessionGapS = 0.033;
+
 // ORB_SLAM3 eTrackingState::OK。
 constexpr int kTrackingOk = 2;
 
@@ -98,6 +101,9 @@ struct Engine {
     std::atomic<long long> startedAtMs{0};
     /** 是否吃帧。停止时不销毁 System。 */
     std::atomic<bool> running{false};
+
+    /** 每次 start() 置位：worker 在第一帧把时间轴接到上一趟后面。 */
+    std::atomic<bool> rebaseSession{false};
 
     // 启动线程前赋值，之后只读，不需要锁。
     std::string vocab;
@@ -496,6 +502,11 @@ void worker(Engine& e) {
     ORB_SLAM3::System* sys = e.sys.load();
     bool haveBase = false;
     double base = 0.0;
+    /** 上一帧喂给 SLAM 的时间（秒，本进程的时间轴），跨会话接续用。 */
+    bool haveLastT = false;
+    double lastT = 0.0;
+    /** 本会话的时间偏移，让两趟之间的间隔看起来只有一帧。 */
+    double sessionOffset = 0.0;
     // 见过非 0 的 KF 数后才算重置；刚构造完本来就没有关键帧。
     bool sawKfs = false;
 
@@ -524,12 +535,27 @@ void worker(Engine& e) {
         // 停止期间不吃帧；队列已由 stop() 清空。
         if (!e.running.load()) continue;
 
-        // 纳秒转秒只在这里做，时间基准取第一帧。
+        // 纳秒转秒只在这里做，时间基准取本进程的第一帧。
         if (!haveBase) {
             base = static_cast<double>(f.tsNs) / 1e9;
             haveBase = true;
         }
-        const double t = static_cast<double>(f.tsNs) / 1e9 - base;
+
+        // 每趟重新起跑时把时间轴接在上一趟后面。不接的话，20 秒的真实间隔会触发
+        // ORB-SLAM3 的 Timestamp jump 守卫（>1 秒），它会重建一张图。
+        // 相机和 IMU 加同一个偏移，相对时序不变。
+        if (e.rebaseSession.exchange(false)) {
+            sessionOffset = haveLastT
+                            ? (lastT + kSessionGapS) - (static_cast<double>(f.tsNs) / 1e9 - base)
+                            : 0.0;
+            if (haveLastT) {
+                printf("[M5] 时间轴接续：偏移 %.3f s（上一趟最后一帧 t=%.3f）\n",
+                       sessionOffset, lastT);
+                fflush(stdout);
+            }
+        }
+
+        const double t = static_cast<double>(f.tsNs) / 1e9 - base + sessionOffset;
 
         // 把上一帧到这一帧之间的 IMU 交给 ORB-SLAM3，
         // 精确切片由 TrackMonocular 内部按时间戳完成。
@@ -540,7 +566,7 @@ void worker(Engine& e) {
                 const Imu& m = e.imus.front();
                 // 参数顺序是加速度在前、角速度在后；写反不会报错，但跟踪会乱。
                 imu.emplace_back(m.ax, m.ay, m.az, m.wx, m.wy, m.wz,
-                                 static_cast<double>(m.tsNs) / 1e9 - base);
+                                 static_cast<double>(m.tsNs) / 1e9 - base + sessionOffset);
                 e.imus.pop_front();
             }
         }
@@ -548,6 +574,8 @@ void worker(Engine& e) {
         // 走 orbTrack：本层不链 OpenCV，cv::Mat 的构造留在另一侧。
         TrackResult r;
         orbTrack(sys, f.gray.data(), f.w, f.h, t, imu, &r);
+        lastT = t;
+        haveLastT = true;
 
         // 测距关闭时不算；开启时每帧都发布，包括不可测的帧。
         // 测量读写 measureState，需要加锁；publishMeasure 之后单独取锁，不嵌套。
@@ -697,6 +725,8 @@ void setIntrinsics(float fx, float fy, float cx, float cy,
 
 void start() {
     Engine& e = engine();
+    // 新一趟：让 worker 在第一帧把时间轴接在上一趟后面，避免触发跳变守卫。
+    e.rebaseSession.store(true);
     // 一次运行对应一份轨迹；上游轨迹表从不清理，需要手动清。
     if (ORB_SLAM3::System* sys = e.sys.load()) {
         sys->ClearFrameTrajectory();
