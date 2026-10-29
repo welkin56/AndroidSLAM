@@ -23,7 +23,8 @@ import kotlin.math.abs
  * 帧的唯一出口是 [onFrame]。
  *
  * 相机只有「开」和「关」两种状态；[ready] 和 [focusLockArmed] 只在 [start]、[stop]
- * 以及 [releaseResources] 中复位。要重新对焦就再次 [beginSettle]。
+ * 以及 [releaseResources] 中复位。重新对焦用 [beginSettle]（收敛后自动锁）
+ * 或 [startContinuousFocus]（不锁，由调用方决定）。
  */
 class CameraCapture(
     private val context: Context,
@@ -342,6 +343,17 @@ class CameraCapture(
         requestSettle(epoch)
     }
 
+    /**
+     * 只要连续对焦、收敛后不锁定：由调用方决定何时 [lockFocusNow]。
+     * 标定页用这个 —— 先看清再锁，锁错了还要能放开重来。
+     */
+    fun startContinuousFocus() = handler.post {
+        if (epoch % 2L == 0L) return@post
+        focusLockArmed = false
+        focusVerifying = false
+        requestSettle(epoch)
+    }
+
     /** 发送连续对焦请求并监听 AF_STATE；会话未建好时不处理。 */
     private fun requestSettle(myEpoch: Long) {
         val d = device ?: return
@@ -393,13 +405,14 @@ class CameraCapture(
         return d
     }
 
-    /** 放开锁定，回到连续对焦。 */
+    /** 放开锁定，回到连续对焦（不再自动锁回去）。 */
     fun releaseFocus() {
         pinnedDiopter = null
+        focusDiopter = null
         focusCommanded = false
         focusNote = null
         ready = false
-        beginSettle()
+        startContinuousFocus()
     }
 
     /**
