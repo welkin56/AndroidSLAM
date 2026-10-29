@@ -9,6 +9,16 @@ git 记的是「结果」，这里记的是「为什么」，以及**考虑过�
 
 ## 2026-10
 
+- [2026-10-28 标定页：本机对着棋盘格算内参](2026-10-28-calib-page.md)
+  —— 入口页多一个「标定」：锁定对焦 → 对着 A4 棋盘格移 30 秒 → App 内用
+  `findChessboardCornersSB` + `calibrateCamera` 算出 fx/fy/cx/cy/k1，存成
+  `calib/profile.json` 的一行。没用 ChArUco：Android 的 OpenCV 4.6 没有 aruco。
+  **未重编验证**。
+
+- [2026-10-28 跨会话把时间轴接上，避免每趟都重建地图](2026-10-28-session-time-continuity.md)
+  —— 每趟「启动」的第一帧从"真实过了 20 秒"改成"上一趟最后一帧 + 33 ms"，
+  不再触发 ORB-SLAM3 的跳变守卫。相机和 IMU 加同一个偏移，相对时序不变。**未重编验证**。
+
 - [2026-10-28 内参：按对焦屈光度索引的 profile + 启动前注入](2026-10-28-intrinsics-profile.md)
   —— 内参不再写进 yaml，改由 `calib/profile.json` 按屈光度插值、在 `nativeStart()`
   之前注入；一张地图把用过的内参记进 `session.json`，重开时直接读记录。

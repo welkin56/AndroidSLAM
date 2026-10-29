@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 
+#include "calib.h"
 #include "log_redirect.h"
 #include "slam_engine.h"
 
@@ -121,6 +122,78 @@ Java_com_example_slamcapture_SlamBridge_nativeSetIntrinsics(
         jfloat k1, jfloat k2, jfloat p1, jfloat p2) {
     try {
         slam::setIntrinsics(fx, fy, cx, cy, k1, k2, p1, p2);
+    } catch (...) {
+    }
+}
+
+// ---------------- 棋盘格标定 ----------------
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibStart(
+        JNIEnv* /*env*/, jobject /*thiz*/, jint cols, jint rows, jint w, jint h) {
+    try {
+        slam::calib::start(cols, rows, w, h);
+        return JNI_TRUE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibAddFrame(
+        JNIEnv* env, jobject /*thiz*/, jbyteArray gray) {
+    if (gray == nullptr) return 0;
+    jbyte* p = env->GetByteArrayElements(gray, nullptr);
+    if (p == nullptr) return 0;
+    int ok = 0;
+    try {
+        ok = slam::calib::addFrame(reinterpret_cast<const unsigned char*>(p));
+    } catch (...) {
+    }
+    // 只读，改了也不用写回。
+    env->ReleaseByteArrayElements(gray, p, JNI_ABORT);
+    return ok;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibViews(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        return slam::calib::views();
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibCoverage(
+        JNIEnv* env, jobject /*thiz*/, jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 10) return;
+    float tmp[10] = {0};
+    try {
+        slam::calib::coverage(tmp);
+    } catch (...) {
+    }
+    env->SetFloatArrayRegion(out, 0, 10, tmp);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibFinish(
+        JNIEnv* env, jobject /*thiz*/, jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 11) return JNI_FALSE;
+    float tmp[11] = {0};
+    int ok = 0;
+    try {
+        ok = slam::calib::finish(tmp);
+    } catch (...) {
+    }
+    if (ok) env->SetFloatArrayRegion(out, 0, 11, tmp);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibReset(JNIEnv* /*env*/, jobject /*thiz*/) {
+    try {
+        slam::calib::reset();
     } catch (...) {
     }
 }

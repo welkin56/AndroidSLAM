@@ -101,6 +101,7 @@ add_library(orb_slam3 SHARED
     ${CPP_DIR}/md5.cpp                # 替代上游依赖的 -lcrypto
     ${CPP_DIR}/orb_track.cpp          # 我们写的，编在这里的原因见上
     ${CPP_DIR}/measure_center.cpp     # 同上，它用到 cv::KeyPoint 和 MapPoint
+    ${CPP_DIR}/calib.cpp              # 同上，标定用的是 OpenCV calib3d
     ${ORB_ROOT}/src/System.cc
     ${ORB_ROOT}/src/Tracking.cc
     ${ORB_ROOT}/src/LocalMapping.cc

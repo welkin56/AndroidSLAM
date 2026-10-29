@@ -118,21 +118,40 @@
         android:layout_marginStart="20dp"
         android:layout_marginEnd="20dp" />
 
-    <Button
-        android:id="@+id/btnRecordMode"
-        style="@style/Widget.Material3.Button.TonalButton"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="52dp"
+        android:layout_height="wrap_content"
         android:layout_marginStart="20dp"
         android:layout_marginTop="14dp"
         android:layout_marginEnd="20dp"
         android:layout_marginBottom="20dp"
-        android:text="录制模式"
-        android:textSize="15sp"
-        app:cornerRadius="16dp"
-        app:icon="@drawable/ic_record"
-        app:iconGravity="textStart"
-        app:iconSize="20dp"
-        app:iconTint="?attr/colorOnSecondaryContainer" />
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnRecordMode"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_weight="1"
+            android:text="录制模式"
+            android:textSize="15sp"
+            app:cornerRadius="16dp"
+            app:icon="@drawable/ic_record"
+            app:iconGravity="textStart"
+            app:iconSize="20dp"
+            app:iconTint="?attr/colorOnSecondaryContainer" />
+
+        <!-- 标定和录制一样是「不选地图」的独立入口。 -->
+        <Button
+            android:id="@+id/btnCalib"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="10dp"
+            android:layout_weight="1"
+            android:text="标定"
+            android:textSize="15sp"
+            app:cornerRadius="16dp" />
+    </LinearLayout>
 
 </LinearLayout>

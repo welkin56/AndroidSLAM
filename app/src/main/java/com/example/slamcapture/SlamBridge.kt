@@ -48,6 +48,29 @@ object SlamBridge {
     external fun nativeSetIntrinsics(fx: Float, fy: Float, cx: Float, cy: Float,
                                      k1: Float, k2: Float, p1: Float, p2: Float)
 
+    // ---------------- 棋盘格标定 ----------------
+    //
+    // 视角全在 native 内存里，不落盘；[nativeCalibFinish] 只估 fx/fy/cx/cy/k1。
+
+    /** [cols]×[rows] 是内角点数。 */
+    external fun nativeCalibStart(cols: Int, rows: Int, w: Int, h: Int): Boolean
+
+    /** 喂一帧紧凑灰度。收下返回 1，没检出/重复返回 0。 */
+    external fun nativeCalibAddFrame(gray: ByteArray): Int
+
+    external fun nativeCalibViews(): Int
+
+    /** out 至少 10 个：前 9 个是九宫格每格占比，第 10 个是画面外圈占比。 */
+    external fun nativeCalibCoverage(out: FloatArray)
+
+    /**
+     * out 至少 11 个，收 fx fy cx cy k1 k2 p1 p2 rms views dropped。
+     * 返回 false 表示视角不够或拟合失败。
+     */
+    external fun nativeCalibFinish(out: FloatArray): Boolean
+
+    external fun nativeCalibReset()
+
     /** 开始吃帧，不销毁 System。 */
     external fun nativeStart()
 
