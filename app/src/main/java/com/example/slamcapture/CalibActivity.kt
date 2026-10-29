@@ -23,6 +23,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 /**
@@ -68,6 +69,9 @@ class CalibActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val calibWorker = Executors.newSingleThreadExecutor()
+
+    /** 同一时刻只允许一帧在检测：检测慢于抽帧间隔时，无界队列会一直堆积。 */
+    private val detecting = AtomicBoolean(false)
 
     /** 落盘只在 UI 线程改，相机线程只读。 */
     @Volatile
@@ -162,12 +166,16 @@ class CalibActivity : AppCompatActivity() {
         }
         if (!capturing) return
         if (++frameSeq % DETECT_EVERY != 0) return
-        // 检测要几十毫秒，丢到独立线程；拷贝一份是因为缓冲之后会被复用。
+        // 上一帧还在检就直接丢：排队只会让延迟越拖越长。拷贝也一样，只在真要检时才做。
+        if (!detecting.compareAndSet(false, true)) return
         val copy = gray.copyOf()
         calibWorker.execute {
-            if (!capturing) return@execute
-            if (SlamBridge.nativeCalibAddFrame(copy) > 0) {
-                uiHandler.post { onViewAccepted() }
+            try {
+                if (capturing && SlamBridge.nativeCalibAddFrame(copy) > 0) {
+                    uiHandler.post { onViewAccepted() }
+                }
+            } finally {
+                detecting.set(false)
             }
         }
     }

@@ -125,19 +125,34 @@ void start(int cols, int rows, int w, int h) {
 
 int addFrame(const unsigned char* gray) {
     State& st = state();
-    std::lock_guard<std::mutex> lk(st.mu);
-    if (gray == nullptr || st.cols <= 0 || st.rows <= 0 || st.w <= 0 || st.h <= 0) return 0;
-    if (st.fitted || static_cast<int>(st.views.size()) >= kMaxViews) return 0;
 
-    const cv::Mat img(st.h, st.w, CV_8UC1, const_cast<unsigned char*>(gray));
+    // 检测要几十到几百毫秒，不能抱着锁跑：views()/coverage() 是 UI 线程每 300 ms
+    // 调一次的，锁被占住主线程就跟着卡。
+    int cols, rows, w, h;
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        if (gray == nullptr || st.cols <= 0 || st.rows <= 0 || st.w <= 0 || st.h <= 0) return 0;
+        if (st.fitted || static_cast<int>(st.views.size()) >= kMaxViews) return 0;
+        cols = st.cols;
+        rows = st.rows;
+        w = st.w;
+        h = st.h;
+    }
+
+    const cv::Mat img(h, w, CV_8UC1, const_cast<unsigned char*>(gray));
     std::vector<cv::Point2f> corners;
 
     // SB 检测器比经典版抗模糊得多；EXHAUSTIVE 慢一些，但我们只抽 1/5 帧。
     const int flags = cv::CALIB_CB_EXHAUSTIVE | cv::CALIB_CB_ACCURACY;
-    if (!cv::findChessboardCornersSB(img, cv::Size(st.cols, st.rows), corners, flags)) {
+    if (!cv::findChessboardCornersSB(img, cv::Size(cols, rows), corners, flags)) {
         return 0;
     }
-    if (static_cast<int>(corners.size()) != st.cols * st.rows) return 0;
+    if (static_cast<int>(corners.size()) != cols * rows) return 0;
+
+    std::lock_guard<std::mutex> lk(st.mu);
+    // 检测期间可能已经攒满，或者被 start() 重新开始了。
+    if (st.fitted || st.w != w || st.h != h || st.cols != cols || st.rows != rows) return 0;
+    if (static_cast<int>(st.views.size()) >= kMaxViews) return 0;
     if (tooSimilar(st, corners)) return 0;
 
     st.views.push_back(corners);
