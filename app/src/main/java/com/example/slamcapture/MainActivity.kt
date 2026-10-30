@@ -98,6 +98,8 @@ class MainActivity : AppCompatActivity() {
         /** 小地图缩放档位下标。 */
         private const val PREF_MAP_ZOOM = "mapZoom"
         private const val PREF_WAYPOINTS = "waypoints"
+        /** 小地图是否绘制本趟轨迹。 */
+        private const val PREF_MAP_TRAJ = "mapTraj"
         private const val PREF_HISTORY = "historyOn"
         /** 隐藏的历史轨迹绝对路径集合。 */
         private const val PREF_HIST_HIDDEN = "historyHidden"
@@ -357,6 +359,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnMapZoomIn: Button
     private lateinit var btnMapZoomOut: Button
 
+    /** 本趟轨迹层；只管画不画，SLAM 始终在记录。 */
+    private lateinit var swTraj: SwitchCompat
+
     /** 上次看到的地图重置次数；增加表示坐标系已更换。 */
     private var resetCountSeen = 0
 
@@ -501,6 +506,7 @@ class MainActivity : AppCompatActivity() {
         swWaypoints = findViewById(R.id.swWaypoints)
         btnWpAdd = findViewById(R.id.btnWpAdd)
         btnWpManage = findViewById(R.id.btnWpManage)
+        swTraj = findViewById(R.id.swTraj)
         swHistory = findViewById(R.id.swHistory)
         btnHistoryManage = findViewById(R.id.btnHistoryManage)
         viewerWrap = findViewById(R.id.viewerWrap)
@@ -605,6 +611,13 @@ class MainActivity : AppCompatActivity() {
         }
         btnWpAdd.setOnClickListener { askAddWaypoint() }
         btnWpManage.setOnClickListener { showWaypointManager() }
+
+        // 实时轨迹：只影响小地图绘制，轨迹本身照常写盘。
+        swTraj.isChecked = pref.getBoolean(PREF_MAP_TRAJ, true)
+        swTraj.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_MAP_TRAJ, checked).apply()
+            render()
+        }
 
         // 历史轨迹：开关只管画不画；逐条隐藏 / 删除在管理页（开关关着也能管）。
         histHidden = (pref.getStringSet(PREF_HIST_HIDDEN, emptySet()) ?: emptySet())
@@ -1643,17 +1656,18 @@ class MainActivity : AppCompatActivity() {
         // 查看器盖住了小窗：不读、不画，省一倍锁和绘制。
         if (mapWrap.visibility != View.VISIBLE || viewerOpen) return
 
-        val n = SlamBridge.nativeGetTrajectory(trajBuf)
+        // 轨迹层关掉时不读 native：省一次轨迹锁。
+        val n = if (swTraj.isChecked) SlamBridge.nativeGetTrajectory(trajBuf) else 0
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
         // 空窗也要给出原因，并区分加载中、未启动等状态。
-        // 只有在无任何可绘制内容时才显示提示。
+        // 只在无任何可绘制内容时才显示提示；主动隐藏轨迹不算「没内容」。
         val anything = n > 0 || pn > 0 || histShown > 0
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
             slamState == SLAM_FAILED -> "构造失败"
             !anything && !slamRunning -> "SLAM 未启动"
             !anything && trkState != TRK_OK -> "跟踪未就绪"
-            !anything -> "等待定位…"
+            !anything && swTraj.isChecked -> "等待定位…"
             else -> null
         }
         // 停止后不绘制当前位置，避免使用过期位姿。

@@ -9,6 +9,10 @@ git 记的是「结果」，这里记的是「为什么」，以及**考虑过�
 
 ## 2026-10
 
+- [2026-10-30 小地图：加一个「实时轨迹」开关](2026-10-30-map-traj-toggle.md)
+  —— 抽屉「标记」分组里多一个开关，关掉后小地图不再画本趟轨迹线，只剩点云和当前位置。
+  关掉时跳过 `nativeGetTrajectory`，省一次 `trajMutex`。**未构建**。
+
 - [2026-10-28 标定页：本机对着棋盘格算内参](2026-10-28-calib-page.md)
   —— 入口页多一个「标定」：锁定对焦 → 对着 A4 棋盘格移 30 秒 → App 内用
   `findChessboardCornersSB` + `calibrateCamera` 算出 fx/fy/cx/cy/k1，存成

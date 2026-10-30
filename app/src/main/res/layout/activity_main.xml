@@ -559,6 +559,15 @@
                 android:layout_marginTop="6dp"
                 android:text="管理路径点" />
 
+            <!-- 实时轨迹：小地图上本趟走过的路线。关掉只剩点云和当前位置。 -->
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/swTraj"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:minHeight="48dp"
+                android:text="实时轨迹" />
+
             <!-- 历史轨迹：同一张图以前各趟的轨迹。 -->
             <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/swHistory"
