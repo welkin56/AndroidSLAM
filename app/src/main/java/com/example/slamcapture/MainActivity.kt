@@ -1203,17 +1203,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 生成段标签，只在数值变化超过 0.5 mm 时重新格式化。
-     * 长度每帧都会变化，但不应每帧调用 String.format。
+     * 生成段标签，只在数值变化超过 5 mm 时重新格式化。
+     * 长度每帧都会变化，但不应每帧调用 String.format；
+     * 显示到厘米 —— 毫米位放大的只是地图收敛的抖动。
      */
     private fun segLabel(i: Int, v: Float): String {
         while (segLast.size <= i) {
             segLast.add(-1f)
             segLabels.add("")
         }
-        if (segLast[i] < 0f || abs(v - segLast[i]) > 5e-4f) {
+        if (segLast[i] < 0f || abs(v - segLast[i]) > 5e-3f) {
             segLast[i] = v
-            segLabels[i] = "%.3f m".format(v)
+            segLabels[i] = "%.2f m".format(v)
         }
         return segLabels[i]
     }
@@ -1246,7 +1247,7 @@ class MainActivity : AppCompatActivity() {
             if (pinnedBuf[lo + 4] >= 0f) {
                 live = PreviewView.Seg(pinnedBuf[lo], pinnedBuf[lo + 1],
                                        pinnedBuf[lo + 2], pinnedBuf[lo + 3],
-                                       "%.3f m".format(pinnedBuf[lo + 4]))
+                                       "%.2f m".format(pinnedBuf[lo + 4]))
             }
         }
         return PreviewView.Overlay(measureState, measureBuf[0], measureBuf[4], measureBuf[5],

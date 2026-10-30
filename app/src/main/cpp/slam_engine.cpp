@@ -28,6 +28,8 @@
 #include <pthread.h>
 
 #include "ImuTypes.h"
+#include "KeyFrame.h"
+#include "Map.h"
 #include "MapPoint.h"
 #include "System.h"
 #include "orb_track.h"
@@ -191,16 +193,29 @@ struct Engine {
     std::atomic<int> baseMaps{0};
     std::atomic<int> baseKfs{0};
 
-    /** 折线上的一个点。存 MapPoint* 是为了身份；世界坐标会随 BA 变化。 */
+    /**
+     * 折线上的一个点。坐标存在「锚点关键帧」的相机系里，每帧由关键帧位姿算出来。
+     *
+     * 同一条链共用一个锚点关键帧，所以整条链是一个刚体：局部 BA 改不动段长。
+     * 关键帧位姿由它全部观测点一起约束，单个地图点被挪几十厘米时它几乎不动。
+     */
     struct Pinned {
-        ORB_SLAM3::MapPoint* mp = nullptr;  // nullptr = 平面兜底来的，没身份，只能冻着
-        float pw[3] = {0, 0, 0};            // 兜底/失效时的坐标，也当每帧的刷新缓存
-        bool low = false;                   // 平面兜底/勉强来的（画空心圈）
-        bool startsChain = false;           // 它是一条新折线的起点
-        bool closed = false;                // 它之后「断开」了
+        ORB_SLAM3::MapPoint* mp = nullptr;   // 锚点来源，只记身份
+        ORB_SLAM3::KeyFrame* kf = nullptr;   // 锚点关键帧；nullptr = 只能冻着
+        ORB_SLAM3::Map* mapAtPin = nullptr;  // p_kf 是按哪张图的尺度算的
+        float p_kf[3] = {0, 0, 0};           // 点在锚点关键帧相机系里的位置
+        float sAtPin = 1.f;                  // 上面这组坐标是按哪个累积尺度算的
+        float pw[3] = {0, 0, 0};             // 每帧由关键帧位姿算出的世界坐标
+        bool low = false;                    // 平面兜底/勉强来的（画空心圈）
+        bool startsChain = false;            // 它是一条新折线的起点
+        bool closed = false;                 // 它之后「断开」了
     };
     /** 折线。与 measure 共用一把锁；只在主线程读写。 */
     std::vector<Pinned> pinned;
+    /** 下一帧刷新哪个钉点；每帧只刷一个，轮流来。 */
+    int refineCursor = 0;
+    /** 上一次段长心跳的时刻，限流用。 */
+    long long lenLogAtMs = 0;
 
     /** 加路径点请求。主线程发出，worker 在下一帧之后执行一次。 */
     std::mutex wpMutex;
@@ -473,7 +488,9 @@ bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
         }
     }
 
-    // 坐标系已改变，位姿和点云快照失效。
+    // 坐标系已改变：位姿、点云快照、折线全失效。
+    // 折线握着旧图的关键帧，旧图被换掉之后那些指针没有意义了。
+    clearPinned();
     {
         std::lock_guard<std::mutex> lk(e.poseMutex);
         e.poseValid = false;
@@ -493,6 +510,9 @@ bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
     fflush(stdout);
     return true;
 }
+
+/** 定义在后面（要用测距那片工具函数）。 */
+void refinePinned(Engine& e, ORB_SLAM3::System* sys, const float t_cw[16]);
 
 // 常驻循环：先构造 System，再持续取帧、跟踪、保存位姿。
 void worker(Engine& e) {
@@ -587,6 +607,9 @@ void worker(Engine& e) {
             }
             publishMeasure(m);
         }
+
+        // 钉点刷新不跟测距开关走：测距关掉之后折线仍然会画。
+        if (r.valid) refinePinned(e, sys, r.t_cw16);
 
         // 重置检测每帧都要做。KF 数掉到 0 表示当前图被重置，
         // 坐标系已重新锚定，前一段轨迹不再可用，只保留最后一段。
@@ -850,9 +873,10 @@ void publishMeasure(const CenterMeasure& m) {
                    out.support, out.texture, out.zSpan * 100.0f);
         } else {
             printf("[M6] * %.3f m  世界(%.3f, %.3f, %.3f)  像素(%.1f, %.1f)"
-                   "  候选%d 支持%d 纹理%d 跨度%.0f%%  %s 路径%d 质量%d\n",
+                   "  候选%d 支持%d 纹理%d 跨度%.0f%%  深度%s  %s 路径%d 质量%d\n",
                    out.distance, out.wx, out.wy, out.wz, out.px, out.py,
                    out.candidates, out.support, out.texture, out.zSpan * 100.0f,
+                   out.surface ? "面" : "点",
                    out.source == 1 ? "新选" : "沿用", out.method, out.quality);
         }
         fflush(stdout);
@@ -953,6 +977,124 @@ float dist3(const float* a, const float* b) {
     const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
+
+/** 钉点深度刷新的收敛速度：每帧一次，约 0.5 s 爬到新值。 */
+constexpr float kRefineAlpha = 0.15f;
+
+/** 刷新时低于这个深度的不碰；相机后方的点算不出像素。 */
+constexpr float kRefineMinZ = 0.05f;
+
+/**
+ * 把钉点坐标刷成锚点关键帧位姿下的最新值。
+ *
+ * 整图尺度修正会把关键帧的平移乘 s，而 p_kf 是不变量。不跟着乘的话，
+ * 每个点会整体平移 (s-1)*相机中心，两个点就朝不同方向散开。
+ */
+void refreshPinned(Engine::Pinned& p) {
+    if (p.kf == nullptr || p.kf->isBad()) return;
+
+    // 关键帧被挂到别的图上（合并）或图被清空时，两边的累积尺度没有可比性：
+    // 算出来的比值会是垃圾，p_kf 会被乘飞。这种情况只冻住，不重标。
+    ORB_SLAM3::Map* m = p.kf->GetMap();
+    if (m != nullptr && m == p.mapAtPin) {
+        const float s = m->GetMetricScale();
+        if (s > 0.f && s != p.sAtPin) {
+            const float k = s / p.sAtPin;
+            p.p_kf[0] *= k;
+            p.p_kf[1] *= k;
+            p.p_kf[2] *= k;
+            p.sAtPin = s;
+        }
+    } else if (p.mapAtPin != nullptr) {
+        p.low = true;   // 换图了，这组坐标只能冻在旧尺度里
+    }
+
+    const Sophus::SE3f Twc = p.kf->GetPoseInverse();
+    const Eigen::Vector3f w = Twc * Eigen::Vector3f(p.p_kf[0], p.p_kf[1], p.p_kf[2]);
+    p.pw[0] = w.x();
+    p.pw[1] = w.y();
+    p.pw[2] = w.z();
+}
+
+/** 没有别的钉点再用这个关键帧时，放开「不许剔除」的保护。 */
+void releaseKfIfUnused(const Engine& e, ORB_SLAM3::KeyFrame* kf) {
+    if (kf == nullptr) return;
+    for (const Engine::Pinned& p : e.pinned) {
+        if (p.kf == kf) return;
+    }
+    kf->SetErase();
+}
+
+/**
+ * 段长心跳（1 Hz）。钉点之后读数到底稳没稳住，只有这一行能证明；别的都是推理。
+ * 锚点关键帧 id 一起打，用来判断两条链是不是已经分开了。
+ */
+void logSegments(Engine& e, long long now) {
+    if (now - e.lenLogAtMs < 1000) return;
+    e.lenLogAtMs = now;
+
+    const int n = static_cast<int>(e.pinned.size());
+    if (n <= 0) return;
+
+    for (Engine::Pinned& p : e.pinned) refreshPinned(p);
+
+    printf("[M6] 段长");
+    for (int i = 0; i + 1 < n; ++i) {
+        if (e.pinned[i + 1].startsChain) {
+            printf(" -");
+        } else {
+            printf(" %.3f", dist3(e.pinned[i].pw, e.pinned[i + 1].pw));
+        }
+    }
+    printf(" | 锚点");
+    for (const Engine::Pinned& p : e.pinned) {
+        printf(" %lu", p.kf == nullptr ? 0UL : p.kf->mnId);
+    }
+    ORB_SLAM3::Map* m = e.pinned[0].mapAtPin;
+    printf(" | 图尺度 %.4f | 点 %d\n", m != nullptr ? m->GetMetricScale() : 0.f, n);
+    fflush(stdout);
+}
+
+/**
+ * 用点–面约束刷新一个钉点的深度（SLAM 线程）。每帧只处理一个，轮流来。
+ *
+ * 只改 p_kf，不动关键帧。EMA 而不是直接赋值：地图本身还在收敛，
+ * 刷新目标是动的，直接赋值会让读数跳。
+ */
+void refinePinned(Engine& e, ORB_SLAM3::System* sys, const float t_cw[16]) {
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    logSegments(e, nowMs());
+
+    const int n = static_cast<int>(e.pinned.size());
+    if (n <= 0) return;
+    if (e.refineCursor >= n) e.refineCursor = 0;
+
+    Engine::Pinned& p = e.pinned[e.refineCursor];
+    e.refineCursor = (e.refineCursor + 1) % n;
+    if (p.kf == nullptr || p.kf->isBad()) return;
+
+    refreshPinned(p);
+    const Eigen::Vector3f pc = toCam(t_cw, p.pw);
+    if (pc.z() <= kRefineMinZ) return;
+
+    const SurfaceDepth sd = surfaceAtPoint(sys, t_cw, p.pw[0], p.pw[1], p.pw[2]);
+    if (!sd.ok) return;
+
+    // 相机系 → 世界：只沿原射线缩放，方向不变。
+    Eigen::Matrix3f Rcw;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) Rcw(r, c) = t_cw[c * 4 + r];
+    }
+    const Eigen::Vector3f tw(t_cw[12], t_cw[13], t_cw[14]);
+    const Eigen::Vector3f cam = -Rcw.transpose() * tw;
+    const Eigen::Vector3f pwNew = Rcw.transpose() * (sd.ratio * pc) + cam;
+
+    const Sophus::SE3f TcwKf = p.kf->GetPose();
+    const Eigen::Vector3f tgt = TcwKf * pwNew;
+    p.p_kf[0] += kRefineAlpha * (tgt.x() - p.p_kf[0]);
+    p.p_kf[1] += kRefineAlpha * (tgt.y() - p.p_kf[1]);
+    p.p_kf[2] += kRefineAlpha * (tgt.z() - p.p_kf[2]);
+}
 }  // namespace
 
 bool addPinned(int snapTo) {
@@ -967,9 +1109,11 @@ bool addPinned(int snapTo) {
         if (snapTo >= static_cast<int>(e.pinned.size())) return false;
         const Engine::Pinned& src = e.pinned[snapTo];
         p.mp = src.mp;
-        p.pw[0] = src.pw[0];
-        p.pw[1] = src.pw[1];
-        p.pw[2] = src.pw[2];
+        p.kf = src.kf;
+        p.mapAtPin = src.mapAtPin;
+        std::memcpy(p.p_kf, src.p_kf, sizeof(p.p_kf));
+        std::memcpy(p.pw, src.pw, sizeof(p.pw));
+        p.sAtPin = src.sAtPin;
         p.low = src.low;
     } else {
         if (e.measure.quality == kNone) return false;  // 没读数就没什么可钉的
@@ -977,25 +1121,67 @@ bool addPinned(int snapTo) {
         p.pw[0] = e.measure.wx;
         p.pw[1] = e.measure.wy;
         p.pw[2] = e.measure.wz;
-        p.low = (e.measure.quality != kGood);
+
+        // 同一条链共用一个锚点关键帧。两点各跟各的关键帧时，局部 BA 会把它们
+        // 改出相对位移；共用一个，整条链就是一个刚体。
+        ORB_SLAM3::KeyFrame* kf = nullptr;
+        if (!e.pinned.empty() && !e.pinned.back().closed) kf = e.pinned.back().kf;
+        const bool freshAnchor = (kf == nullptr);
+        if (freshAnchor && p.mp != nullptr && !p.mp->isBad()) {
+            ORB_SLAM3::KeyFrame* rk = p.mp->GetReferenceKeyFrame();
+            if (rk != nullptr && !rk->isBad()) kf = rk;
+        }
+        if (kf != nullptr) {
+            const Sophus::SE3f Tcw = kf->GetPose();
+            const Eigen::Vector3f pc = Tcw * Eigen::Vector3f(p.pw[0], p.pw[1], p.pw[2]);
+            if (pc.allFinite()) {
+                p.kf = kf;
+                p.p_kf[0] = pc.x();
+                p.p_kf[1] = pc.y();
+                p.p_kf[2] = pc.z();
+                ORB_SLAM3::Map* m = kf->GetMap();
+                p.mapAtPin = m;
+                p.sAtPin = (m != nullptr) ? m->GetMetricScale() : 1.f;
+                if (freshAnchor) kf->SetNotErase();
+            }
+        }
+        // 没绑上关键帧的点只能冻着，走久了会偏，一律算「不太准」。
+        p.low = (e.measure.quality != kGood) || p.kf == nullptr;
     }
 
     // 断开之后下一个点就是新折线的起点；由这一侧判断，Kotlin 不需要保存链状态。
     p.startsChain = e.pinned.empty() || e.pinned.back().closed;
     e.pinned.push_back(p);
+    if (snapTo < 0) {
+        printf("[M6] 钉点 #%d 锚点KF %lu 关键帧系(%.3f, %.3f, %.3f) 质量%d\n",
+               static_cast<int>(e.pinned.size()), p.kf == nullptr ? 0UL : p.kf->mnId,
+               p.p_kf[0], p.p_kf[1], p.p_kf[2], e.measure.quality);
+        fflush(stdout);
+    }
     return true;
 }
 
 void undoPinned() {
     Engine& e = engine();
     std::lock_guard<std::mutex> lk(e.measureMutex);
-    if (!e.pinned.empty()) e.pinned.pop_back();
+    if (e.pinned.empty()) return;
+    ORB_SLAM3::KeyFrame* kf = e.pinned.back().kf;
+    e.pinned.pop_back();
+    releaseKfIfUnused(e, kf);
 }
 
 void clearPinned() {
     Engine& e = engine();
     std::lock_guard<std::mutex> lk(e.measureMutex);
+    // 多个点共用同一个锚点关键帧，先去重再逐个放开。
+    std::vector<ORB_SLAM3::KeyFrame*> kfs;
+    for (const Engine::Pinned& p : e.pinned) {
+        if (p.kf == nullptr) continue;
+        if (std::find(kfs.begin(), kfs.end(), p.kf) == kfs.end()) kfs.push_back(p.kf);
+    }
     e.pinned.clear();
+    e.refineCursor = 0;
+    for (ORB_SLAM3::KeyFrame* kf : kfs) kf->SetErase();
 }
 
 void closePinnedChain() {
@@ -1036,16 +1222,11 @@ int getPinned(float* out, int cap) {
     const int segBase = 1 + 3 * n;
 
     // ① 计算每个点的相机系坐标并刷新世界坐标。
-    //    BA 会持续调整地图点；没有身份或已失效的点只能沿用上一份坐标。
+    //    坐标跟着锚点关键帧走；整图尺度修正时 p_kf 一起重标。
     Eigen::Vector3f pc[kMaxPinned];
     for (int i = 0; i < n; ++i) {
         Engine::Pinned& p = e.pinned[i];
-        if (p.mp != nullptr && !p.mp->isBad()) {
-            const Eigen::Vector3f w = p.mp->GetWorldPos();
-            p.pw[0] = w.x();
-            p.pw[1] = w.y();
-            p.pw[2] = w.z();
-        }
+        refreshPinned(p);
         pc[i] = havePose ? toCam(t, p.pw) : Eigen::Vector3f(0, 0, -1);
     }
 

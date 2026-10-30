@@ -36,6 +36,7 @@ struct CenterMeasure {
     int support = 0;     // 环内支持条目数（不去重），日志用
     int texture = 0;     // 宽锥内特征点总数，日志用
     float zSpan = 0;     // 当帧候选深度的最大相对跨度，日志用
+    int surface = 0;     // 1 = 深度已按局部平面修正（method == 1 时有效），日志用
 };
 
 /** 环容量，同时也是时间窗：满了覆盖最旧的。 */
@@ -78,5 +79,29 @@ bool cameraIntrinsics(float* fx, float* fy, float* cx, float* cy);
 
 /** 覆盖缓存的内参。App 侧注入真实内参后必须调一次，否则投影还用 yaml 里的占位值。 */
 void updateIntrinsics(float fx, float fy, float cx, float cy);
+
+// ---------------- 点–面约束 ----------------
+
+/**
+ * 用点周围的局部平面修正它的深度。
+ *
+ * 单目对一个点的深度只约束到一条射线上：沿射线滑动，重投影误差不变。
+ * 平面把这条射线截成一个点，补掉那个零空间方向；横向位置不动。
+ */
+struct SurfaceDepth {
+    int ok = 0;          // 1 = 平面通过门控，调用方可以按 ratio 缩放
+    float ratio = 1;     // 修正后深度 / 传入点的深度
+    int inliers = 0;     // 参与拟合的内点数
+    int total = 0;       // 锥内候选总数
+    float residual = 0;  // 1/Z 域的相对残差 RMS
+    float cosInc = 0;    // 入射角余弦，1 = 正对表面
+};
+
+/**
+ * 修正世界点 (wx,wy,wz) 的深度。需要跟踪 OK、且该点此刻落在画面内。
+ * ok 为 0 时调用方保持原值，并按 inliers/residual 决定要不要降置信。
+ */
+SurfaceDepth surfaceAtPoint(ORB_SLAM3::System* sys, const float t_cw[16],
+                            float wx, float wy, float wz);
 
 }  // namespace slam
