@@ -195,12 +195,20 @@ struct Engine {
     struct Pinned {
         ORB_SLAM3::MapPoint* mp = nullptr;  // nullptr = 平面兜底来的，没身份，只能冻着
         float pw[3] = {0, 0, 0};            // 兜底/失效时的坐标，也当每帧的刷新缓存
+        float pw0[3] = {0, 0, 0};           // 钉下时的坐标，只用于漂移日志
         bool low = false;                   // 平面兜底/勉强来的（画空心圈）
         bool startsChain = false;           // 它是一条新折线的起点
         bool closed = false;                // 它之后「断开」了
+        bool sawBad = false;                // 已打过「被剔除」的日志
     };
     /** 折线。与 measure 共用一把锁；只在主线程读写。 */
     std::vector<Pinned> pinned;
+    /** 钉点漂移日志的上次打印时刻，与 pinned 共用一把锁。 */
+    long long pinnedLogAtMs = 0;
+
+    /** 最近一帧的图像尺寸，钉点日志用来把像素偏差换算成米。 */
+    std::atomic<int> lastW{0};
+    std::atomic<int> lastH{0};
 
     /** 加路径点请求。主线程发出，worker 在下一帧之后执行一次。 */
     std::mutex wpMutex;
@@ -494,6 +502,9 @@ bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
     return true;
 }
 
+/** 钉点漂移日志；定义在「多点折线」一节。 */
+void logPinnedDrift(const TrackResult& r);
+
 // 常驻循环：先构造 System，再持续取帧、跟踪、保存位姿。
 void worker(Engine& e) {
     construct(e);
@@ -534,6 +545,9 @@ void worker(Engine& e) {
 
         // 停止期间不吃帧；队列已由 stop() 清空。
         if (!e.running.load()) continue;
+
+        e.lastW.store(f.w);
+        e.lastH.store(f.h);
 
         // 纳秒转秒只在这里做，时间基准取本进程的第一帧。
         if (!haveBase) {
@@ -587,6 +601,9 @@ void worker(Engine& e) {
             }
             publishMeasure(m);
         }
+
+        // 只在有钉点时才有输出；关掉测距开关也继续打，否则看不到后半程。
+        logPinnedDrift(r);
 
         // 重置检测每帧都要做。KF 数掉到 0 表示当前图被重置，
         // 坐标系已重新锚定，前一段轨迹不再可用，只保留最后一段。
@@ -897,6 +914,10 @@ void logNoPose(int why) {
 /** 折线点数上限。 */
 constexpr int kMaxPinned = 128;
 
+/** 钉点漂移日志的间隔与每行最多列几个点。 */
+constexpr long long kPinnedLogMs = 1000;
+constexpr int kPinnedLogMax = 6;
+
 /** 相机后方的点插值到这个 z；只影响落点距离，不改变方向。 */
 constexpr float kNearZ = 0.02f;
 
@@ -953,6 +974,80 @@ float dist3(const float* a, const float* b) {
     const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
+
+/**
+ * 把钉点坐标刷成地图点的最新值；地图点失效时保留上一份。
+ * ⚠️ 正是这条「失效就保留」让被剔除的点永久冻住。
+ */
+void refreshPinned(Engine::Pinned& p) {
+    if (p.mp == nullptr || p.mp->isBad()) return;
+    const Eigen::Vector3f w = p.mp->GetWorldPos();
+    p.pw[0] = w.x();
+    p.pw[1] = w.y();
+    p.pw[2] = w.z();
+}
+
+/**
+ * 每秒一行钉点状态，用于分辨距离变化的来源（整图改尺度 / 局部 BA / 点被剔除）。
+ * 段长取「当前 / 钉下时」，点漂移是相对钉下位置的位移；camR 是相机到地图原点的距离，
+ * 整图缩放会让它和段长按同一个比例跳。camR 与点是两回事，别混着看。
+ */
+void logPinnedDrift(const TrackResult& r) {
+    Engine& e = engine();
+    const long long now = nowMs();
+    if (now - e.pinnedLogAtMs < kPinnedLogMs) return;
+
+    std::lock_guard<std::mutex> lk(e.measureMutex);
+    if (e.pinned.empty()) return;
+    e.pinnedLogAtMs = now;
+
+    const int n = static_cast<int>(e.pinned.size());
+
+    // 剔除事件单独一行：之后这个点的坐标就再也不动了，段长变化不能算在它头上。
+    for (int i = 0; i < n && i < kPinnedLogMax; ++i) {
+        Engine::Pinned& p = e.pinned[i];
+        if (p.sawBad || p.mp == nullptr || !p.mp->isBad()) continue;
+        p.sawBad = true;
+        printf("[M6] 钉点 #%d 地图点 %lu 被剔除，坐标从此冻结（漂移 %.3f m）\n", i + 1, p.mp->mnId,
+               dist3(p.pw, p.pw0));
+        fflush(stdout);
+    }
+
+    char line[1024];
+    int used = snprintf(line, sizeof(line), "[M6] 钉点%d", n);
+    // 追加一段；写不下就停手，不越界。
+    auto append = [&](const char* fmt, auto... args) {
+        const int cap = static_cast<int>(sizeof(line)) - used;
+        if (cap <= 1) return;
+        const int w = snprintf(line + used, static_cast<size_t>(cap), fmt, args...);
+        if (w > 0) used += (w < cap ? w : cap - 1);
+    };
+
+    for (int i = 0; i < n; ++i) refreshPinned(e.pinned[i]);
+
+    // 段长：只有连着同一折线的相邻两点才有。
+    for (int i = 0; i + 1 < n && i < kPinnedLogMax; ++i) {
+        if (e.pinned[i + 1].startsChain) continue;
+        append("  段%d %.3f/%.3f", i + 1, dist3(e.pinned[i].pw, e.pinned[i + 1].pw),
+               dist3(e.pinned[i].pw0, e.pinned[i + 1].pw0));
+    }
+
+    for (int i = 0; i < n && i < kPinnedLogMax; ++i) {
+        const Engine::Pinned& p = e.pinned[i];
+        const bool bad = (p.mp == nullptr) || p.mp->isBad();
+        append("  点%d id%lu bad%d Δ%.3f", i + 1, p.mp == nullptr ? 0UL : p.mp->mnId,
+               bad ? 1 : 0, dist3(p.pw, p.pw0));
+    }
+
+    // camR：相机世界坐标的模长。整图被 ApplyScaledRotation 缩放时它会跟着跳。
+    float camR = -1.f;
+    if (r.valid) {
+        const Eigen::Matrix4f t = Eigen::Map<const Eigen::Matrix4f>(r.t_cw16);
+        camR = (-t.block<3, 3>(0, 0).transpose() * t.block<3, 1>(0, 3)).norm();
+    }
+    printf("%s  camR %.3f KF %lu\n", line, camR, r.kfCount);
+    fflush(stdout);
+}
 }  // namespace
 
 bool addPinned(int snapTo) {
@@ -980,9 +1075,38 @@ bool addPinned(int snapTo) {
         p.low = (e.measure.quality != kGood);
     }
 
+    p.pw0[0] = p.pw[0];
+    p.pw0[1] = p.pw[1];
+    p.pw0[2] = p.pw[2];
+
     // 断开之后下一个点就是新折线的起点；由这一侧判断，Kotlin 不需要保存链状态。
     p.startsChain = e.pinned.empty() || e.pinned.back().closed;
     e.pinned.push_back(p);
+
+    // 钉点日志：先记「钉的时候瞄的和钉的差多远」——这一段偏移之后不会再消失。
+    if (snapTo >= 0) {
+        printf("[M6] 钉点 #%d 吸附到已有点 #%d\n", static_cast<int>(e.pinned.size()), snapTo + 1);
+    } else {
+        const int w = e.lastW.load(), h = e.lastH.load();
+        float dpx = -1.f;
+        if (e.measure.px >= 0.f && w > 0 && h > 0) {
+            const float dx = e.measure.px - w * 0.5f;
+            const float dy = e.measure.py - h * 0.5f;
+            dpx = std::sqrt(dx * dx + dy * dy);
+        }
+        // 像素偏差换算成米；内参没读到时只报像素。
+        float dpxM = -1.f;
+        float fx = 0, fy = 0, cx = 0, cy = 0;
+        if (dpx >= 0.f && cameraIntrinsics(&fx, &fy, &cx, &cy) && fx > 0.f) {
+            dpxM = dpx * e.measure.distance / fx;
+        }
+        printf("[M6] 钉点 #%d 地图点 %lu 质量%d 路径%d 跨度%.0f%% 像素偏差%.1f px(≈%.3f m)"
+               " 距离%.3f m\n",
+               static_cast<int>(e.pinned.size()),
+               p.mp == nullptr ? 0UL : p.mp->mnId, e.measure.quality, e.measure.method,
+               e.measure.zSpan * 100.0f, dpx, dpxM, e.measure.distance);
+    }
+    fflush(stdout);
     return true;
 }
 
@@ -1040,12 +1164,7 @@ int getPinned(float* out, int cap) {
     Eigen::Vector3f pc[kMaxPinned];
     for (int i = 0; i < n; ++i) {
         Engine::Pinned& p = e.pinned[i];
-        if (p.mp != nullptr && !p.mp->isBad()) {
-            const Eigen::Vector3f w = p.mp->GetWorldPos();
-            p.pw[0] = w.x();
-            p.pw[1] = w.y();
-            p.pw[2] = w.z();
-        }
+        refreshPinned(p);
         pc[i] = havePose ? toCam(t, p.pw) : Eigen::Vector3f(0, 0, -1);
     }
 
