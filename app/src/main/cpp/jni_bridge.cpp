@@ -140,19 +140,34 @@ Java_com_example_slamcapture_SlamBridge_nativeCalibStart(
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_example_slamcapture_SlamBridge_nativeCalibAddFrame(
-        JNIEnv* env, jobject /*thiz*/, jbyteArray gray) {
+Java_com_example_slamcapture_SlamBridge_nativeCalibProbe(
+        JNIEnv* env, jobject /*thiz*/, jbyteArray gray, jfloatArray out) {
     if (gray == nullptr) return 0;
     jbyte* p = env->GetByteArrayElements(gray, nullptr);
     if (p == nullptr) return 0;
     int ok = 0;
+    float quad[8] = {0};
     try {
-        ok = slam::calib::addFrame(reinterpret_cast<const unsigned char*>(p));
+        ok = slam::calib::probe(reinterpret_cast<const unsigned char*>(p), quad);
     } catch (...) {
+        ok = 0;
     }
     // 只读，改了也不用写回。
     env->ReleaseByteArrayElements(gray, p, JNI_ABORT);
+    if (ok > 0 && out != nullptr && env->GetArrayLength(out) >= 8) {
+        env->SetFloatArrayRegion(out, 0, 8, quad);
+    }
     return ok;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeCalibCommit(
+        JNIEnv* /*env*/, jobject /*thiz*/, jint step) {
+    try {
+        return slam::calib::commit(step);
+    } catch (...) {
+        return 0;
+    }
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -179,14 +194,14 @@ Java_com_example_slamcapture_SlamBridge_nativeCalibCoverage(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_slamcapture_SlamBridge_nativeCalibFinish(
         JNIEnv* env, jobject /*thiz*/, jfloatArray out) {
-    if (out == nullptr || env->GetArrayLength(out) < 11) return JNI_FALSE;
-    float tmp[11] = {0};
+    if (out == nullptr || env->GetArrayLength(out) < 13) return JNI_FALSE;
+    float tmp[13] = {0};
     int ok = 0;
     try {
         ok = slam::calib::finish(tmp);
     } catch (...) {
     }
-    if (ok) env->SetFloatArrayRegion(out, 0, 11, tmp);
+    if (ok) env->SetFloatArrayRegion(out, 0, 13, tmp);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
