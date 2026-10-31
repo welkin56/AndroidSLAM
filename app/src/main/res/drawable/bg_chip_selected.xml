@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  选中态的芯片。几何和 bg_chip 完全一致（20dp 圆角、无内边距），
+  这样切换选中态时不会因为描边消失而抖一下。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="?attr/colorPrimary" />
+    <corners android:radius="20dp" />
+</shape>

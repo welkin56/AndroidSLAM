@@ -51,10 +51,10 @@ class EntryActivity : AppCompatActivity() {
             startActivity(Intent(this, CaptureActivity::class.java))
         }
 
-        // 标定同理：不载图、不开 SLAM，只算内参。
+        // 标定同理：不载图、不开 SLAM，只算内参。先进档位列表，在那里管理/新建各屈光度。
         findViewById<Button>(R.id.btnCalib).setOnClickListener {
-            Log.i(TAG, "进标定页")
-            startActivity(Intent(this, CalibActivity::class.java))
+            Log.i(TAG, "进标定档位列表")
+            startActivity(Intent(this, CalibListActivity::class.java))
         }
 
         // 列表在 onStart 中扫描。

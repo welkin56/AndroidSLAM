@@ -55,6 +55,15 @@
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- 标定档位列表：入口页「标定」先到这里，「新建档位」才进 CalibActivity。
+             标定页 finish() 会回到本页（它只是弹栈顶），所以本页在 onStart 里重扫 profile。 -->
+        <activity
+            android:name=".CalibListActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- 标定板要能发到别的设备/打印店，走 FileProvider 给一张 PNG。 -->
         <provider
             android:name="androidx.core.content.FileProvider"

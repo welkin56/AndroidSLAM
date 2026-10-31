@@ -297,13 +297,23 @@ class CalibActivity : AppCompatActivity() {
 
         val d = lockedDiopter ?: return
         val dropped = resBuf[10].toInt()
+        // 覆盖还是新增，得先说清：不再按 ±0.15 D 合并之后，弹窗关掉之后表里可能多出一行，
+        // 不提示会让人以为「同一档又标了一遍应该没变化」。
+        val prof = CalibStore.load(this)
+        val sameD = prof?.rows?.firstOrNull { abs(it.d - d) <= SAME_D_EPS }
+        val afterCount = (prof?.rows?.size ?: 0) + (if (sameD != null) 0 else 1)
         MaterialAlertDialogBuilder(this)
             .setTitle("标定完成")
             .setMessage(
                 "对焦 %.2f D（约 %.2f m）\nfx %.2f   fy %.2f\ncx %.2f   cy %.2f\n"
                     .format(d, 1f / d, resBuf[0], resBuf[1], resBuf[2], resBuf[3]) +
                     "k1 %.5f\n重投影误差 %.3f px · %d 个视角".format(resBuf[4], rms, n) +
-                    if (dropped > 0) "\n（剔除了 $dropped 个偏离的视角）" else ""
+                    (if (dropped > 0) "\n（剔除了 $dropped 个偏离的视角）" else "") +
+                    (
+                        if (sameD != null) "\n（覆盖 %.2f D 那一档，共 %d 个档位）"
+                            .format(sameD.d, afterCount)
+                        else "\n（新增一档，共 %d 个档位）".format(afterCount)
+                        )
             )
             .setPositiveButton("保存") { _, _ -> saveRow(d, n, rms) }
             .setNegativeButton("不要", null)
@@ -337,10 +347,13 @@ class CalibActivity : AppCompatActivity() {
             fx = resBuf[0], fy = resBuf[1], cx = resBuf[2], cy = resBuf[3],
             k1 = resBuf[4], k2 = resBuf[5], p1 = resBuf[6], p2 = resBuf[7],
             source = "auto", rms = rms, views = views,
-            date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()),
+            // 到分钟：档位列表要按「最近时间」排序，只到天的话同一天标两次排不出先后。
+            // 老的 yyyy-MM-dd 行仍能正常参与字符串排序（视为当天 00:00）。
+            date = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date()),
         )
-        // 同一档（±0.15 D）复标就覆盖，不另起一行。
-        val rows = (prof.rows.filter { abs(it.d - d) > 0.15f } + row).sortedBy { it.d }
+        // 只有屈光度**完全相同**才覆盖。以前是 ±0.15 D 就算同一档，那会把
+        // 「同一位置标了三次」压成一行，正好丢掉判断重复性最需要的样本。
+        val rows = (prof.rows.filter { abs(it.d - d) > SAME_D_EPS } + row).sortedBy { it.d }
         if (CalibStore.save(this, prof.copy(rows = rows))) {
             Log.i(TAG, "已保存档位 %.3f D fx=%.3f".format(d, row.fx))
             finish()
