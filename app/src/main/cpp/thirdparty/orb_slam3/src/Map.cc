@@ -27,7 +27,8 @@ namespace ORB_SLAM3
 long unsigned int Map::nNextId=0;
 
 Map::Map():mnMaxKFid(0),mnBigChangeIdx(0), mbImuInitialized(false), mnMapChange(0), mpFirstRegionKF(static_cast<KeyFrame*>(NULL)),
-mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false)
+mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false),
+mMetricScale(1.f)
 {
     mnId=nNextId++;
     mThumbnail = static_cast<unsigned char*>(NULL);
@@ -35,7 +36,8 @@ mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNo
 
 Map::Map(int initKFid):mnInitKFid(initKFid), mnMaxKFid(initKFid),/*mnLastLoopKFid(initKFid),*/ mnBigChangeIdx(0), mIsInUse(false),
                        mHasTumbnail(false), mbBad(false), mbImuInitialized(false), mpFirstRegionKF(static_cast<KeyFrame*>(NULL)),
-                       mnMapChange(0), mbFail(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false)
+                       mnMapChange(0), mbFail(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false),
+                       mMetricScale(1.f)
 {
     mnId=nNextId++;
     mThumbnail = static_cast<unsigned char*>(NULL);
@@ -142,6 +144,11 @@ int Map::GetLastBigChangeIdx()
 {
     unique_lock<mutex> lock(mMutexMap);
     return mnBigChangeIdx;
+}
+
+float Map::GetMetricScale()
+{
+    return mMetricScale.load(std::memory_order_relaxed);
 }
 
 vector<KeyFrame*> Map::GetAllKeyFrames()
@@ -296,6 +303,9 @@ void Map::ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool b
         pMP->SetWorldPos(s * Ryw * pMP->GetWorldPos() + tyw);
         pMP->UpdateNormalAndDepth();
     }
+    mMetricScale.store(mMetricScale.load(std::memory_order_relaxed) * s, std::memory_order_relaxed);
+    cout << "[MAP] 尺度修正 s=" << s << " 累积=" << mMetricScale.load(std::memory_order_relaxed)
+         << endl;
     mnMapChange++;
 }
 

@@ -25,6 +25,7 @@
 
 #include <set>
 #include <mutex>
+#include <atomic>
 
 #include <boost/serialization/base_object.hpp>
 
@@ -79,6 +80,10 @@ public:
     void SetReferenceMapPoints(const std::vector<MapPoint*> &vpMPs);
     void InformNewBigChange();
     int GetLastBigChangeIdx();
+
+    // add：自建图以来的累积米制尺度。ApplyScaledRotation 每调一次就乘一次 s，
+    // 外部据此把按老尺度算出的坐标重标。只读，不加锁。
+    float GetMetricScale();
 
     std::vector<KeyFrame*> GetAllKeyFrames();
     std::vector<MapPoint*> GetAllMapPoints();
@@ -184,6 +189,9 @@ protected:
 
     int mnMapChange;
     int mnMapChangeNotified;
+
+    // add：累积尺度。ApplyScaledRotation 会改坐标系但保留 map id，外部只能靠它察觉。
+    std::atomic<float> mMetricScale;
 
     long unsigned int mnInitKFid;
     long unsigned int mnMaxKFid;

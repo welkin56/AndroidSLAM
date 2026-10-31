@@ -3,6 +3,7 @@ package com.example.slamcapture
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -79,6 +80,15 @@ class MainActivity : AppCompatActivity() {
         /** 预热时长：延迟相机帧，让 IMU 先写入一段。 */
         private const val PREROLL_NS = 300_000_000L
 
+        /** 「启动」后等对焦收敛的上限；到点就用兜底档位开跑。 */
+        private const val FOCUS_WAIT_MS = 3_000L
+
+        /** 没有屈光度读数时按 1 m 处理（内参表最常用的一档）。 */
+        private const val DEFAULT_DIOPTER = 1.0f
+
+        /** profile 里没量过 IMU 频率时的兜底（本机实测 402 Hz）。 */
+        private const val IMU_FREQ_FALLBACK = 402f
+
         /** 开关状态的持久化。 */
         private const val PREF = "slamapp"
         private const val PREF_RECORD = "record"
@@ -88,6 +98,8 @@ class MainActivity : AppCompatActivity() {
         /** 小地图缩放档位下标。 */
         private const val PREF_MAP_ZOOM = "mapZoom"
         private const val PREF_WAYPOINTS = "waypoints"
+        /** 小地图是否绘制本趟轨迹。 */
+        private const val PREF_MAP_TRAJ = "mapTraj"
         private const val PREF_HISTORY = "historyOn"
         /** 隐藏的历史轨迹绝对路径集合。 */
         private const val PREF_HIST_HIDDEN = "historyHidden"
@@ -182,6 +194,24 @@ class MainActivity : AppCompatActivity() {
      * 与 [slamState] 不同，System 就绪后仍会一直存在。
      */
     private var slamRunning = false
+
+    // ---------------- 内参与对焦 ----------------
+
+    /** 当前这一趟使用的内参；null 表示还没确定。 */
+    private var activeRow: CalibRow? = null
+
+    /** 内参来源的一句话，诊断面板显示。 */
+    private var intrinsicsNote = "未确定"
+
+    /** 正在等对焦收敛：相机已开，nativeStart() 还没调。 */
+    private var waitingFocus = false
+
+    /** 等对焦的截止时刻（elapsedRealtime）。 */
+    private var focusDeadlineMs = 0L
+
+    /** 当前相机 id 与传感器方向：写 yaml 和记录内参都要。 */
+    private var cameraId = ""
+    private var sensorOrientation = 0
 
     // ---------------- 硬件（本页自己持有）----------------
 
@@ -329,6 +359,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnMapZoomIn: Button
     private lateinit var btnMapZoomOut: Button
 
+    /** 本趟轨迹层；只管画不画，SLAM 始终在记录。 */
+    private lateinit var swTraj: SwitchCompat
+
     /** 上次看到的地图重置次数；增加表示坐标系已更换。 */
     private var resetCountSeen = 0
 
@@ -473,6 +506,7 @@ class MainActivity : AppCompatActivity() {
         swWaypoints = findViewById(R.id.swWaypoints)
         btnWpAdd = findViewById(R.id.btnWpAdd)
         btnWpManage = findViewById(R.id.btnWpManage)
+        swTraj = findViewById(R.id.swTraj)
         swHistory = findViewById(R.id.swHistory)
         btnHistoryManage = findViewById(R.id.btnHistoryManage)
         viewerWrap = findViewById(R.id.viewerWrap)
@@ -577,6 +611,13 @@ class MainActivity : AppCompatActivity() {
         }
         btnWpAdd.setOnClickListener { askAddWaypoint() }
         btnWpManage.setOnClickListener { showWaypointManager() }
+
+        // 实时轨迹：只影响小地图绘制，轨迹本身照常写盘。
+        swTraj.isChecked = pref.getBoolean(PREF_MAP_TRAJ, true)
+        swTraj.setOnCheckedChangeListener { _, checked ->
+            pref.edit().putBoolean(PREF_MAP_TRAJ, checked).apply()
+            render()
+        }
 
         // 历史轨迹：开关只管画不画；逐条隐藏 / 删除在管理页（开关关着也能管）。
         histHidden = (pref.getStringSet(PREF_HIST_HIDDEN, emptySet()) ?: emptySet())
@@ -693,6 +734,15 @@ class MainActivity : AppCompatActivity() {
     private fun onButtonSlam() {
         // 上一次的错误提示只留到下一次操作。
         uiMessage = null
+
+        // 等对焦中：用户觉得清楚了就立刻锁定并开始，不必等自动收敛。
+        if (waitingFocus) {
+            cam.lockFocusNow()
+            finishStart()
+            render()
+            return
+        }
+
         // 运行中：结束本次会话
         if (slamRunning) {
             stopHardware("用户结束")
@@ -752,9 +802,95 @@ class MainActivity : AppCompatActivity() {
         framesFromTsNs = SystemClock.elapsedRealtimeNanos() + PREROLL_NS
 
         preview.setActive(true)
-        cam.start()
-        cam.beginSettle()   // 收敛对焦然后锁死 —— 锁焦的后果是 fx 只在那个距离上等于 435.2
 
+        // 内参以地图记录为准，镜组也回到记录的那个屈光度。
+        // 既包括从入口页打开的旧图，也包括本页已经跑过一趟的新图（sessionDir 已建）。
+        val recorded = (mapFile?.let { File(it).parentFile } ?: sessionDir)
+            ?.let { CalibStore.readMapIntrinsics(it) }
+        if (recorded != null) {
+            cam.pinnedDiopter = recorded.d
+            cam.start()
+            cam.beginSettle()
+            applyIntrinsics(recorded, "地图记录")
+            startTracking()
+            return
+        }
+
+        // 新地图：先让用户对好焦，收敛后再按屈光度查表。等对焦由 ticker 推进。
+        //
+        // 走到这里还可能是"打开了一张没有内参记录的老图"：那就按当前对焦取一档，
+        // 开跑后把它记进这张图，之后就一直用它。
+        if (mapFile != null) uiMessage = "这张图没有内参记录，按当前对焦取一档"
+        cam.pinnedDiopter = null
+        val rows = CalibStore.load(this)?.rows.orEmpty()
+        // 收敛到表外就只提示、不锁：锁下去整段画面都会糊。
+        // 没有标定表时用 2.5 D（0.4 m）兜底 —— 锁到更近的位置整段远景都会糊。
+        cam.autofocusMaxD = if (rows.isEmpty()) 2.5f else rows.maxOf { it.d } + 1.0f
+        cam.start()
+        cam.beginSettle()
+        waitingFocus = true
+        focusDeadlineMs = SystemClock.elapsedRealtime() + FOCUS_WAIT_MS
+        render()
+        uiQueueTicker()
+    }
+
+    /**
+     * 对焦收敛（或超时）后：定内参 → 注入 → 真正开始吃帧。
+     * 用户点「锁定并开始」时也会直接走这里。
+     */
+    private fun finishStart() {
+        if (!waitingFocus) return
+        waitingFocus = false
+
+        // 超出标定范围时 focusDiopter 是空的、镜组还在连续对焦：这时**不要**去锁
+        // （锁在 0.2 m 上整段远景都糊），按默认档取内参，画面保持 AF 当前的样子。
+        val outOfRange = cam.focusDiopter == null && cam.focusNote != null
+        // 超时自动开跑时可能还没锁：能读到当前屈光度就锁住，否则内参会随场景漂。
+        // 定焦模组没有这个概念，不报警。
+        if (!outOfRange && cam.focusDiopter == null &&
+            cam.lockFocusNow() == null && cam.supportsAf
+        ) {
+            uiMessage = "读不到对焦距离 —— 内参会随画面变化，结果不可比"
+        }
+
+        val d = if (outOfRange) DEFAULT_DIOPTER
+                else cam.focusDiopter ?: cam.latestFocusDistance() ?: DEFAULT_DIOPTER
+        val rows = CalibStore.load(this)?.rows.orEmpty()
+        val row = CalibStore.interpolate(rows, d)
+
+        if (row != null) {
+            applyIntrinsics(row, "档位插值")
+            val gap = CalibStore.distanceToTable(rows, d)
+            if (gap > 1.0f) {
+                uiMessage = "对焦 %.2f D 离最近的标定档差 %.2f D，内参是外推的".format(d, gap)
+            }
+        } else {
+            val fb = CalibStore.fallback(this)
+            if (fb != null) {
+                // 兜底值没有档位，但这一趟确实是在 d 上跑的；记录要用真实的 d，
+                // 否则下次打开这张图会把镜组命令到一个没测过的位置。
+                applyIntrinsics(fb.copy(d = d), "模板兜底")
+                uiMessage = "还没有标定表，用的是模板内参 —— 换设备后不要信这组数"
+            } else {
+                intrinsicsNote = "未注入（读不到任何内参）"
+            }
+        }
+        startTracking()
+    }
+
+    /** 把内参交给 C++。必须在 [startTracking] 之前 —— 帧一喂进去上游就开始用它。 */
+    private fun applyIntrinsics(row: CalibRow, from: String) {
+        activeRow = row
+        intrinsicsNote = "%s · %.2f D · fx %.1f".format(
+            CalibStore.sourceLabel(row), row.d, row.fx)
+        Log.i(TAG, "内参（$from）：fx=%.3f fy=%.3f cx=%.3f cy=%.3f k1=%.5f k2=%.5f d=%.2f"
+            .format(row.fx, row.fy, row.cx, row.cy, row.k1, row.k2, row.d))
+        SlamBridge.nativeSetIntrinsics(
+            row.fx, row.fy, row.cx, row.cy, row.k1, row.k2, row.p1, row.p2)
+    }
+
+    /** nativeStart() 以及本趟的会话目录/录制初始化。内参已经定好才会走到这里。 */
+    private fun startTracking() {
         SlamBridge.nativeStart()   // 顺带把 C++ 那边的轨迹和重置计数清零
         slamRunning = true
         trkMsg = null
@@ -776,6 +912,14 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        // 一张图一套内参：没有记录就补上，之后每次打开这张图都用它。
+        sessionDir?.let { dir ->
+            val row = activeRow
+            if (row != null && CalibStore.readMapIntrinsics(dir) == null) {
+                CalibStore.writeMapIntrinsics(dir, row, Build.MODEL, cameraId)
+            }
+        }
+
         // 一趟固定一个时间戳；轨迹先落 traj/，存图成功才归档到 map-<id>/。
         runStamp = stamp()
         curTrajBase = null
@@ -795,6 +939,18 @@ class MainActivity : AppCompatActivity() {
      * 不销毁 System；C++ 的 stop() 只停止吃帧并清空队列。
      */
     private fun stopHardware(reason: String) {
+        // 还在等对焦、没真正开跑：只拆硬件，不碰会话文件。
+        if (waitingFocus) {
+            waitingFocus = false
+            preview.setActive(false)
+            imu?.stop()
+            imuThread?.quitSafely()
+            imu = null
+            imuThread = null
+            cam.stop()
+            render()
+            return
+        }
         if (!slamRunning) return
         Log.i(TAG, "SLAM 停止吃帧（$reason）")
 
@@ -894,6 +1050,15 @@ class MainActivity : AppCompatActivity() {
         val w = SessionWriter(dir)
         // 标记为 SLAM 期间录制；格式与录制模式相同，但帧率受落盘影响。
         w.withSlam = true
+        // 内参也落一份，事后才能知道这段数据是在什么条件下采的。
+        activeRow?.let { r ->
+            w.calib = SessionWriter.CalibSnapshot(
+                focusMode = if (cam.focusCommanded) "locked" else "auto",
+                diopter = cam.focusDiopter ?: r.d,
+                source = r.source,
+                fx = r.fx, fy = r.fy, cx = r.cx, cy = r.cy, k1 = r.k1,
+            )
+        }
         w.start()
         if (w.ioError != null) {
             Log.e(TAG, "建 session 文件失败：${w.ioError}")
@@ -952,10 +1117,19 @@ class MainActivity : AppCompatActivity() {
                 pollMeasure()
             }
 
+            // 等对焦：有结论（收敛 / 判定锁不了）或超时就定内参、真正开跑。
+            if (waitingFocus &&
+                (cam.ready || SystemClock.elapsedRealtime() >= focusDeadlineMs)
+            ) {
+                finishStart()
+            }
+
             // 先刷新界面，再判断是否继续调度；否则最后一轮刷新会被跳过。
             render()
 
-            if (slamState == SLAM_LOADING || slamRunning || saving || restoring || viewerOpen) {
+            if (slamState == SLAM_LOADING || slamRunning || waitingFocus ||
+                saving || restoring || viewerOpen
+            ) {
                 uiHandler.postDelayed(this, TICK_MS)
             }
         }
@@ -1029,17 +1203,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 生成段标签，只在数值变化超过 0.5 mm 时重新格式化。
-     * 长度每帧都会变化，但不应每帧调用 String.format。
+     * 生成段标签，只在数值变化超过 5 mm 时重新格式化。
+     * 长度每帧都会变化，但不应每帧调用 String.format；
+     * 显示到厘米 —— 毫米位放大的只是地图收敛的抖动。
      */
     private fun segLabel(i: Int, v: Float): String {
         while (segLast.size <= i) {
             segLast.add(-1f)
             segLabels.add("")
         }
-        if (segLast[i] < 0f || abs(v - segLast[i]) > 5e-4f) {
+        if (segLast[i] < 0f || abs(v - segLast[i]) > 5e-3f) {
             segLast[i] = v
-            segLabels[i] = "%.3f m".format(v)
+            segLabels[i] = "%.2f m".format(v)
         }
         return segLabels[i]
     }
@@ -1072,7 +1247,7 @@ class MainActivity : AppCompatActivity() {
             if (pinnedBuf[lo + 4] >= 0f) {
                 live = PreviewView.Seg(pinnedBuf[lo], pinnedBuf[lo + 1],
                                        pinnedBuf[lo + 2], pinnedBuf[lo + 3],
-                                       "%.3f m".format(pinnedBuf[lo + 4]))
+                                       "%.2f m".format(pinnedBuf[lo + 4]))
             }
         }
         return PreviewView.Overlay(measureState, measureBuf[0], measureBuf[4], measureBuf[5],
@@ -1138,6 +1313,7 @@ class MainActivity : AppCompatActivity() {
             slamState == SLAM_FAILED -> "构造失败"
             restoring -> "载入地图…"
             slamRunning -> "结束"
+            waitingFocus -> "锁定并开始"
             slamState == SLAM_READY -> "启动 SLAM"
             else -> "准备 SLAM"
         }
@@ -1263,6 +1439,9 @@ class MainActivity : AppCompatActivity() {
                     "构造失败 —— 看 logcat（tag slam）"
                 }
             restoring -> restoreMsg ?: "正在载入地图…"
+            waitingFocus -> cam.focusDiopter?.let {
+                "对焦 %.2f D · 点「锁定并开始」".format(it)
+            } ?: "对焦中… 点「锁定并开始」可立刻锁定"
             !slamRunning && slamState == SLAM_READY ->
                 "已就绪 · 点「启动 SLAM」打开相机和 IMU"
             !slamRunning -> "点「准备 SLAM」构造 System"
@@ -1280,6 +1459,16 @@ class MainActivity : AppCompatActivity() {
         // ---- 诊断面板：数字和路径都在这儿，平时收着 ----
         tvDiag.text = buildString {
             append("地图来源  $mapLabel\n")
+            // 内参只有一个真相：profile / 地图记录。这里显示的是这一趟实际注入的那套。
+            append("内参  $intrinsicsNote\n")
+            val fd = cam.focusDiopter
+            if (fd != null) {
+                append("对焦  %.2f D".format(fd))
+                cam.focusNote?.let { append("  · $it") }
+                append('\n')
+            } else {
+                cam.focusNote?.let { append("对焦  $it\n") }
+            }
             if (slamRunning && poseValid) {
                 append("位置  %.3f  %.3f  %.3f\n".format(poseBuf[12], poseBuf[13], poseBuf[14]))
             }
@@ -1468,17 +1657,18 @@ class MainActivity : AppCompatActivity() {
         // 查看器盖住了小窗：不读、不画，省一倍锁和绘制。
         if (mapWrap.visibility != View.VISIBLE || viewerOpen) return
 
-        val n = SlamBridge.nativeGetTrajectory(trajBuf)
+        // 轨迹层关掉时不读 native：省一次轨迹锁。
+        val n = if (swTraj.isChecked) SlamBridge.nativeGetTrajectory(trajBuf) else 0
         val pn = SlamBridge.nativeGetMapPoints(mapPtBuf)
         // 空窗也要给出原因，并区分加载中、未启动等状态。
-        // 只有在无任何可绘制内容时才显示提示。
+        // 只在无任何可绘制内容时才显示提示；主动隐藏轨迹不算「没内容」。
         val anything = n > 0 || pn > 0 || histShown > 0
         val hint = when {
             slamState == SLAM_LOADING -> "词袋加载中…"
             slamState == SLAM_FAILED -> "构造失败"
             !anything && !slamRunning -> "SLAM 未启动"
             !anything && trkState != TRK_OK -> "跟踪未就绪"
-            !anything -> "等待定位…"
+            !anything && swTraj.isChecked -> "等待定位…"
             else -> null
         }
         // 停止后不绘制当前位置，避免使用过期位姿。
@@ -2112,18 +2302,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * yaml 路径。assets/phone.yaml 是权威副本，但 C++ 需要真实文件路径，
-     * 因此先复制到私有目录。
+     * yaml 路径。模板来自 assets，只替换相机–IMU 外参和 IMU 频率；
+     * **内参不写进文件**，由 [applyIntrinsics] 走 nativeSetIntrinsics 注入。
      */
     private fun resolveSettingsPath(): String? {
         val dst = File(filesDir, SETTINGS_NAME)
+
+        // 外参旋转取决于这台机器的传感器方向，不能沿用模板里那台的值。
+        val info = cam.cameraInfo()
+        if (info == null) {
+            return refuse("相机信息", dst) { "打不开相机，算不出相机–IMU 外参。" }
+        }
+        cameraId = info.first
+        sensorOrientation = info.second
+
+        val imuFreq = CalibStore.load(this)?.imuFrequency?.takeIf { it > 0f }
+            ?: IMU_FREQ_FALLBACK
         try {
-            assets.open(SETTINGS_NAME).use { input ->
-                dst.outputStream().use { output -> input.copyTo(output) }
+            val template = assets.open(SETTINGS_NAME).bufferedReader().use { it.readText() }
+            val text = buildString {
+                append(SettingsTemplate.patch(
+                    template, SettingsTemplate.tbc(sensorOrientation), imuFreq))
+                // 选择旧图时补充路径。System 构造时读取该键，载图只在那一刻生效；
+                // 值不带 .osa，上游会自行追加。
+                mapFile?.let { append("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }
             }
-            // 选择旧图时补充路径。System 构造时读取该键，载图只在那一刻生效；
-            // 值不带 .osa，上游会自行追加。
-            mapFile?.let { dst.appendText("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }
+            dst.writeText(text)
         } catch (e: IOException) {
             Log.e(TAG, "释放 $SETTINGS_NAME 失败", e)
             uiMessage = "打不开 assets/$SETTINGS_NAME：$e"

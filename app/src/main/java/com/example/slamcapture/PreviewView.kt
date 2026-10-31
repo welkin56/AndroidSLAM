@@ -10,6 +10,7 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.util.AttributeSet
+import android.util.Log
 import android.view.View
 
 /**
@@ -29,6 +30,8 @@ class PreviewView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private companion object {
+        const val TAG = "PreviewView"
+
         const val W = CameraCapture.W
         const val H = CameraCapture.H
 
@@ -66,7 +69,7 @@ class PreviewView @JvmOverloads constructor(
     /**
      * 叠加层内容。不可变，整体替换引用，避免 onDraw 读到半新半旧的数据。
      *
-     * px/py 是图像像素坐标，屏幕位置由 [toScreen] 换算。
+     * px/py 是图像像素坐标，屏幕位置由 [imageToScreen] 换算。
      * marks 和 segs 只包含可投影的点。live 是最后一个点到十字的橡皮筋。
      */
     data class Overlay(
@@ -172,17 +175,28 @@ class PreviewView @JvmOverloads constructor(
         fontFeatureSettings = "tnum"
     }
 
-    /** [toScreen] 的复用输出；同时需要两个点时使用不同实例。 */
+    /** [imageToScreen] 的复用输出；同时需要两个点时使用不同实例。 */
     private val ptA = PointF()
     private val ptB = PointF()
 
     /**
-     * 图像像素到屏幕坐标。
+     * 画面之外的附加层（标定引导框之类），画在测量叠加之后。
+     * 只准用 [imageToScreen] 定位：dst/scale 重算一次就会和画面错位。
+     */
+    var guidePainter: ((Canvas) -> Unit)? = null
+
+    /** 画面在屏幕上的落点，letterbox 之后的那块。没布局完成时是空矩形。 */
+    fun imageRect(out: RectF) {
+        out.set(dst)
+    }
+
+    /**
+     * 图像像素到屏幕坐标。主线程。
      *
      * 对应 onDraw 中的 translate、rotate(90) 和 scale 三步。
      * 这个变换只在这里实现，写错会让标记与画面错位。
      */
-    private fun toScreen(px: Float, py: Float, out: PointF) {
+    fun imageToScreen(px: Float, py: Float, out: PointF) {
         out.set(dst.right - py * scale, dst.top + px * scale)
     }
 
@@ -244,13 +258,15 @@ class PreviewView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         // 第二道检查：清屏后到达的在途帧不绘制。
-        val g = if (active) pending else null
-        if (g == null) {
+        if (!active) {
             drawn = null
             return
         }
+        val g = pending
+        // 没新帧就重画上一帧：换步时单独 invalidate() 也要能出图。
+        if (g == null && drawn == null) return
 
-        if (g !== drawn) {
+        if (g != null && g !== drawn) {
             for (i in argb.indices) argb[i] = lut[g[i].toInt() and 0xFF]
             bmp.setPixels(argb, 0, W, 0, 0, W, H)   // 复用缓冲，不分配
             drawn = g
@@ -266,6 +282,16 @@ class PreviewView @JvmOverloads constructor(
         canvas.restore()
 
         overlay?.let { drawMeasure(canvas, it) }
+
+        // 引导层最后画，压在画面和测量叠加之上。
+        guidePainter?.let { painter ->
+            try {
+                painter(canvas)
+            } catch (e: Throwable) {
+                Log.e(TAG, "引导层绘制失败，已停用", e)
+                guidePainter = null
+            }
+        }
     }
 
     /** 绘制十字、吸附点和读数；只在有画面时调用。 */
@@ -274,7 +300,7 @@ class PreviewView @JvmOverloads constructor(
         for (s in ov.segs) drawSeg(canvas, s, markPaint)
         ov.live?.let { drawSeg(canvas, it, livePaint) }  // 尚未确定的橡皮筋
         for (m in ov.marks) {
-            toScreen(m.px, m.py, ptA)
+            imageToScreen(m.px, m.py, ptA)
             canvas.drawCircle(ptA.x, ptA.y, 7f * density,
                               if (m.low) markPaint else markSolidPaint)
         }
@@ -289,7 +315,7 @@ class PreviewView @JvmOverloads constructor(
 
         // 画出可能吸附的位置，让用户提前知道会钉到哪个点。
         if (ov.state.hasReading && ov.px >= 0f) {
-            toScreen(ov.px, ov.py, ptA)
+            imageToScreen(ov.px, ov.py, ptA)
             canvas.drawCircle(ptA.x, ptA.y, 6f * density, snapPaint)
         }
 
@@ -304,8 +330,8 @@ class PreviewView @JvmOverloads constructor(
 
     /** 绘制一段折线及其中点的长度标签。 */
     private fun drawSeg(canvas: Canvas, s: Seg, line: Paint) {
-        toScreen(s.x0, s.y0, ptA)
-        toScreen(s.x1, s.y1, ptB)
+        imageToScreen(s.x0, s.y0, ptA)
+        imageToScreen(s.x1, s.y1, ptB)
         canvas.drawLine(ptA.x, ptA.y, ptB.x, ptB.y, line)
         drawPillText(canvas, s.label,
                      (ptA.x + ptB.x) / 2f,

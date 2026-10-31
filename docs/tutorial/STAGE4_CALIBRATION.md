@@ -7,6 +7,11 @@
 > 是采集的 session 太短。换成 65 秒后位姿从 37 帧涨到 1730 帧。
 > 所以本文档解决的是**精度**，不是**能不能跑通**。
 > 背景见 [ORB_SLAM3_TRACKING_FLOW.md](ORB_SLAM3_TRACKING_FLOW.md) §八。
+>
+> **📌 2026-10-28**：内参现在**不写进 `phone.yaml`** 了 —— 由 `calib/profile.json`
+> 按对焦屈光度插值、启动前注入；一张地图记一套。本文下面的 PC 流程仍然有效
+> （用来给表里填一行），但"改 yaml 再重建"那一步已经取消。见
+> [changes/2026-10-28-intrinsics-profile.md](../changes/2026-10-28-intrinsics-profile.md)。
 
 ---
 

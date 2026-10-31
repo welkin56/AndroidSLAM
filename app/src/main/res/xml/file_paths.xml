@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 只暴露 share/ 一个目录：标定板导出的 PNG 放这儿。 -->
+<paths>
+    <external-files-path name="share" path="share/" />
+</paths>

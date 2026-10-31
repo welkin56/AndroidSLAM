@@ -41,6 +41,45 @@ object SlamBridge {
     external fun nativePushImu(tsNs: Long, wx: Float, wy: Float, wz: Float,
                                ax: Float, ay: Float, az: Float)
 
+    /**
+     * 注入相机内参。**必须在 [nativeStart] 之前**，跑着帧时调用会被忽略。
+     * 一张地图只用一套内参，切换内参要重开一张图。
+     */
+    external fun nativeSetIntrinsics(fx: Float, fy: Float, cx: Float, cy: Float,
+                                     k1: Float, k2: Float, p1: Float, p2: Float)
+
+    // ---------------- 棋盘格标定 ----------------
+    //
+    // 采集是分步引导的：每一步先 probe 看当前帧的板子四边形，上层判定姿势对上了再 commit。
+    // 视角全在 native 内存里，不落盘；[nativeCalibFinish] 只估 fx/fy/cx/cy/k1。
+
+    /** [cols]×[rows] 是内角点数。 */
+    external fun nativeCalibStart(cols: Int, rows: Int, w: Int, h: Int): Boolean
+
+    /**
+     * 只检测当前帧、不入队。out 收 4 个外角（图像坐标），检出返回 1。
+     * 必须和 [nativeCalibCommit] 同线程且在其之前：native 只留最近一次 probe 的角点。
+     */
+    external fun nativeCalibProbe(gray: ByteArray, out: FloatArray): Int
+
+    /** 把上一次 [nativeCalibProbe] 的角点作为视角入队，标记属于第 [step] 步。每步最多 3 个。 */
+    external fun nativeCalibCommit(step: Int): Int
+
+    external fun nativeCalibViews(): Int
+
+    /** out 至少 10 个：前 9 个是九宫格每格占比，第 10 个是画面外圈占比。 */
+    external fun nativeCalibCoverage(out: FloatArray)
+
+    /**
+     * out 收 13 个：fx fy cx cy k1 k2 p1 p2 rms views dropped fxRelSd fyRelSd。
+     * 返回 false 表示视角不够或拟合失败。
+     *
+     * 最后两个是焦距相对标准差，别用 rms 代替 —— 正对时 rms 可以很低而焦距没定住。
+     */
+    external fun nativeCalibFinish(out: FloatArray): Boolean
+
+    external fun nativeCalibReset()
+
     /** 开始吃帧，不销毁 System。 */
     external fun nativeStart()
 

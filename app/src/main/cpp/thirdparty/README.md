@@ -88,6 +88,8 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 31 | `orb_slam3/include/{Atlas,Map,KeyFrame,MapPoint}.h` + 对应 `.cc`、`src/System.cc` | **新增** `Atlas::CheckBackupConsistency()` → `Map::CheckBackupConsistency()` → `KeyFrame::CheckBackupConsistency()`，在**反序列化之后、`PostLoad()` 之前**检查每张图的引用是不是都落在自己身上；`KeyFrame::PostLoad` / `MapPoint::PostLoad` 查不到的 id 跳过、不再塞 `nullptr` | ⚠️ **配合 30**：修复前写出来的旧 `.osa` 已经坏了。没有自检的话它们会把整个 App 带崩；现在判载入失败，界面走「载图失败」那条路 |
 | 32 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `System::GetMapList()` / `GetMapCloud()` —— atlas 里每张图的 id/KF/点数和**单张图的点云** | ⚠️ **不是上游 bug，是我们多出来的用法**：2D 地图查看器要一张一张翻 atlas 里的图，而 `Atlas::GetAllMapPoints()` 只给当前图。`GetMapCloud` 会对目标图拿 `mMutexMap` 拷指针表，所以只给「选图/刷新」这种低频动作调。详见 `docs/changes/2026-10-24-map-viewer.md` |
 
+| 33 | `orb_slam3/include/{System,Tracking}.h` + `src/{System,Tracking}.cc` | **新增** `System::SetCameraIntrinsics()` → `Tracking::SetCameraIntrinsics()`：换 `mpCamera` 的四个参数，同步 `mK` / `mK_` / `mDistCoef`，并置 `Frame::mbInitialComputations` | ⚠️ **不是上游 bug，是我们多出来的用法**：内参由 App 的标定表按对焦屈光度插值后注入，不再写进 yaml。上游的 `Tracking::ChangeCalibration` 不能直接用：它读 `Camera.fx`（实际键是 `Camera1.fx`，读出来是 0），而且只改 `mK` / `mDistCoef`、**没碰 `mpCamera`** —— `Frame` 的去畸变和反投影走的正是后者。只在 `nativeStart()` 之前调，见 `docs/changes/2026-10-28-intrinsics-profile.md` |
+
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 
 ### 第 10 条说清楚

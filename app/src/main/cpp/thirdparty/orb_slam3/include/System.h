@@ -134,6 +134,14 @@ public:
     void Reset();
     void ResetActiveMap();
 
+    /**
+     * add：直接设定相机内参（畸变取 k1..p2，k3 固定为 0）。
+     * 只能在 nativeStart() 之前、没有任何帧在跑的时候调用：
+     * LocalMapping / LoopClosing 读这些量时没有加锁。
+     */
+    void SetCameraIntrinsics(float fx, float fy, float cx, float cy,
+                             float k1, float k2, float p1, float p2);
+
     // add：ResetActiveMap 原地清空当前图，Map::mnId 不变，
     // 因此关键帧数降到 0 是「发生过重置」的唯一外部信号。
     unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }
