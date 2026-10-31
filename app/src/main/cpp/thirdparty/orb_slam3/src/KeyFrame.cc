@@ -580,6 +580,12 @@ void KeyFrame::SetBadFlag()
         }
         else if(mbNotErase)
         {
+            // 自加：被外部（钉点锚点）的保护挡下时留一行。mbToBeErased 一旦置上就不会
+            // 再清，而 culling 只遍历当前 KF 的共视邻居，这个 KF 走远之后再也不会有
+            // 第二次机会 —— 所以"保护命中过"是个粘性事实，值得在日志里留个记号。
+            // 只在第一次命中时打，否则每次 culling 都会刷一行。
+            if(!mbToBeErased)
+                cout << "[KF] 保护命中 KF=" << mnId << endl;
             mbToBeErased = true;
             return;
         }

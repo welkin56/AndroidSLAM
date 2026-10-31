@@ -308,3 +308,79 @@ app/src/main/java/com/example/slamcapture/MainActivity.kt
 - **采集页对焦未确认。** 实测 96 px 锥内 `纹理` 只有 4–32（正常应 ~90 以上），
   同时段出现过一次 267，10 倍落差更像**失焦**而不是白墙。标定页锁了自动对焦，
   采集页没有。先看预览画面糊不糊，再判断是场景问题还是对焦问题。
+
+## 追加：`SetErase` 的空指针路径（2026-10-31）
+
+### 成因
+
+`clearPinned` / `releaseKfIfUnused` 会调 `KeyFrame::SetErase()` 解除钉点保护。
+但 `SetErase` 不是纯解锁 —— `mbToBeErased` 已置位时它会直接进 `SetBadFlag()`，
+而 `SetBadFlag()` 第一行就是：
+
+```cpp
+if(mnId==mpMap->GetInitKFid())    // KeyFrame.cc:577
+```
+
+`Map::clear()` 会把每个 KF 的 `mpMap` 置成 NULL（`Map.cc:246`）。所以
+**地图被重置之后再清空折线 → `mpMap` 已经是 NULL → 空指针解引用**。
+
+`mbToBeErased` 是**粘性**的：`KeyFrameCulling` 只遍历当前 KF 的共视邻居
+（`LocalMapping.cc:910`），一个钉点时的 KF 在随后几秒内被判冗余、被
+`SetNotErase` 挡下、打上标记；它离开共视范围之后就再也遍历不到，这个标记
+就一直留着，没有任何东西会清它。
+
+### 但触发窗口很窄：只在开局前 15 秒
+
+`ResetActiveMap` 才是走 `Map::clear()` 的那条路。其余路径都不置 NULL：
+
+| 入口 | 条件 | `mpMap` |
+|---|---|---|
+| `Tracking.cc:2188` | IMU 已初始化 且 `!GetIniertialBA2()` | **NULL** |
+| `Tracking.cc:2307` | `LOST` 且 `KeyFramesInMap() <= 10` | **NULL** |
+| `Tracking.cc:1841` | `mbBadImu`（`mTinit < 10` 且几乎没位移） | **NULL** |
+| `Tracking.cc:2311` / `2057` | 其余丢失 → `CreateMapInAtlas()` | 仍指向旧 Map |
+
+而 `SetIniertialBA2()` 在 `mTinit > 15.0f` 时就被置上（`LocalMapping.cc:219`，
+**在 VIBA2 真正跑之前**）。所以前两条的窗口只有建图后的前 15 秒。
+`mTinit` 还要求相机中心位移 > 5 cm 才累加（`LocalMapping.cc:136`），
+所以站着原地转能让这个窗口保持得更久。
+
+⟹ **正常用法（建图 30 秒后钉点）碰不到。** 这条不是「随时会炸」，
+是「开局十几秒内钉过点、又丢过跟踪、再清空」才会炸。
+
+### 改了什么（只加判断和日志，不改行为）
+
+| 位置 | 改动 |
+|---|---|
+| `slam_engine.cpp:1022` `releaseKfIfUnused` | `if (kf->GetMap() == nullptr) return;` |
+| `slam_engine.cpp:1188` `clearPinned` | 同上，另外累计 `stale` 个数打一行 |
+| `KeyFrame.cc:583` `SetBadFlag` | `mbNotErase` 分支首次命中时打 `[KF] 保护命中 KF=N` |
+
+**没做**的两件事，写清楚以免以后又被当成遗漏：
+
+- **没有放弃 `SetErase()`**。那样能一并消掉跨线程 `SetBadFlag`，但会让每条链
+  的锚点 KF 永久保护、永不剔除，反复清空重钉会累积到上千个，地图越跑越重。
+  用一个更大的隐患换一个小隐患，不划算。
+- **没有把解除保护挪到 SLAM 线程**。worker 和 LocalMapping 仍是两个线程，只是
+  把 UI 线程换成 worker，没根治；而 `SetBadFlag` 内部锁齐全、上游
+  `MapPoint::SetBadFlag` 本来就是多线程调的，为这条窄路径引入队列 + drain
+  不值得。
+
+### 验收
+
+不需要专门设计场景，正常用一次即可，看两行日志：
+
+```
+[KF] 保护命中 KF=436                                    ← culling 想剔它，被钉点挡住
+[M6] 清空折线：1 个锚点KF 已随旧图失效，跳过解保护        ← mpMap 真的是 NULL
+```
+
+两个都出现、id 对得上，就说明原本的崩溃路径确实可达（而且已经被挡掉）。
+`[KF] 保护命中` 一次都不出现，说明这条路径在实际使用里进不去，可以从遗留划掉。
+
+### 回滚
+
+删掉那三行判断和两行日志即可，没有格式变更、没有状态。
+
+⚠️ 这条是**代码审查得出的结论，没有真机复现**。`mbToBeErased` 在 `protected`
+区且没有 getter，外部读不到，所以加了日志来替代观测。

@@ -1022,6 +1022,10 @@ void releaseKfIfUnused(const Engine& e, ORB_SLAM3::KeyFrame* kf) {
     for (const Engine::Pinned& p : e.pinned) {
         if (p.kf == kf) return;
     }
+    // 图被重置后这个 KF 已经不属于任何 Map（Map::clear 会把 mpMap 置 NULL）。
+    // 而 SetErase 在「待剔除」标记已置上时会直接进 SetBadFlag，它第一行就解引用
+    // mpMap。那种情况下放开不放开保护都无所谓，跳过。
+    if (kf->GetMap() == nullptr) return;
     kf->SetErase();
 }
 
@@ -1181,7 +1185,19 @@ void clearPinned() {
     }
     e.pinned.clear();
     e.refineCursor = 0;
-    for (ORB_SLAM3::KeyFrame* kf : kfs) kf->SetErase();
+    int stale = 0;
+    for (ORB_SLAM3::KeyFrame* kf : kfs) {
+        // 同 releaseKfIfUnused：图被重置后 mpMap 是 NULL，SetErase 会崩。
+        if (kf->GetMap() == nullptr) {
+            ++stale;
+            continue;
+        }
+        kf->SetErase();
+    }
+    if (stale > 0) {
+        printf("[M6] 清空折线：%d 个锚点KF 已随旧图失效，跳过解保护\n", stale);
+        fflush(stdout);
+    }
 }
 
 void closePinnedChain() {
