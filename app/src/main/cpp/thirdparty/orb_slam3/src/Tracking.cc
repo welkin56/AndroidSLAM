@@ -40,6 +40,25 @@ using namespace std;
 namespace ORB_SLAM3
 {
 
+namespace {
+
+// 弱帧不立锚。这是本仓库对上游的一处改动，理由见 docs/changes/2026-10-31-weak-frame-kf-gate.md。
+//
+// 上游 NeedNewKeyFrame() 的 c4 判据是「内点 15~75 时插帧」，也就是跟踪一变弱就补一张
+// 关键帧。意图没错（缺图要补图），但它默认了被补的那一帧位姿可信 —— 而这时位姿恰恰
+// 最不可信。这一帧会成为 mPrevKF 链上的锚，后续每轮 LocalInertialBA 都以窗口外那一帧
+// 为基准（不是建图第一帧），于是误差只累加、没有回收机制。
+//
+// 所以这里不改「插多少」，只改「用哪一帧插」：内点不够就先不插，等下一个够的帧。
+constexpr int kWeakInliers = 45;
+
+// 推迟的上限。超过就必须放行一次：mpImuPreintegratedFromLastKF 是从上一关键帧开始
+// 积分的，臂越长 PredictStateIMU 的误差越大（随 t² 增长），插一张不完美的锚也好过
+// 让位姿靠纯惯性硬推。
+constexpr double kWeakHoldS = 1.0;
+
+}  // namespace
+
 
 Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Atlas *pAtlas, KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq):
     mState(NO_IMAGES_YET), mSensor(sensor), mTrackedFr(0), mbStep(false),
@@ -3093,6 +3112,36 @@ bool Tracking::NeedNewKeyFrame()
             return false;
     }
 
+    // 弱帧不立锚：内点太少时先不建关键帧，等下一个内点够的帧再插。
+    // 两档分开：丢失档（mState != OK）完全不让插，弱档（还 OK 但内点少）只是推迟。
+    // 见文件顶部 kWeakInliers / kWeakHoldS 的注释。
+    if(mpAtlas->GetCurrentMap()->isImuInitialized() && mpLastKeyFrame != nullptr)
+    {
+        const double dtKF = mCurrentFrame.mTimeStamp - mpLastKeyFrame->mTimeStamp;
+
+        // ① 已经判定丢失：位姿是纯 IMU 外推，插进去就是凭空造锚。这里不设上限 ——
+        //    从丢失里恢复靠的是 TrackLocalMap 重新匹配上（mn>10 即回 OK），不需要新关键帧。
+        //    yaml 里的 IMU.InsertKFsWhenLost=0 只挡住 !bOK 那一支；RECENTLY_LOST 期间
+        //    bOK 会被 2002 行置 true，所以还得在这里再挡一次。
+        if(mState != OK)
+        {
+            if(mCurrentFrame.mnId % 15 == 0)
+                cout << "[KF] 丢失不立锚 内点 " << mnMatchesInliers << " 距上一KF " << dtKF
+                     << "s 状态 " << static_cast<int>(mState) << endl;
+            return false;
+        }
+
+        // ② 还 OK 但很弱：推迟到下一个够强的帧；超过 kWeakHoldS 必须放行一次。
+        if(mnMatchesInliers < kWeakInliers && dtKF < kWeakHoldS)
+        {
+            // 限流到 0.5 s 一行（30 fps）；够看清什么时候被推迟，又不刷屏。
+            if(mCurrentFrame.mnId % 15 == 0)
+                cout << "[KF] 缓插 内点 " << mnMatchesInliers << " 距上一KF " << dtKF
+                     << "s" << endl;
+            return false;
+        }
+    }
+
     if(mbOnlyTracking)
         return false;
 
@@ -3355,6 +3404,12 @@ void Tracking::CreateNewKeyFrame()
     mpLocalMapper->InsertKeyFrame(pKF);
 
     mpLocalMapper->SetNotStop(false);
+
+    // 插进去的这一帧到底是什么质量，是判断「弱帧推迟」有没有生效的唯一直接证据。
+    // 只在 bOK 时才会走到这里（InsertKFsWhenLost=0 之后），所以 mnMatchesInliers 是当帧值。
+    cout << "[KF] #" << pKF->mnId << " 内点 " << mnMatchesInliers
+         << " 间隔 " << (pKF->mTimeStamp - (pKF->mPrevKF ? pKF->mPrevKF->mTimeStamp : pKF->mTimeStamp))
+         << "s" << endl;
 
     mnLastKeyFrameId = mCurrentFrame.mnId;
     mpLastKeyFrame = pKF;
