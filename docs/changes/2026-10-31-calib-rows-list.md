@@ -91,13 +91,14 @@
 
 ## 验证
 
-**未构建**（`wsl.exe` 被本机安全策略拦着，起不了 Linux 命令）。
+**已构建、已装机**（2026-10-31）。真机观察到的两处版式问题当场改掉了：空状态的
+`drawableTop` 图标与按钮的「+」重复且飘到顶上（已删）；排序控件从 `TextButton`
+改成芯片（和 `activity_main` 的状态芯片同一套）。后来那一版的最终形态是
+「标题 → 副标题 → 主按钮 → 分区标题 + 排序芯片 → 卡片列表」。
 
-```bash
-cd /home/welkin/SLAMAPP/SlamCapture
-./gradlew :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
+这一页随后成为标定链路的入口，真机跑了 5 次标定，档位写入/排序/删除都正常。
+
+下面这段是首次安装时的检查清单，保留作回归用。
 
 真机按顺序走一遍，覆盖全部分支：
 

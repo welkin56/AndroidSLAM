@@ -76,6 +76,13 @@ SLAM 用的同一个 640×480 流，也不做"1280 再缩放"。
 没有给 `beginSettle` 加一个 `autoLock: Boolean` 参数，而是新开 `startContinuousFocus()`：
 一个是"准备好"，一个是"只是对焦"，两个相反的语义塞进同一个方法，调用点会看不出区别。
 
+> **补记（2026-10-31，`c36554b`）**：`startContinuousFocus()` 当时并没真做出来 ——
+> 标定页是"调完 `beginSettle` 再立刻 `releaseFocus`"绕过去的，收敛窗口里仍可能锁上。
+> 后来在 `CameraCapture` 里补了真正的方法：置 `focusLockArmed = false` / `focusVerifying = false`
+> 后重发 AF 请求，**收敛后不锁**，锁的时机完全交给调用方。
+> 同时把 `releaseFocus()` 的注释改成"不再自动锁回去"，并把类注释里那句
+> "要重新对焦就再次 `beginSettle`"改成列出两条路，否则读代码的人会以为放开之后还会被锁回去。
+
 **⑨ 底部按钮改成一排次要 + 一个主按钮。**
 三个 Material 按钮并排时，左右各 24dp 的内边距把可用文字宽度压到 ~49dp，
 4 个汉字（14sp）要 56dp，于是「打开相机」折成两行、整排按钮跟着变高。

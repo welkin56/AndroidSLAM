@@ -175,6 +175,27 @@ pKFi->mpImuPreintegrated->SetNewBias(...);                        // ← 然后�
 `mpAtlas->GetCurrentMap()`（那个在坏图窗口里是 `while(IsBad()) usleep(3000)`，从主线程调会**冻死界面**），
 改用「最后一个有效参考帧属于哪张图」—— 语义一样、不会挂，**而且顺带让重置之后的老帧被自动滤掉**。
 
+## 我们对 ORB-SLAM3 改了哪些地方
+
+`orb_slam3/` 是 fork，不是上游原版。**升级上游时要按这张表逐条重放**，否则那些功能会静默消失
+（都不会编译报错，只会「行为变得像原版」）。
+
+| 提交 | 文件 | 改了什么 | 没了会怎样 |
+|---|---|---|---|
+| `fa7157b` | `include/System.h`、`src/System.cc`<br>`include/Tracking.h`、`src/Tracking.cc` | `System::SetCameraIntrinsics()` → `Tracking::SetCameraIntrinsics()`：运行期改写共享 `mpCamera` 的 fx/fy/cx/cy 与畸变系数，并置 `Frame::mbInitialComputations = true` 让图像边界重算 | App 注入的内参只影响新帧，已有地图仍按 yaml 的模板值投影 —— 测距系统性偏 |
+| `8a6d6bc` | `include/Map.h`、`src/Map.cc` | `std::atomic<float> mMetricScale` + `GetMetricScale()`；`ApplyScaledRotation()` 末尾 `*= s` | 钉点不知道整图被缩放过，`p_kf` 不重标 → 标记脱面、两点朝不同方向散开 |
+| `d731780` | `src/Tracking.cc` | 匿名命名空间加 `kWeakInliers` / `kWeakHoldS`；`NeedNewKeyFrame()` 加「弱帧推迟 / 丢失不立锚」两档；`CreateNewKeyFrame()` 末加 `[KF]` 日志 | 又变回「跟踪一变弱就补一张关键帧」，锚点落在最不可信的帧上 |
+| `661d3ed` | `src/KeyFrame.cc` | `SetBadFlag()` 的 `mbNotErase` 分支首次命中时打一行 `[KF] 保护命中 KF=N` | 只是少一行诊断，不影响行为；但 `mbToBeErased` 就没有外部观测手段了 |
+
+三条注意：
+
+- `d731780` 和 `fa7157b` 都改了 `Tracking.cc`，**顺序有依赖** —— 前者插在 `NeedNewKeyFrame()` 里，
+  后者在文件末尾加方法，重放时先 `fa7157b` 再 `d731780` 冲突最少。
+- `8a6d6bc` 的 `mMetricScale` **没有进 `Map::serialize`**。存图/载图后它回到 1，
+  而钉点记的 `sAtPin` 可能是别的值 → 比值算成垃圾。现在的规避方式是
+  `maybeRestoreMap` 里清空折线，**这个前提不能去掉**。
+- 升级前先 `git log --oneline -- app/src/main/cpp/thirdparty` 对一遍，比这张表可靠。
+
 ## 许可证
 
 搬进来的东西各自带着自己的许可证，不要当成这个项目的代码：
