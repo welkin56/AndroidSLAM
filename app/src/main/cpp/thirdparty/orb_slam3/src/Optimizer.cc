@@ -20,6 +20,7 @@
 #include "Optimizer.h"
 
 
+#include <cmath>
 #include <complex>
 
 #include <Eigen/StdVector>
@@ -4855,9 +4856,21 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
     }
 
     // Recover optimized pose, velocity and biases
-    pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
     Vector6d b;
     b << VG->estimate(), VA->estimate();
+
+    // 优化可能发散（重定位后位姿/速度初值和预积分对不上时会），发散的结果是 NaN。
+    // 一旦写回 Frame，CreateNewKeyFrame 的 SetNewBias 会把它存进关键帧，下一帧
+    // PredictStateIMU 拿 KF 的 bias 调 GetDeltaRotation，崩在 SO3::exp 的 ensure 上。
+    // 直接返回 0：让调用方按「这帧没跟住」处理，NaN 既不进 Frame，也不进 mpcpi。
+    if (!(VP->estimate().Rwb.allFinite() && VP->estimate().twb.allFinite() &&
+          VV->estimate().allFinite() && b.allFinite()))
+    {
+        cout << "[OPT] 惯性优化发散（结果含 NaN），本帧状态不写回" << endl;
+        return 0;
+    }
+
+    pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
     pFrame->mImuBias = IMU::Bias(b[3],b[4],b[5],b[0],b[1],b[2]);
 
     // Recover Hessian, marginalize keyFframe states and generate new prior for frame
@@ -4906,6 +4919,40 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
 
 int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
 {
+    // 入口体检。bias / 速度 / 预积分只要有非有限值，g2o 会在 EdgeInertial::computeError
+    // 里把它送进 SO3::exp，触发 Sophus 的 ensure 直接 abort —— 整个进程没了，不是可捕获的崩溃。
+    // 重定位恢复后的帧最容易出现这种输入（位姿刚从漂移位置跳回来，速度和 bias 还是旧的）。
+    // 检测到就退回纯视觉，至少让这一帧活下来，日志里能看见。
+    // 原来的写法是「三个指针都在才检查，缺任何一个反而直接跳过检查」，随后照样解引用。
+    if (!pFrame->mpPrevFrame || !pFrame->mpImuPreintegratedFrame || !pFrame->mpImuPreintegrated)
+    {
+        cout << "[OPT] 惯性优化缺少前帧或预积分，退回纯视觉" << endl;
+        return PoseOptimization(pFrame);
+    }
+    {
+        const IMU::Bias &b = pFrame->mImuBias;
+        const IMU::Bias &bp = pFrame->mpPrevFrame->mImuBias;
+        const bool ok =
+            pFrame->isSet() && pFrame->mpPrevFrame->isSet() &&
+            pFrame->GetPose().matrix().allFinite() && pFrame->mpPrevFrame->GetPose().matrix().allFinite() &&
+            std::isfinite(b.bax) && std::isfinite(b.bay) && std::isfinite(b.baz) &&
+            std::isfinite(b.bwx) && std::isfinite(b.bwy) && std::isfinite(b.bwz) &&
+            std::isfinite(bp.bax) && std::isfinite(bp.bay) && std::isfinite(bp.baz) &&
+            std::isfinite(bp.bwx) && std::isfinite(bp.bwy) && std::isfinite(bp.bwz) &&
+            pFrame->GetVelocity().allFinite() && pFrame->mpPrevFrame->GetVelocity().allFinite() &&
+            std::isfinite(pFrame->mpImuPreintegratedFrame->dT) && pFrame->mpImuPreintegratedFrame->dT > 0.f &&
+            std::isfinite(pFrame->mpImuPreintegrated->dT) && pFrame->mpImuPreintegrated->dT > 0.f &&
+            pFrame->mpImuPreintegratedFrame->dR.allFinite() && pFrame->mpImuPreintegratedFrame->JRg.allFinite() &&
+            pFrame->mpImuPreintegrated->dR.allFinite() && pFrame->mpImuPreintegrated->JRg.allFinite() &&
+            pFrame->mpImuPreintegratedFrame->C.allFinite() && pFrame->mpImuPreintegratedFrame->Info.allFinite() &&
+            pFrame->mpImuPreintegrated->C.allFinite() && pFrame->mpImuPreintegrated->Info.allFinite();
+        if (!ok)
+        {
+            cout << "[OPT] 惯性优化输入非有限，退回纯视觉" << endl;
+            return PoseOptimization(pFrame);
+        }
+    }
+
     g2o::SparseOptimizer optimizer;
     g2o::BlockSolverX::LinearSolverType * linearSolver;
 
@@ -5111,19 +5158,23 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     ear->setInformation(InfoA);
     optimizer.addEdge(ear);
 
-    if (!pFp->mpcpi)
-        Verbose::PrintMess("pFp->mpcpi does not exist!!!\nPrevious Frame " + to_string(pFp->mnId), Verbose::VERBOSITY_NORMAL);
+    // 上一帧走的是纯 PoseOptimization（重定位当帧、或刚 ResetActiveMap），没有生成 mpcpi。
+    // 缺这条先验不致命：上面 EdgeInertial 仍在约束位姿和速度。不跳过就是空指针解引用。
+    // ep 在函数末尾还要取 Hessian，所以放在外面持有，用前判空。
+    EdgePriorPoseImu* ep = nullptr;
+    if (pFp->mpcpi)
+    {
+        ep = new EdgePriorPoseImu(pFp->mpcpi);
 
-    EdgePriorPoseImu* ep = new EdgePriorPoseImu(pFp->mpcpi);
-
-    ep->setVertex(0,VPk);
-    ep->setVertex(1,VVk);
-    ep->setVertex(2,VGk);
-    ep->setVertex(3,VAk);
-    g2o::RobustKernelHuber* rkp = new g2o::RobustKernelHuber;
-    ep->setRobustKernel(rkp);
-    rkp->setDelta(5);
-    optimizer.addEdge(ep);
+        ep->setVertex(0,VPk);
+        ep->setVertex(1,VVk);
+        ep->setVertex(2,VGk);
+        ep->setVertex(3,VAk);
+        g2o::RobustKernelHuber* rkp = new g2o::RobustKernelHuber;
+        ep->setRobustKernel(rkp);
+        rkp->setDelta(5);
+        optimizer.addEdge(ep);
+    }
 
     // We perform 4 optimizations, after each optimization we classify observation as inlier/outlier
     // At the next optimization, outliers are not included, but at the end they can be classified as inliers again.
@@ -5137,10 +5188,28 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     int nInliersMono = 0;
     int nInliersStereo = 0;
     int nInliers=0;
+
+    // 每次只跑一步，步后立刻检查。g2o 在下一次 computeActiveErrors 里才会把 NaN 送进
+    // EdgeInertial/SO3::exp，那一步是 Sophus ensure → abort，进程直接没。分步跑就能在
+    // 写坏 Frame 之前退出，交给调用方退回纯视觉。
+    auto statesFinite = [&]() -> bool {
+        return VP->estimate().Rwb.allFinite() && VP->estimate().twb.allFinite() &&
+               VV->estimate().allFinite() && VG->estimate().allFinite() && VA->estimate().allFinite();
+    };
+
     for(size_t it=0; it<4; it++)
     {
         optimizer.initializeOptimization(0);
-        optimizer.optimize(its[it]);
+        for (int nit = 0; nit < its[it]; ++nit)
+        {
+            optimizer.optimize(1);
+            if (!statesFinite())
+            {
+                cout << "[OPT] 惯性优化第 " << it << " 轮第 " << nit
+                     << " 步发散，本帧退回纯视觉" << endl;
+                return -1;
+            }
+        }
 
         nBad=0;
         nBadMono = 0;
@@ -5256,9 +5325,21 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
 
 
     // Recover optimized pose, velocity and biases
-    pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
     Vector6d b;
     b << VG->estimate(), VA->estimate();
+
+    // 优化可能发散（重定位后位姿/速度初值和预积分对不上时会），发散的结果是 NaN。
+    // 一旦写回 Frame，CreateNewKeyFrame 的 SetNewBias 会把它存进关键帧，下一帧
+    // PredictStateIMU 拿 KF 的 bias 调 GetDeltaRotation，崩在 SO3::exp 的 ensure 上。
+    // 直接返回 0：让调用方按「这帧没跟住」处理，NaN 既不进 Frame，也不进 mpcpi。
+    if (!(VP->estimate().Rwb.allFinite() && VP->estimate().twb.allFinite() &&
+          VV->estimate().allFinite() && b.allFinite()))
+    {
+        cout << "[OPT] 惯性优化发散（结果含 NaN），本帧状态不写回" << endl;
+        return -1;
+    }
+
+    pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
     pFrame->mImuBias = IMU::Bias(b[3],b[4],b[5],b[0],b[1],b[2]);
 
     // Recover Hessian, marginalize previous frame states and generate new prior for frame
@@ -5279,7 +5360,9 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     H.block<3,3>(27,12) += Har.block<3,3>(3,0);
     H.block<3,3>(27,27) += Har.block<3,3>(3,3);
 
-    H.block<15,15>(0,0) += ep->GetHessian();
+    // ep 为空说明没加这条先验边，这一块保持零，与「不加边」一致。
+    if (ep)
+        H.block<15,15>(0,0) += ep->GetHessian();
 
     int tot_in = 0, tot_out = 0;
     for(size_t i=0, iend=vpEdgesMono.size(); i<iend; i++)

@@ -1053,4 +1053,8 @@ namespace ORB_SLAM3 {
 		jacs(1, 4) = s2*t65-t14*t101*t167*t212*(1.0/2.0);
 		jacs(1, 5) = s3*t65-t14*t101*t167*t216*(1.0/2.0);
     }
+
+    // 原版只声明不定义：Relocalization() 从不 delete solver，这个符号一直没人引用。
+    // 现在按候选数回收就必须有实体。成员全是 STL/Eigen/标量，默认析构够用。
+    MLPnPsolver::~MLPnPsolver() = default;
 }//End namespace ORB_SLAM2

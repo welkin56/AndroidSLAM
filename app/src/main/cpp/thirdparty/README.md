@@ -89,6 +89,8 @@ PC 上跑 `mono_inertial_euroc` 做对照（M7 的验收项）用的还是上游
 | 32 | `orb_slam3/include/System.h` + `src/System.cc` | **新增** `System::GetMapList()` / `GetMapCloud()` —— atlas 里每张图的 id/KF/点数和**单张图的点云** | ⚠️ **不是上游 bug，是我们多出来的用法**：2D 地图查看器要一张一张翻 atlas 里的图，而 `Atlas::GetAllMapPoints()` 只给当前图。`GetMapCloud` 会对目标图拿 `mMutexMap` 拷指针表，所以只给「选图/刷新」这种低频动作调。详见 `docs/changes/2026-10-24-map-viewer.md` |
 
 | 33 | `orb_slam3/include/{System,Tracking}.h` + `src/{System,Tracking}.cc` | **新增** `System::SetCameraIntrinsics()` → `Tracking::SetCameraIntrinsics()`：换 `mpCamera` 的四个参数，同步 `mK` / `mK_` / `mDistCoef`，并置 `Frame::mbInitialComputations` | ⚠️ **不是上游 bug，是我们多出来的用法**：内参由 App 的标定表按对焦屈光度插值后注入，不再写进 yaml。上游的 `Tracking::ChangeCalibration` 不能直接用：它读 `Camera.fx`（实际键是 `Camera1.fx`，读出来是 0），而且只改 `mK` / `mDistCoef`、**没碰 `mpCamera`** —— `Frame` 的去畸变和反投影走的正是后者。只在 `nativeStart()` 之前调，见 `docs/changes/2026-10-28-intrinsics-profile.md` |
+| 34 | `orb_slam3/src/MLPnPsolver.cpp` | **补** `MLPnPsolver::~MLPnPsolver() = default;` —— 头文件只声明、`.cpp` 里从来没有定义 | ⚠️ **上游的漏定义，但默认不会暴露**：原版 `Relocalization()` 从不 `delete` solver，析构符号永远没人引用，链接器不会要它。一旦开始按候选数回收就是 `undefined symbol: ORB_SLAM3::MLPnPsolver::~MLPnPsolver()`。能默认析构是因为成员里唯一的裸指针 `mpCamera` 是 `Frame` 相机的别名（`mpCamera(F.mpCamera)`），不持有所有权 |
+| 35 | `orb_slam3/src/Optimizer.cc`（`PoseInertialOptimizationLastFrame`） | `EdgePriorPoseImu` 的创建和加边整体包进 `if (pFp->mpcpi)` —— 原来只打一行日志，然后照样 `new EdgePriorPoseImu(pFp->mpcpi)` | ⚠️ **上游 bug，第三次同源复现**（同 10、11）：`mpcpi` 只有 `PoseInertialOptimizationLastKeyFrame` / `LastFrame` 的末尾会生成，**纯 `PoseOptimization` 从不生成**。于是「重定位当帧走纯 PO → 下一帧切回惯性优化」必然空指针解引用，崩在 `EdgePriorPoseImu` 构造函数，`fault addr 0x0`；而那句 `PrintMess` 用的是 `VERBOSITY_NORMAL`（实际是 QUIET），**永远打不出来**。上游 `IMU_MONOCULAR` 下 `Relocalization()` 没有调用点，这条路径本来走不到 —— 是我们的级 2 把它接活的。缺这条先验不致命，`EdgeInertial` 仍在约束位姿和速度 |
 
 第 3、6、7 条是这次真编才暴露出来的 —— 光看代码不容易想到。
 
@@ -186,6 +188,7 @@ pKFi->mpImuPreintegrated->SetNewBias(...);                        // ← 然后�
 | `8a6d6bc` | `include/Map.h`、`src/Map.cc` | `std::atomic<float> mMetricScale` + `GetMetricScale()`；`ApplyScaledRotation()` 末尾 `*= s` | 钉点不知道整图被缩放过，`p_kf` 不重标 → 标记脱面、两点朝不同方向散开 |
 | `d731780` | `src/Tracking.cc` | 匿名命名空间加 `kWeakInliers` / `kWeakHoldS`；`NeedNewKeyFrame()` 加「弱帧推迟 / 丢失不立锚」两档；`CreateNewKeyFrame()` 末加 `[KF]` 日志 | 又变回「跟踪一变弱就补一张关键帧」，锚点落在最不可信的帧上 |
 | `661d3ed` | `src/KeyFrame.cc` | `SetBadFlag()` 的 `mbNotErase` 分支首次命中时打一行 `[KF] 保护命中 KF=N` | 只是少一行诊断，不影响行为；但 `mbToBeErased` 就没有外部观测手段了 |
+| 待提交 | `include/Tracking.h`、`src/Tracking.cc`<br>`src/MLPnPsolver.cpp`、`src/Optimizer.cc` | `RECENTLY_LOST` 的 IMU 分支里加两级视觉恢复：级 1 `TrackReferenceKeyFrame`（每帧，3~5 ms）、级 2 `Relocalization`（每 3 帧，20~100 ms），各配一条与 `T_pred` 的夹角闸（30°/45°），失败统一回滚位姿、匹配表与 `mnLastRelocFrameId`。顺带在 `Relocalization()` 里用作用域守卫回收 `MLPnPsolver`，并补上它缺失的析构定义（第 34 条）；`PoseInertialOptimizationLastFrame` 补 `mpcpi` 空指针守卫（第 35 条）、输入/输出有限性检查，并把 `optimize(10)` 拆成逐步 `optimize(1)` 检查、发散返回 `-1` 后由 `TrackLocalMap` 退回纯视觉并冷却；`PreintegrateIMU` 丢弃脏采样，`PredictStateIMU` 检查预积分 `dR/JRg`；恢复后 30 帧及整个 `RECENTLY_LOST` 阶段只走纯视觉，恢复标记须经 `TrackLocalMap` 验收否则回滚 | 丢失期间只剩投影匹配这一条依赖位姿的通路：位姿偏 2° 投影就偏 15 px 卡在窗边，偏 3° 彻底出窗 → 搜不到点 → 位姿不更新 → 5 秒缓期必然耗尽重建地图。看到的现象是「画面回来了，系统回不来」。见 `docs/changes/2026-11-02-lost-recovery-two-stage.md` |
 
 三条注意：
 

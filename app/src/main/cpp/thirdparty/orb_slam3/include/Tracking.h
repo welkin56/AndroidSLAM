@@ -218,10 +218,15 @@ protected:
     void CreateInitialMapMonocular();
 
     void CheckReplacedInLastFrame();
-    bool TrackReferenceKeyFrame();
+    bool TrackReferenceKeyFrame(const Sophus::SE3f* pInitPose = nullptr);
     void UpdateLastFrame();
     bool TrackWithMotionModel();
     bool PredictStateIMU();
+
+    // 丢失期间的两级视觉恢复。都不改 mState / bOK，交给调用方后面的 TrackLocalMap 裁决。
+    bool TryRecoverByReferenceKF(const Sophus::SE3f& T_pred);
+    bool TryRecoverByRelocalization(const Sophus::SE3f& T_pred);
+    static float RotationDeg(const Sophus::SE3f& A, const Sophus::SE3f& B);
 
     bool Relocalization();
 
@@ -315,6 +320,8 @@ protected:
 
     int mnFirstImuFrameId;
     int mnFramesToResetIMU;
+    // 惯性优化发散后的冷却帧数；大于 0 时本帧只做纯视觉。
+    int mnInertialOptCooldown = 0;
 
     // Threshold close/far points
     // Points seen as close by the stereo/RGBD sensor are considered reliable

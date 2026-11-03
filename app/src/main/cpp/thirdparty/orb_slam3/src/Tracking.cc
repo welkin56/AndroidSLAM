@@ -33,6 +33,8 @@
 
 #include <mutex>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 
 
 using namespace std;
@@ -56,6 +58,55 @@ constexpr int kWeakInliers = 45;
 // 积分的，臂越长 PredictStateIMU 的误差越大（随 t² 增长），插一张不完美的锚也好过
 // 让位姿靠纯惯性硬推。
 constexpr double kWeakHoldS = 1.0;
+
+// 丢失期间的两级视觉恢复。丢掉之后 TrackLocalMap 只剩投影匹配，而投影匹配依赖位姿：
+// 位姿一偏就搜不到点，搜不到就不更新位姿，形成死锁 —— 画面回来了也没用。
+// 只有不依赖位姿的描述子匹配能打破它：级 1 用参考关键帧（便宜，覆盖"回到同一片"），
+// 级 2 用全图检索（贵，覆盖"转到别处又回来"）。
+
+/** 级 1 的最低内点数。上游非 IMU 分支用 nmatchesMap>=10，IMU 分支（2814）无条件
+ *  return true 把这道检查删了，这里补回来并严一档（丢失恢复比正常跟踪更可疑）。 */
+constexpr int kLostRefKFMinInliers = 15;
+
+/** 级 1 允许的旋转偏差。T_pred 在丢失 1~2 秒后自身就有 10~15° 不确定度。 */
+constexpr float kLostRefKFMaxRotDeg = 30.f;
+
+/** 级 2 的旋转偏差上限。触发时丢失更久，T_pred 更不可靠，放宽。 */
+constexpr float kLostRelocMaxRotDeg = 45.f;
+
+/** 级 2 的平移偏差上限。单目尺度不一定收敛好，只挡极端跳变。 */
+constexpr float kLostRelocMaxPosM = 3.f;
+
+/** 级 2 的节流间隔。Relocalization 要 20~100 ms，每帧做会拖垮帧率。 */
+constexpr int kLostRelocEvery = 3;
+
+/** 重定位/恢复成功之后，强制走纯视觉优化的帧数。
+ *  上游用 mnFramesToResetIMU 控制这个窗口，但那个变量在本工程从未赋值（见
+ *  docs/changes/2026-11-02-lost-recovery-two-stage.md），实测是 0 —— 窗口不存在，
+ *  于是恢复后的下一帧就进惯性优化：拿 33 ms 的预积分残差去约束一次几秒的位姿跳跃，
+ *  g2o 发散，bias 变 NaN，最后崩在 SO3::exp 的 ensure 上（SIGABRT）。
+ *  这里单独开一个窗口，不动 mnFramesToResetIMU —— 它还牵着 2020/2252/2268 三处。 */
+constexpr int kRecoverVisualFrames = 30;
+
+/** bias 的六个分量是否都是有限值。惯性优化发散一次就能把 NaN 写进 Frame，
+ *  随后 CreateNewKeyFrame 存进关键帧，下一帧 PredictStateIMU 拿它调
+ *  GetDeltaRotation 会崩在 SO3::exp 的 ensure 上（SIGABRT）。 */
+bool BiasFinite(const IMU::Bias& b)
+{
+    return std::isfinite(b.bax) && std::isfinite(b.bay) && std::isfinite(b.baz) &&
+           std::isfinite(b.bwx) && std::isfinite(b.bwy) && std::isfinite(b.bwz);
+}
+
+/** 预积分内部量是否都可用。GetDeltaRotation 直接用 dR/JRg 调 SO3::exp，
+ *  这些量一旦是 NaN，下面的 ensure 会在日志里 abort 整个进程。 */
+bool PreintegratedFinite(const IMU::Preintegrated* p)
+{
+    return p && std::isfinite(p->dT) && p->dT > 0.f &&
+           p->dR.allFinite() && p->dV.allFinite() && p->dP.allFinite() &&
+           p->JRg.allFinite() && p->JVg.allFinite() && p->JVa.allFinite() &&
+           p->JPg.allFinite() && p->JPa.allFinite() &&
+           p->C.allFinite() && p->Info.allFinite();
+}
 
 }  // namespace
 
@@ -1746,6 +1797,12 @@ void Tracking::PreintegrateIMU()
             tstep = mCurrentFrame.mTimeStamp-mCurrentFrame.mpPrevFrame->mTimeStamp;
         }
 
+        // IMU 时间戳重复时 tab=0，上面两个插值分支的 (tini/tab)、(tend/tab) 会算出 inf/NaN；
+        // 传感器本身也可能吐非有限值。一旦进预积分，dR/JRg 整条链就坏死，最后崩在
+        // SO3::exp 的 ensure 上（SIGABRT，整个进程没了）。丢掉一条只影响一个采样周期。
+        if (!acc.allFinite() || !angVel.allFinite() || !std::isfinite(tstep) || tstep <= 0.f)
+            continue;
+
         if (!mpImuPreintegratedFromLastKF)
             cout << "mpImuPreintegratedFromLastKF does not exist" << endl;
         mpImuPreintegratedFromLastKF->IntegrateNewMeasurement(acc,angVel,tstep);
@@ -1772,6 +1829,14 @@ bool Tracking::PredictStateIMU()
 
     if(mbMapUpdated && mpLastKeyFrame)
     {
+        // 惯性优化发散一次就会把 NaN 写进 Frame，再经 CreateNewKeyFrame 的 SetNewBias
+        // 存进关键帧。这里不挡，GetDeltaRotation 里的 SO3::exp 会 ensure 失败直接 abort。
+        if (!PreintegratedFinite(mpImuPreintegratedFromLastKF) || !BiasFinite(mpLastKeyFrame->GetImuBias()))
+        {
+            cout << "[TRK] 预测跳过：KF 预测输入不可用" << endl;
+            return false;
+        }
+
         const Eigen::Vector3f twb1 = mpLastKeyFrame->GetImuPosition();
         const Eigen::Matrix3f Rwb1 = mpLastKeyFrame->GetImuRotation();
         const Eigen::Vector3f Vwb1 = mpLastKeyFrame->GetVelocity();
@@ -1790,6 +1855,12 @@ bool Tracking::PredictStateIMU()
     }
     else if(!mbMapUpdated)
     {
+        if (!PreintegratedFinite(mCurrentFrame.mpImuPreintegratedFrame) || !BiasFinite(mLastFrame.mImuBias))
+        {
+            cout << "[TRK] 预测跳过：上一帧预测输入不可用" << endl;
+            return false;
+        }
+
         const Eigen::Vector3f twb1 = mLastFrame.GetImuPosition();
         const Eigen::Matrix3f Rwb1 = mLastFrame.GetImuRotation();
         const Eigen::Vector3f Vwb1 = mLastFrame.GetVelocity();
@@ -1960,6 +2031,9 @@ void Tracking::Track()
     {
         // System is initialized. Track Frame.
         bool bOK;
+        // 恢复函数只提供候选，TrackLocalMap 才是最终验收。用它保存本帧进入前的标记，
+        // 候选通过但局部地图验收失败时，不能把 mnLastRelocFrameId 留在前进后的值上。
+        const unsigned int relocIdOnEntry = mnLastRelocFrameId;
 
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartPosePred = std::chrono::steady_clock::now();
@@ -2022,7 +2096,7 @@ void Tracking::Track()
                     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))
                     {
                         if(pCurrentMap->isImuInitialized())
-                            PredictStateIMU();
+                            bOK = PredictStateIMU();
                         else
                             bOK = false;
 
@@ -2031,6 +2105,32 @@ void Tracking::Track()
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
                             bOK=false;
+                        }
+
+                        // 超时之后不再尝试 —— 上面那一步已经决定换图了。
+                        // isSet 是必需的：PredictStateIMU 可能返回 false 且不写位姿，那时
+                        // GetPose 拿到的是未初始化的 mTcw，回滚会把它当真的写回去，而
+                        // SetPose 只置位不能复位，mbHasPose 就从 false 变 true 再也退不回去。
+                        if (bOK && mCurrentFrame.isSet())
+                        {
+                            const Sophus::SE3f T_pred = mCurrentFrame.GetPose();
+                            const unsigned int relocIdSaved = mnLastRelocFrameId;
+
+                            bool recovered = TryRecoverByReferenceKF(T_pred);
+                            if (!recovered && mCurrentFrame.mnId % kLostRelocEvery == 0)
+                                recovered = TryRecoverByRelocalization(T_pred);
+
+                            // 不改 bOK / mState，交给紧随其后的 TrackLocalMap 裁决：
+                            // 提前置 OK 会让它失败时掉进"IMU 未初始化就清图"那条分支，
+                            // 并且把 mTimeStampLost 刷新，5 秒计时无限续命。
+                            if (!recovered)
+                            {
+                                // 两级都没成：清掉匹配、位姿退回 IMU 预测，当作没试过。
+                                mCurrentFrame.SetPose(T_pred);
+                                mCurrentFrame.mvpMapPoints.assign(mCurrentFrame.N, static_cast<MapPoint*>(NULL));
+                                mCurrentFrame.mvbOutlier.assign(mCurrentFrame.N, false);
+                                mnLastRelocFrameId = relocIdSaved;
+                            }
                         }
                     }
                     else
@@ -2160,8 +2260,13 @@ void Tracking::Track()
         {
             if(bOK)
             {
+                const bool wasRecentlyLost = (mState == RECENTLY_LOST);
                 bOK = TrackLocalMap();
-
+                if (wasRecentlyLost)
+                {
+                    // 成功才把这一帧登记为正式恢复；失败则连同级 1/级 2 写过的标记一起撤回。
+                    mnLastRelocFrameId = bOK ? mCurrentFrame.mnId : relocIdOnEntry;
+                }
             }
             if(!bOK)
                 cout << "Fail to track local map!" << endl;
@@ -2756,7 +2861,7 @@ void Tracking::CheckReplacedInLastFrame()
 }
 
 
-bool Tracking::TrackReferenceKeyFrame()
+bool Tracking::TrackReferenceKeyFrame(const Sophus::SE3f* pInitPose)
 {
     // Compute Bag of Words vector
     mCurrentFrame.ComputeBoW();
@@ -2770,12 +2875,15 @@ bool Tracking::TrackReferenceKeyFrame()
 
     if(nmatches<15)
     {
-        cout << "TRACK_REF_KF: Less than 15 matches!!\n";
+        // 上游这里无条件打一行 cout，丢失期间每帧一次，几十秒就能淹掉整份日志。
+        // 同样的信息外面有 [TRK] 钥匙帧匹配不足（每 15 帧限流一次）。
         return false;
     }
 
     mCurrentFrame.mvpMapPoints = vpMapPointMatches;
-    mCurrentFrame.SetPose(mLastFrame.GetPose());
+    // 上游固定用上一帧位姿当局值优化初值。丢失恢复时上一帧已经是几秒前的，
+    // 而 IMU 播出来的预测位姿才是当前位置，所以允许调用方传进来。
+    mCurrentFrame.SetPose(pInitPose ? *pInitPose : mLastFrame.GetPose());
 
     //mCurrentFrame.PrintPointDistribution();
 
@@ -2815,6 +2923,84 @@ bool Tracking::TrackReferenceKeyFrame()
         return true;
     else
         return nmatchesMap>=10;
+}
+
+float Tracking::RotationDeg(const Sophus::SE3f& A, const Sophus::SE3f& B)
+{
+    const Sophus::SE3f dT = A * B.inverse();
+    float c = (dT.rotationMatrix().trace() - 1.f) * 0.5f;
+    c = std::min(1.f, std::max(-1.f, c));
+    return std::acos(c) * 57.2957795f;
+}
+
+bool Tracking::TryRecoverByReferenceKF(const Sophus::SE3f& T_pred)
+{
+    if (mpReferenceKF == nullptr || mpReferenceKF->isBad())
+    {
+        if (mCurrentFrame.mnId % 15 == 0)
+            cout << "[TRK] 钥匙帧不可用" << endl;
+        return false;
+    }
+
+    // 失败路径是干净的：nmatches<15 的 return 在赋 mvpMapPoints 之前，位姿和匹配表都没被碰。
+    // 初值传 T_pred 而不是让它用 mLastFrame：丢失后上一帧位姿已经漂了几秒。
+    if (!TrackReferenceKeyFrame(&T_pred))
+    {
+        if (mCurrentFrame.mnId % 15 == 0)
+            cout << "[TRK] 钥匙帧匹配不足" << endl;
+        return false;
+    }
+
+    int nGood = 0;
+    for (int i = 0; i < mCurrentFrame.N; ++i)
+    {
+        MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+        if (pMP && !mCurrentFrame.mvbOutlier[i] && pMP->Observations() > 0)
+            ++nGood;
+    }
+
+    // BoW 误匹配也能凑出内部自洽的错解（PoseOptimization 第三轮会关掉鲁棒核），
+    // 单看内点数拦不住，只能拿与 IMU 预测的夹角兜。
+    const float deg = RotationDeg(mCurrentFrame.GetPose(), T_pred);
+    if (nGood < kLostRefKFMinInliers || deg > kLostRefKFMaxRotDeg)
+    {
+        if (mCurrentFrame.mnId % 15 == 0)
+            cout << "[TRK] 钥匙帧拒收 内点 " << nGood << " 夹角 " << deg << "度" << endl;
+        return false;
+    }
+
+    // 和级 2 对齐。这一行决定三件事：
+    // ① TrackLocalMap 这一帧走纯视觉 PoseOptimization —— 否则走惯性优化，会用 33 ms 的
+    //    预积分残差去约束一次几秒的位姿跳跃，把刚修正的位姿拽回漂移轨迹；
+    // ② 随后 mMaxFrames 帧内按 50 内点验收，不再有 15 内点的假成功；
+    // ③ UpdateLocalKeyFrames 按当前帧的匹配投票，局部地图是当前朝向而不是上一帧的。
+    mnLastRelocFrameId = mCurrentFrame.mnId;
+
+    cout << "[TRK] 钥匙帧恢复 内点 " << nGood << " 夹角 " << deg << "度 距丢失 "
+         << (mCurrentFrame.mTimeStamp - mTimeStampLost) << "s" << endl;
+    return true;
+}
+
+bool Tracking::TryRecoverByRelocalization(const Sophus::SE3f& T_pred)
+{
+    // 失败时 mCurrentFrame 的位姿可能已被中间解改写（Relocalization 先 SetPose 再判内点），
+    // 所以这里只判"成不成"，回滚交给调用方统一做。
+    if (!Relocalization())
+        return false;
+
+    const float deg = RotationDeg(mCurrentFrame.GetPose(), T_pred);
+    const float dpos = (mCurrentFrame.GetPose().translation() - T_pred.translation()).norm();
+    if (deg > kLostRelocMaxRotDeg || dpos > kLostRelocMaxPosM)
+    {
+        cout << "[TRK] 全图重定位拒收 夹角 " << deg << "度 平移 " << dpos << "m" << endl;
+        return false;
+    }
+
+    // 保留 Relocalization 写的 mnLastRelocFrameId：它让 UpdateLocalKeyFrames 改用当前帧
+    // 投票而不是上一帧，局部地图才是当前朝向的。
+    cout << "[TRK] 全图重定位 夹角 " << deg << "度 平移 " << dpos << "m 距丢失 "
+         << (mCurrentFrame.mTimeStamp - mTimeStampLost) << "s" << endl;
+    return true;
 }
 
 void Tracking::UpdateLastFrame()
@@ -3010,8 +3196,17 @@ bool Tracking::TrackLocalMap()
         Optimizer::PoseOptimization(&mCurrentFrame);
     else
     {
-        if(mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU)
+        // 丢失还没恢复时，位姿、速度和 bias 都可能彼此对不上；这时惯性优化会发散，
+        // 甚至在 g2o 内部把 NaN 送进 SO3::exp 直接 abort，函数末尾的写回检查拦不到。
+        // 只有 TrackLocalMap 真正验收通过、mState 回到 OK 后，才开始恢复窗口计时。
+        // 冷却期内同样只做纯视觉：惯性优化刚发散过，状态还没稳定，立即重试只会再炸。
+        if(mState != OK ||
+           mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU ||
+           mCurrentFrame.mnId<=mnLastRelocFrameId+kRecoverVisualFrames ||
+           mnInertialOptCooldown > 0)
         {
+            if (mnInertialOptCooldown > 0)
+                --mnInertialOptCooldown;
             Verbose::PrintMess("TLM: PoseOptimization ", Verbose::VERBOSITY_DEBUG);
             Optimizer::PoseOptimization(&mCurrentFrame);
         }
@@ -3022,6 +3217,13 @@ bool Tracking::TrackLocalMap()
             {
                 Verbose::PrintMess("TLM: PoseInertialOptimizationLastFrame ", Verbose::VERBOSITY_DEBUG);
                 inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
+                if (inliers < 0)
+                {
+                    // 优化中途发散。帧本身没被写坏（顶点是独立副本），退回纯视觉保住这一帧，
+                    // 并冷却一段时间，避免每帧重试同一条必然发散的路径。
+                    mnInertialOptCooldown = kRecoverVisualFrames;
+                    inliers = Optimizer::PoseOptimization(&mCurrentFrame);
+                }
             }
             else
             {
@@ -3704,6 +3906,14 @@ bool Tracking::Relocalization()
 
     vector<MLPnPsolver*> vpMLPnPsolvers;
     vpMLPnPsolvers.resize(nKFs);
+
+    // solver 原版从不 delete：每个持有长度 F.N 的 mvPoch3d/mvPc/mvSigma2/mvMaxError，
+    // 按候选数泄漏 60~100 KB/次。用作用域守卫回收，覆盖下面两个 return 出口。
+    struct SolverReaper
+    {
+        vector<MLPnPsolver*>& v;
+        ~SolverReaper() { for (MLPnPsolver* p : v) delete p; }
+    } solverReaper{vpMLPnPsolvers};
 
     vector<vector<MapPoint*> > vvpMapPointMatches;
     vvpMapPointMatches.resize(nKFs);
