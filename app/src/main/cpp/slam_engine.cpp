@@ -981,6 +981,15 @@ float dist3(const float* a, const float* b) {
 /** 钉点深度刷新的收敛速度：每帧一次，约 0.5 s 爬到新值。 */
 constexpr float kRefineAlpha = 0.15f;
 
+/**
+ * 钉点刷新的死区：修正比落在 1±该值以内就不动。
+ *
+ * 钉点本来就是地图点，和邻域点同源，平面看不出它的偏差 —— 实测修正比中位数 1.000
+ * （p10 0.979 / p90 1.014），没有可修的系统偏差。不设死区只会把拟合噪声灌进 p_kf：
+ * 两个端点各抖 ±2%，段长极差从 0.5% 涨到 8.9%。
+ */
+constexpr float kRefineDeadband = 0.03f;
+
 /** 刷新时低于这个深度的不碰；相机后方的点算不出像素。 */
 constexpr float kRefineMinZ = 0.05f;
 
@@ -1083,6 +1092,8 @@ void refinePinned(Engine& e, ORB_SLAM3::System* sys, const float t_cw[16]) {
 
     const SurfaceDepth sd = surfaceAtPoint(sys, t_cw, p.pw[0], p.pw[1], p.pw[2]);
     if (!sd.ok) return;
+    // 死区内的比值是拟合噪声，改它只会让段长跟着抖；见 kRefineDeadband。
+    if (std::fabs(sd.ratio - 1.0f) <= kRefineDeadband) return;
 
     // 相机系 → 世界：只沿原射线缩放，方向不变。
     Eigen::Matrix3f Rcw;

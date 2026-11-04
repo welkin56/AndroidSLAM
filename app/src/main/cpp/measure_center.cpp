@@ -39,6 +39,31 @@ constexpr float kSurfMinCosInc = 0.3f;      // 入射角 < 72°
 /** 平面深度和锚点自己的深度差超过这个比例，就分不清谁错了，不改。 */
 constexpr float kSurfRelMax = 0.25f;
 
+/**
+ * 选层：先只保留与锚点深度相差这个比例以内的点，再拟合。
+ *
+ * 96 px 窗口在 2 m 处横跨 ±0.6 m，多表面窗口里全量最小二乘会拟出一个谁都不贴的
+ * 「妥协平面」，随后内点剔除把所有点判成外点。必须大于 kSurfRelMax —— 选层筛得比
+ * 最终门控还严时，门控永远轮不到。
+ */
+constexpr float kSurfLayerFrac = 0.30f;
+
+/** 平面修正比的平滑系数，约 0.3/帧。 */
+constexpr float kSurfRatioAlpha = 0.3f;
+
+/** 面修正的统计周期。1 Hz 明细是抽样，算不出成功率，要单独累计。 */
+constexpr long long kSurfStatMs = 5000;
+
+/**
+ * 是否把平面修正真正落到坐标上。false = 只算、只打日志，不改任何深度。
+ *
+ * 三轮真机的结论：门控能过（通过率 40~90%），但修正比自身有 ±2~8% 的散布，
+ * 而中位数 0.993 说明**没有系统偏差可修** —— 用它改 p_kf 等于把平面估计的噪声
+ * 灌进钉点，段长极差从 0.5% 涨到 8~23%。
+ * 在拿到「开/关 + 已知长度」的对照之前，保留观测、不落盘。
+ */
+constexpr bool kSurfaceApply = false;
+
 /** 内参，initIntrinsics / updateIntrinsics 填充；0 表示未读到。 */
 float gFx = 0, gFy = 0, gCx = 0, gCy = 0;
 
@@ -138,8 +163,10 @@ inline float axisAngle(const Eigen::Vector3f& pc) {
 struct PlaneFit {
     float invZ = 0;      // 目标像素处的 1/Z
     Eigen::Vector3f n;   // 平面法向（未归一化，n·X = 1 的 n）
+    int window = 0;      // 窗口内可用点数，选层前
     int inliers = 0;
-    int total = 0;
+    int total = 0;       // 选层后参与拟合的点数，也是「内点过半」的分母
+    int solved = 0;      // 1 = 第一次最小二乘解出来了；0 = 点不够或方程秩亏
     float residual = 0;  // 1/Z 域的相对残差 RMS
     float cosInc = 0;    // 入射角余弦，1 = 正对表面
 };
@@ -149,15 +176,21 @@ struct PlaneFit {
  *
  * 相机系平面 n*X = d 代入 X = Z*(x, y, 1) 后，1/Z 在像素坐标上是仿射的，
  * 所以直接对 1/Z 做最小二乘即可，不需要内参。
+ * refZ > 0 时只保留与它相差 kSurfLayerFrac 以内的点，先收缩到一张面；传 0 表示不选层。
  * 先做一次全量拟合，剔除相对误差大的点后再拟合一次。
  */
 bool fitPlaneAt(const std::vector<cv::KeyPoint>& kps,
                 const std::vector<ORB_SLAM3::MapPoint*>& mps, const Eigen::Matrix4f& Tcw,
-                float u, float v, float radiusPx, PlaneFit* out) {
+                float u, float v, float radiusPx, float refZ, PlaneFit* out) {
     const size_t n = std::min(kps.size(), mps.size());
 
-    std::vector<Eigen::Vector3f> uvz;  // (u, v, 1/Z)
+    // (du, dv, 1/Z)，du/dv 是相对目标像素的偏移。
+    // 用绝对像素建正规方程时法矩阵条件数约 2.6e7（u≈320、v≈240），float 的秩判据
+    // 3·eps·maxpivot 会把最小特征值判成 0，FullPivLU::isInvertible() 直接 false —— 实测
+    // 459 次拟合里 455 次卡在这里，内点恒为 0。平移之后条件数降到 1e3 量级。
+    std::vector<Eigen::Vector3f> uvz;
     uvz.reserve(64);
+    int window = 0;
     for (size_t i = 0; i < n; ++i) {
         ORB_SLAM3::MapPoint* mp = mps[i];
         if (mp == nullptr) continue;
@@ -171,38 +204,46 @@ bool fitPlaneAt(const std::vector<cv::KeyPoint>& kps,
         // GetWorldPos() 内部加锁。
         const float z = (Tcw * mp->GetWorldPos().homogeneous()).z();
         if (z < kMinZ) continue;
+        ++window;
 
-        uvz.emplace_back(kps[i].pt.x, kps[i].pt.y, 1.0f / z);
+        // 选层排在算出 z 之后：它只跟深度有关，而深度要加锁取，放在像素筛后能少拿一批锁。
+        if (refZ > 0.f && std::fabs(z - refZ) > kSurfLayerFrac * refZ) continue;
+
+        uvz.emplace_back(dx, dy, 1.0f / z);
     }
+    // 两个计数都在早退之前赋值，否则拟合失败时日志只剩一句失败，看不出是密度还是选层。
+    out->window = window;
     out->total = static_cast<int>(uvz.size());
     if (uvz.size() < static_cast<size_t>(kMinPlanePoints)) return false;
 
-    // 解 [u v 1] * (a,b,c) = 1/Z 的正规方程；点退化时返回 false。
-    auto fit = [](const std::vector<Eigen::Vector3f>& pts, Eigen::Vector3f* abc) {
-        Eigen::Matrix3f A = Eigen::Matrix3f::Zero();
-        Eigen::Vector3f b = Eigen::Vector3f::Zero();
+    // 解 [du dv 1] * (a,b,c) = 1/Z 的正规方程；点退化时返回 false。
+    // 方程本身用 double：平移之后 float 也够，但稀疏窗口只有 5~8 个点时留一倍余量。
+    auto fit = [](const std::vector<Eigen::Vector3f>& pts, Eigen::Vector3d* abc) {
+        Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+        Eigen::Vector3d b = Eigen::Vector3d::Zero();
         for (const Eigen::Vector3f& p : pts) {
-            const Eigen::Vector3f r(p.x(), p.y(), 1.0f);
+            const Eigen::Vector3d r(p.x(), p.y(), 1.0);
             A += r * r.transpose();
             b += r * p.z();
         }
-        const Eigen::FullPivLU<Eigen::Matrix3f> lu(A);
+        const Eigen::FullPivLU<Eigen::Matrix3d> lu(A);
         if (!lu.isInvertible()) return false;
         *abc = lu.solve(b);
         return true;
     };
 
-    Eigen::Vector3f abc;
+    Eigen::Vector3d abc;
     if (!fit(uvz, &abc)) return false;
+    out->solved = 1;
 
     std::vector<Eigen::Vector3f> inliers;
     inliers.reserve(uvz.size());
-    float sum2 = 0.f;
+    double sum2 = 0.0;
     for (const Eigen::Vector3f& p : uvz) {
-        const float inv = abc.x() * p.x() + abc.y() * p.y() + abc.z();
-        if (inv <= 1e-6f) continue;  // 拟合出负深度，是外点
+        const double inv = abc.x() * p.x() + abc.y() * p.y() + abc.z();
+        if (inv <= 1e-6) continue;  // 拟合出负深度，是外点
         // 相对深度误差；在 1/Z 上计算比在 Z 上更稳定。
-        const float rel = std::fabs(inv - p.z()) / inv;
+        const double rel = std::fabs(inv - p.z()) / inv;
         if (rel > kPlaneRelTol) continue;
         inliers.push_back(p);
         sum2 += rel * rel;
@@ -212,21 +253,24 @@ bool fitPlaneAt(const std::vector<cv::KeyPoint>& kps,
     out->inliers = static_cast<int>(inliers.size());
     out->residual = inliers.empty()
                         ? 0.f
-                        : std::sqrt(sum2 / static_cast<float>(inliers.size()));
+                        : static_cast<float>(std::sqrt(sum2 / static_cast<double>(inliers.size())));
 
     // 内点不过半，邻域里多半有两张面，混合平面的值不可用。
     if (inliers.size() < static_cast<size_t>(kMinPlanePoints) || inliers.size() * 2 < uvz.size())
         return false;
     if (!fit(inliers, &abc)) return false;
 
-    const float inv = abc.x() * u + abc.y() * v + abc.z();
-    if (inv <= 1e-6f) return false;
+    // 相对坐标的原点就是目标像素，所以十字处的 1/Z 直接是常数项。
+    const double inv = abc.z();
+    if (inv <= 1e-6) return false;
 
-    out->invZ = inv;
+    out->invZ = static_cast<float>(inv);
 
-    // 把 1/Z = a*u + b*v + c 还原成平面：1 = a*fx*X + b*fy*Y + (a*cx+b*cy+c)*Z。
-    out->n = Eigen::Vector3f(abc.x() * gFx, abc.y() * gFy,
-                             abc.x() * gCx + abc.y() * gCy + abc.z());
+    // 把 1/Z = a*du + b*dv + c 还原成平面。du = u' − u：
+    // 1 = a*fx*X + b*fy*Y + [a*(cx−u) + b*(cy−v) + c]*Z。
+    out->n = Eigen::Vector3f(static_cast<float>(abc.x() * gFx), static_cast<float>(abc.y() * gFy),
+                             static_cast<float>(abc.x() * (gCx - u) + abc.y() * (gCy - v) +
+                                                 abc.z()));
     if (out->n.norm() > 1e-6f && gFx > 0.f) {
         const Eigen::Vector3f ray((u - gCx) / gFx, (v - gCy) / gFy, 1.0f);
         out->cosInc = std::fabs(out->n.dot(ray)) / (out->n.norm() * ray.norm());
@@ -241,19 +285,69 @@ bool surfaceGated(const PlaneFit& f) {
     return f.cosInc >= kSurfMinCosInc;
 }
 
+/** 两个 tag 既当打印名，也当统计下标。 */
+constexpr int kTagCross = 0;  // 十字
+constexpr int kTagPin = 1;    // 钉点
+
+inline int tagIndex(const char* tag) {
+    return std::strcmp(tag, "钉点") == 0 ? kTagPin : kTagCross;
+}
+inline const char* tagName(int ti) { return ti == kTagPin ? "钉点" : "十字"; }
+
+/** 面修正的分档计数，每 kSurfStatMs 打一行并清零。 */
+struct SurfaceStat {
+    int tries = 0;
+    int pass = 0;
+    int fitFail = 0;  // 拟合失败，含选层后点不够
+    int gated = 0;    // 内点少 / 残差大 / 掠射
+    int far = 0;      // 与锚点差太多
+};
+enum { kSurfPass = 0, kSurfFitFail, kSurfGated, kSurfFar };
+
+// 只在 SLAM 线程上调（centerMeasure 与 surfaceAtPoint 同一条链），不需要加锁。
+SurfaceStat gStat[2];
+
 /**
- * 门控诊断，1 Hz 限流。
+ * 记一次门控结果。
+ *
+ * 1 Hz 明细是抽样，只能看出「过没过」，算不出成功率；这里逐次累计，够一个周期
+ * 才打一行。门控一直不过时，这一行是唯一能说明「卡在哪一档」的东西。
+ */
+void noteSurface(int ti, int outcome) {
+    static long long lastMs[2] = {0, 0};
+    SurfaceStat& s = gStat[ti];
+    ++s.tries;
+    if (outcome == kSurfPass) ++s.pass;
+    else if (outcome == kSurfFitFail) ++s.fitFail;
+    else if (outcome == kSurfGated) ++s.gated;
+    else ++s.far;
+
+    const long long now = monoMs();
+    if (now - lastMs[ti] < kSurfStatMs) return;
+    lastMs[ti] = now;
+    printf("[M6] 面统计[%s] 尝试%d 通过%d(%.0f%%) 拟合失败%d 门控%d 差太多%d\n", tagName(ti),
+           s.tries, s.pass, 100.f * static_cast<float>(s.pass) / static_cast<float>(s.tries),
+           s.fitFail, s.gated, s.far);
+    fflush(stdout);
+    s = SurfaceStat{};
+}
+
+/**
+ * 门控明细，两个 tag 各自 1 Hz 限流。
  *
  * 门没过的时候，四个数里哪个在挡比「过没过」有用得多；拟合失败（点够但不在
  * 一个面上）也要打，否则它静默地什么也不发生，看起来和「全部通过」一样。
+ * 两个 tag 共用一条限流时，调用多的那个会把另一个饿死。
  */
 void logSurface(const PlaneFit& f, const char* tag, const char* why, float z, float zNew) {
-    static long long lastMs = 0;
+    static long long lastMs[2] = {0, 0};
+    const int ti = tagIndex(tag);
     const long long now = monoMs();
-    if (now - lastMs < 1000) return;
-    lastMs = now;
-    printf("[M6] 面[%s] 候选%d 内点%d 残差%.1f%% 入射%.2f 深度%.2f→%.2f %s\n", tag,
-           f.total, f.inliers, f.residual * 100.f, f.cosInc, z, zNew, why);
+    if (now - lastMs[ti] < 1000) return;
+    lastMs[ti] = now;
+    // 窗和层要分开：「候选 12」现在有两种解释（密度不够 / 被选层筛光），一个数说不清。
+    printf("[M6] 面[%s] 窗%d/层%d 内点%d 残差%.1f%% 入射%.2f 深度%.2f→%.2f %s\n", tag,
+           f.window, f.total, f.inliers, f.residual * 100.f, f.cosInc, z, zNew, why);
     fflush(stdout);
 }
 
@@ -267,13 +361,20 @@ bool correctDepth(const std::vector<cv::KeyPoint>& kps,
                   const std::vector<ORB_SLAM3::MapPoint*>& mps, const Eigen::Matrix4f& Tcw,
                   const char* tag, Eigen::Vector3f* pc, SurfaceDepth* st) {
     if (gFx <= 0.f || pc->z() <= kMinZ) return false;
+    const int ti = tagIndex(tag);
 
     const float u = gFx * pc->x() / pc->z() + gCx;
     const float v = gFy * pc->y() / pc->z() + gCy;
 
     PlaneFit f;
-    if (!fitPlaneAt(kps, mps, Tcw, u, v, kSurfRadiusPx, &f)) {
-        logSurface(f, tag, "拟合失败", pc->z(), pc->z());
+    // 以锚点自己的深度选层：要修的就是它，以它为中心才能把修正量关在 ±kSurfLayerFrac 里。
+    if (!fitPlaneAt(kps, mps, Tcw, u, v, kSurfRadiusPx, pc->z(), &f)) {
+        // 三种失败要分开：点不够、方程秩亏、有解但内点不过半 —— 修法完全不同。
+        const char* why = (static_cast<size_t>(f.total) < kMinPlanePoints) ? "点太少"
+                          : !f.solved                                      ? "方程奇异"
+                                                                           : "内点不足";
+        logSurface(f, tag, why, pc->z(), pc->z());
+        noteSurface(ti, kSurfFitFail);
         return false;
     }
 
@@ -288,15 +389,20 @@ bool correctDepth(const std::vector<cv::KeyPoint>& kps,
                           : (f.residual > kSurfMaxResidual) ? "残差大"
                                                             : "掠射";
         logSurface(f, tag, why, pc->z(), pc->z());
+        noteSurface(ti, kSurfGated);
         return false;
     }
     // 差得太多说明平面锁到了别的表面上，那时分不清谁错，宁可不改。
     if (!(k > 0.f) || std::fabs(k - 1.0f) > kSurfRelMax) {
         logSurface(f, tag, "与锚点差太多", pc->z(), pc->z() * k);
+        noteSurface(ti, kSurfFar);
         return false;
     }
 
     logSurface(f, tag, "通过", pc->z(), pc->z() * k);
+    noteSurface(ti, kSurfPass);
+    // 只观测模式：比值已经打进日志，坐标一律不动。
+    if (!kSurfaceApply) return false;
     *pc *= k;
     st->ok = 1;
     st->ratio = k;
@@ -308,7 +414,8 @@ bool planeDepthAt(const std::vector<cv::KeyPoint>& kps,
                   const std::vector<ORB_SLAM3::MapPoint*>& mps, const Eigen::Matrix4f& Tcw,
                   const Center& c, float coneRadiusPx, float* outZ) {
     PlaneFit f;
-    if (!fitPlaneAt(kps, mps, Tcw, c.u, c.v, coneRadiusPx, &f)) return false;
+    // 兜底没有锚点可参照，refZ 传 0 表示不选层，行为与加选层之前一致。
+    if (!fitPlaneAt(kps, mps, Tcw, c.u, c.v, coneRadiusPx, 0.f, &f)) return false;
     *outZ = 1.0f / f.invZ;
     return true;
 }
@@ -419,6 +526,9 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
             std::max(kDepthJumpMin, kDepthJumpGain * std::sqrt(dx * dx + dy * dy + dz * dz));
         if (std::fabs(pc.norm() - st->lastD) > limit) {
             st->locked = nullptr;
+            // 解锁就把修正比放掉，重新锁定时从 1 起，避免套用旧锚点的修正。
+            st->ratioMp = nullptr;
+            st->ratioEma = 1.0f;
             // 跳变过大时直接不给数，也不走平面兜底，避免产生另一个跳变。
             return out;
         }
@@ -478,22 +588,32 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
 
         // 点–面约束：只沿射线改深度，横向（像素）不动。
         // 锁定和跳变判据继续用未修正的 pc，那套状态机不受这里影响。
-        Eigen::Vector3f pcOut = pc;
+        // correctDepth 会就地乘上未平滑的 k，所以用草稿接，值本身丢弃。
+        Eigen::Vector3f pcFit = pc;
         SurfaceDepth sd;
-        const bool corrected = correctDepth(kps, mps, Tcw, "十字", &pcOut, &sd);
-        if (corrected) out.surface = 1;
-        if (corrected) {
-            out.distance = pcOut.norm();  // 斜距
-        } else {
-            out.distance = pc.norm();
+        const bool corrected = correctDepth(kps, mps, Tcw, "十字", &pcFit, &sd);
+
+        // 修正比按锚点平滑：单帧平面深度会抖，硬套上去读数跟着抖。
+        // 换锚点从 1 起，避免把上一点的修正量带到新点上。
+        if (st->ratioMp != mp) {
+            st->ratioMp = mp;
+            st->ratioEma = 1.0f;
         }
-        // 修正过就用修正后的坐标；否则取地图点最新的（环里的 pw 可能已过期）。
+        // 门控没过时目标回到 1：没有本帧证据就慢慢退回未修正，而不是把旧修正一直供着。
+        const float target = corrected ? sd.ratio : 1.0f;
+        st->ratioEma += kSurfRatioAlpha * (target - st->ratioEma);
+
+        const Eigen::Vector3f pcOut = pc * st->ratioEma;
+        out.distance = pcOut.norm();  // 斜距
+        // 和 distance 必须同源，否则界面上的点和数字对不上；
+        // 没有修正时仍取地图点最新坐标（环里的 pw 可能已过期）。
         Eigen::Vector3f pw;
-        if (corrected) {
+        if (std::fabs(st->ratioEma - 1.0f) > 1e-4f) {
             pw = Tcw.block<3, 3>(0, 0).transpose() * pcOut + cam;
         } else {
             pw = mp->GetWorldPos();
         }
+        out.surface = (std::fabs(st->ratioEma - 1.0f) > 0.005f) ? 1 : 0;
         out.wx = pw.x();
         out.wy = pw.y();
         out.wz = pw.z();
@@ -528,6 +648,9 @@ CenterMeasure centerMeasure(ORB_SLAM3::System* sys, int w, int h, const float t_
     // ============ ⑤ 平面兜底 ============
     // 平面结果没有身份，不锁定；也不更新 lastD/lastCam，因为量纲不同。
     st->locked = nullptr;
+    // 同理放掉修正比：兜底这几帧没有锚点，旧修正不该带到下次锁定。
+    st->ratioMp = nullptr;
+    st->ratioEma = 1.0f;
     float z = 0;
     if (planeDepthAt(kps, mps, Tcw, c, kConeFrac * static_cast<float>(w), &z)) {
         out.quality = kFair;  // 兜底结果一律不算「好」

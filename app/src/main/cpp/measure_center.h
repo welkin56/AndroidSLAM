@@ -59,6 +59,10 @@ struct CenterMeasureState {
     /** 深度锁定：上一帧到锁定点的距离，以及上一帧相机世界坐标。 */
     float lastD = 0;
     float lastCam[3] = {0, 0, 0};
+
+    /** 点–面修正比的平滑值；ratioMp 是这串修正属于哪个锚点。换点或解锁时归 1。 */
+    ORB_SLAM3::MapPoint* ratioMp = nullptr;
+    float ratioEma = 1;
 };
 
 /**
@@ -92,7 +96,7 @@ struct SurfaceDepth {
     int ok = 0;          // 1 = 平面通过门控，调用方可以按 ratio 缩放
     float ratio = 1;     // 修正后深度 / 传入点的深度
     int inliers = 0;     // 参与拟合的内点数
-    int total = 0;       // 锥内候选总数
+    int total = 0;       // 选层后参与拟合的点数（无锚点时等于锥内点数）
     float residual = 0;  // 1/Z 域的相对残差 RMS
     float cosInc = 0;    // 入射角余弦，1 = 正对表面
 };
