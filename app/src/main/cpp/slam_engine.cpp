@@ -212,8 +212,6 @@ struct Engine {
     };
     /** 折线。与 measure 共用一把锁；只在主线程读写。 */
     std::vector<Pinned> pinned;
-    /** 下一帧刷新哪个钉点；每帧只刷一个，轮流来。 */
-    int refineCursor = 0;
     /** 上一次段长心跳的时刻，限流用。 */
     long long lenLogAtMs = 0;
 
@@ -511,8 +509,8 @@ bool maybeRestoreMap(Engine& e, ORB_SLAM3::System* sys) {
     return true;
 }
 
-/** 定义在后面（要用测距那片工具函数）。 */
-void refinePinned(Engine& e, ORB_SLAM3::System* sys, const float t_cw[16]);
+/** 段长心跳，定义在后面（要用测距那片工具函数）。 */
+void logSegments(Engine& e, long long now);
 
 // 常驻循环：先构造 System，再持续取帧、跟踪、保存位姿。
 void worker(Engine& e) {
@@ -608,8 +606,11 @@ void worker(Engine& e) {
             publishMeasure(m);
         }
 
-        // 钉点刷新不跟测距开关走：测距关掉之后折线仍然会画。
-        if (r.valid) refinePinned(e, sys, r.t_cw16);
+        // 段长心跳不跟测距开关走：测距关掉之后折线仍然要画。
+        if (r.valid) {
+            std::lock_guard<std::mutex> lk(e.measureMutex);
+            logSegments(e, nowMs());
+        }
 
         // 重置检测每帧都要做。KF 数掉到 0 表示当前图被重置，
         // 坐标系已重新锚定，前一段轨迹不再可用，只保留最后一段。
@@ -873,10 +874,9 @@ void publishMeasure(const CenterMeasure& m) {
                    out.support, out.texture, out.zSpan * 100.0f);
         } else {
             printf("[M6] * %.3f m  世界(%.3f, %.3f, %.3f)  像素(%.1f, %.1f)"
-                   "  候选%d 支持%d 纹理%d 跨度%.0f%%  深度%s  %s 路径%d 质量%d\n",
+                   "  候选%d 支持%d 纹理%d 跨度%.0f%%  %s 路径%d 质量%d\n",
                    out.distance, out.wx, out.wy, out.wz, out.px, out.py,
                    out.candidates, out.support, out.texture, out.zSpan * 100.0f,
-                   out.surface ? "面" : "点",
                    out.source == 1 ? "新选" : "沿用", out.method, out.quality);
         }
         fflush(stdout);
@@ -978,12 +978,6 @@ float dist3(const float* a, const float* b) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-/** 钉点深度刷新的收敛速度：每帧一次，约 0.5 s 爬到新值。 */
-constexpr float kRefineAlpha = 0.15f;
-
-/** 刷新时低于这个深度的不碰；相机后方的点算不出像素。 */
-constexpr float kRefineMinZ = 0.05f;
-
 /**
  * 把钉点坐标刷成锚点关键帧位姿下的最新值。
  *
@@ -1059,46 +1053,6 @@ void logSegments(Engine& e, long long now) {
     fflush(stdout);
 }
 
-/**
- * 用点–面约束刷新一个钉点的深度（SLAM 线程）。每帧只处理一个，轮流来。
- *
- * 只改 p_kf，不动关键帧。EMA 而不是直接赋值：地图本身还在收敛，
- * 刷新目标是动的，直接赋值会让读数跳。
- */
-void refinePinned(Engine& e, ORB_SLAM3::System* sys, const float t_cw[16]) {
-    std::lock_guard<std::mutex> lk(e.measureMutex);
-    logSegments(e, nowMs());
-
-    const int n = static_cast<int>(e.pinned.size());
-    if (n <= 0) return;
-    if (e.refineCursor >= n) e.refineCursor = 0;
-
-    Engine::Pinned& p = e.pinned[e.refineCursor];
-    e.refineCursor = (e.refineCursor + 1) % n;
-    if (p.kf == nullptr || p.kf->isBad()) return;
-
-    refreshPinned(p);
-    const Eigen::Vector3f pc = toCam(t_cw, p.pw);
-    if (pc.z() <= kRefineMinZ) return;
-
-    const SurfaceDepth sd = surfaceAtPoint(sys, t_cw, p.pw[0], p.pw[1], p.pw[2]);
-    if (!sd.ok) return;
-
-    // 相机系 → 世界：只沿原射线缩放，方向不变。
-    Eigen::Matrix3f Rcw;
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) Rcw(r, c) = t_cw[c * 4 + r];
-    }
-    const Eigen::Vector3f tw(t_cw[12], t_cw[13], t_cw[14]);
-    const Eigen::Vector3f cam = -Rcw.transpose() * tw;
-    const Eigen::Vector3f pwNew = Rcw.transpose() * (sd.ratio * pc) + cam;
-
-    const Sophus::SE3f TcwKf = p.kf->GetPose();
-    const Eigen::Vector3f tgt = TcwKf * pwNew;
-    p.p_kf[0] += kRefineAlpha * (tgt.x() - p.p_kf[0]);
-    p.p_kf[1] += kRefineAlpha * (tgt.y() - p.p_kf[1]);
-    p.p_kf[2] += kRefineAlpha * (tgt.z() - p.p_kf[2]);
-}
 }  // namespace
 
 bool addPinned(int snapTo) {
@@ -1121,6 +1075,9 @@ bool addPinned(int snapTo) {
         p.low = src.low;
     } else {
         if (e.measure.quality == kNone) return false;  // 没读数就没什么可钉的
+        // 兜底读数没有地图点身份，坐标是按主点视线估算的；
+        // 钉下去等于把平面误差带进段长，而段长要的是厘米级。
+        if (e.measure.method != 1 || e.measure.mp == nullptr) return false;
         p.mp = e.measure.mp;
         p.pw[0] = e.measure.wx;
         p.pw[1] = e.measure.wy;
@@ -1184,7 +1141,6 @@ void clearPinned() {
         if (std::find(kfs.begin(), kfs.end(), p.kf) == kfs.end()) kfs.push_back(p.kf);
     }
     e.pinned.clear();
-    e.refineCursor = 0;
     int stale = 0;
     for (ORB_SLAM3::KeyFrame* kf : kfs) {
         // 同 releaseKfIfUnused：图被重置后 mpMap 是 NULL，SetErase 会崩。

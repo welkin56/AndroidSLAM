@@ -1276,7 +1276,13 @@ class MainActivity : AppCompatActivity() {
                 break
             }
         }
-        if (SlamBridge.nativeAddPinned(snapTo)) refreshPinned()
+        if (SlamBridge.nativeAddPinned(snapTo)) {
+            refreshPinned()
+        } else {
+            // 兜底读数没有地图点身份，钉下去会把平面估计的误差带进段长。
+            transientMsg = "钉不上：当前读数没有地图点身份，等十字锁到地图点再按"
+            transientUntil = SystemClock.elapsedRealtime() + 3000
+        }
     }
 
     /**
