@@ -43,7 +43,8 @@ Android 上的单目惯性 SLAM 实时测距 App。
 4. **未做已知长度校准**。需要一个固定尺寸的基准物，属于产品决定 —— 这是限制 1 的解法。
 5. **只在单机型上验证**（arm64-v8a）。内置的内参与 IMU 噪声是开发者这台机器的值，
    换机型不重标也能跑，但测距读数不可信 —— 需要重走一次标定（内参 + IMU 噪声）。
-6. **词袋 `ORBvoc.txt` 145 MB 不进 APK**，需要单独推到设备，见构建步骤。
+6. **词袋 `ORBvoc.txt` 145 MB 不进源码仓库**。debug 包要单独推送到设备（见构建步骤）；
+   release 包内置，首次启动自动解压到应用私有目录。
 
 ## 技术栈
 
@@ -82,16 +83,25 @@ cd <repo> && ./tools/setup-boost-android.sh
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### 推词袋
+### 词袋
 
-`ORBvoc.txt`（145 MB）不进 APK。先从 ORB-SLAM3 官方仓库的 `Vocabulary/` 取到，
-放到脚本期望的位置后：
+`ORBvoc.txt`（139 MB）不进 git。先从 ORB-SLAM3 官方仓库的 `Vocabulary/` 取到，
+然后用下面两种方式之一：
+
+**debug 包：推到设备**
 
 ```bash
 ./tools/push-vocab.sh
 ```
 
-不推的话 App 启动时会明确提示「跑一次 tools/push-vocab.sh」。
+**release 包：打进 APK**
+
+```bash
+./tools/prepare-release-vocab.sh   # 复制到 app/src/release/assets/（不进 git）
+```
+
+打出的 release 包首次启动会把词袋解压到 `files/` 下（约 5 秒，只做一次），
+之后启动不再需要这一步。四处都没有时会明确提示缺什么。
 
 ## 目录结构
 
@@ -118,7 +128,8 @@ docs/
 tools/
   calibration/         标定与验证脚本（Python）
   setup-boost-android.sh
-  push-vocab.sh
+  push-vocab.sh        debug：把词袋推到设备
+  prepare-release-vocab.sh  release：把词袋复制进 assets
 ```
 
 ## 文档

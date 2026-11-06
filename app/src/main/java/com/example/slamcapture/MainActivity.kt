@@ -60,6 +60,9 @@ class MainActivity : AppCompatActivity() {
         private const val VOCAB_NAME = "ORBvoc.txt"
         private const val SETTINGS_NAME = "phone.yaml"
 
+        /** 解压词袋时每写这么多字节刷一次界面，免得每 1 MB 都重排一次。 */
+        private const val VOCAB_REFRESH_BYTES = 8L shl 20
+
         // SlamBridge.nativeState() 的取值，和 C++ 侧 slam::State 一一对应。
         private const val SLAM_IDLE = 0
         private const val SLAM_LOADING = 1
@@ -188,6 +191,13 @@ class MainActivity : AppCompatActivity() {
     /** C++ 侧 System 状态。只在主线程写。 */
     private var slamState = SLAM_IDLE
     private var slamElapsedMs = 0L
+
+    /** 正在把词袋从 assets 解压到外部目录（只有 release 包第一次启动才会走）。 */
+    private var vocabPreparing = false
+
+    /** 已解压字节数。解压线程写、主线程读。 */
+    @Volatile
+    private var vocabUnpacked = 0L
 
     /**
      * 是否正在吃帧：相机和 IMU 已打开，且已调用 nativeStart()。
@@ -766,11 +776,95 @@ class MainActivity : AppCompatActivity() {
         }
 
         // —— 第一次：构造 System ——
-        val vocab = resolveVocabPath() ?: return
+        // 词袋可能还要先从 assets 解压出来，那一步异步，成功后自己接上构造。
+        ensureVocabThenStart()
+    }
+
+    /**
+     * 词袋就绪后构造 System。
+     *
+     * release 包把词袋放进了 assets，第一次启动要解压 139 MB 到外部文件目录：
+     * DBoW2 的 loadFromTextFile 只接受文件路径，喂不了 assets 流；而 139 MB 的
+     * 复制放主线程会 ANR，所以转后台，完成后回主线程接着构造。
+     */
+    private fun ensureVocabThenStart() {
+        val dst = File(getExternalFilesDir(null) ?: filesDir, VOCAB_NAME)
+        if (dst.isFile && dst.length() > 0 && dst.canRead()) {
+            startSystem(dst.absolutePath)
+            return
+        }
+
+        // push 脚本推的路径就是这里，所以打包过的包同样认这个文件，不必分两条路。
+        if (assets.list("")?.contains(VOCAB_NAME) != true) {
+            refuse("词袋", dst) {
+                "这个 APK 没打包词袋，跑一次 tools/push-vocab.sh 把它推上来（139 MB）。"
+            }
+            return
+        }
+
+        vocabPreparing = true
+        vocabUnpacked = 0
+        slamState = SLAM_LOADING
+        render()
+
+        Thread {
+            val err = unpackVocab(dst)
+            uiHandler.post {
+                vocabPreparing = false
+                // 页面已经走了就不再构造 System：文件留着，下次点按钮直接走快速路径。
+                // slamState 一起查，是防以后有别的路径在解压中间改了状态。
+                if (isFinishing || isDestroyed || slamState != SLAM_LOADING) return@post
+                if (err != null) {
+                    slamState = SLAM_FAILED
+                    uiMessage = "解压词袋失败：$err"
+                    render()
+                } else {
+                    startSystem(dst.absolutePath)
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * 从 assets 解压词袋。先写 `.part` 再改名：中途被杀不会留下一个长度不对的
+     * ORBvoc.txt —— 那种文件会被下次启动当成可用，直接交给 ORB-SLAM3 崩在里面。
+     */
+    private fun unpackVocab(dst: File): String? {
+        val part = File(dst.parentFile, "$VOCAB_NAME.part")
+        try {
+            assets.open(VOCAB_NAME).use { input ->
+                part.outputStream().use { out ->
+                    val buf = ByteArray(1 shl 20)
+                    var total = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        val prev = total
+                        total += n
+                        vocabUnpacked = total
+                        if (total / VOCAB_REFRESH_BYTES != prev / VOCAB_REFRESH_BYTES) {
+                            uiHandler.post { if (!isFinishing && !isDestroyed) render() }
+                        }
+                    }
+                }
+            }
+            if (!part.renameTo(dst)) return "改名为 ${dst.name} 失败"
+            Log.i(TAG, "词袋解压完成 ${dst.length()} 字节 → ${dst.absolutePath}")
+            return null
+        } catch (e: Throwable) {
+            part.delete()
+            Log.e(TAG, "解压词袋失败", e)
+            return e.message ?: e.toString()
+        }
+    }
+
+    /** 词袋已就绪，构造 System。 */
+    private fun startSystem(vocabPath: String) {
         val settings = resolveSettingsPath() ?: return
         // 选了图就把路径一路传下去。C++ 那边还不支持载入旧图（会打一行「收到但没实现」），
         // 但通道先通着，免得等到 M8 才发现送不过去。
-        SlamBridge.nativeInit(vocab, settings, mapFile)
+        SlamBridge.nativeInit(vocabPath, settings, mapFile)
         slamState = SlamBridge.nativeState()   // 正常是 kLoading
         render()
         uiQueueTicker()
@@ -1315,7 +1409,7 @@ class MainActivity : AppCompatActivity() {
             (slamRunning || slamState == SLAM_IDLE || slamState == SLAM_READY) && !restoring
         btnSlam.text = when {
             // 加载中 / 构造失败优先：换源请求这会儿还没轮到（失败的话永远不会轮到）。
-            slamState == SLAM_LOADING -> "加载中…"
+            slamState == SLAM_LOADING -> if (vocabPreparing) "准备中…" else "加载中…"
             slamState == SLAM_FAILED -> "构造失败"
             restoring -> "载入地图…"
             slamRunning -> "结束"
@@ -1437,7 +1531,11 @@ class MainActivity : AppCompatActivity() {
             transientMsg != null && now < transientUntil -> transientMsg
             wpMsg != null -> wpMsg
             slamState == SLAM_LOADING ->
-                "词袋加载中…已 ${slamElapsedMs / 1000} 秒"
+                if (vocabPreparing) {
+                    "正在解压词袋… 已写 ${vocabUnpacked / 1048576} MB（首次启动一次性）"
+                } else {
+                    "词袋加载中…已 ${slamElapsedMs / 1000} 秒"
+                }
             slamState == SLAM_FAILED ->
                 if (SlamBridge.nativeFailureCode() == 1) {
                     "载图失败 —— 这张图读不了，回入口页换一张或新建"
@@ -2296,16 +2394,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------- 文件 ----------------
-
-    /**
-     * 词袋路径。文件未打入 APK，需要推送到外部文件目录。
-     * 返回 null 表示状态栏已显示提示，调用方不应继续调用 nativeInit。
-     */
-    private fun resolveVocabPath(): String? {
-        val f = File(getExternalFilesDir(null) ?: filesDir, VOCAB_NAME)
-        return f.takeIf { it.isFile && it.length() > 0 && it.canRead() }?.absolutePath
-            ?: refuse("词袋", f) { "跑一次 tools/push-vocab.sh 把它推上来（145 MB，不进 APK）。" }
-    }
 
     /**
      * yaml 路径。模板来自 assets，只替换相机–IMU 外参和 IMU 频率；

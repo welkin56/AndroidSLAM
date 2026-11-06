@@ -9,6 +9,11 @@ git 记的是「结果」，这里记的是「为什么」，以及**考虑过�
 
 ## 2026-11
 
+- [2026-11-06 release 内置词袋并配置签名](2026-11-06-release-vocab-and-signing.md)
+  —— 词袋走 release 专用 assets（`src/release/assets`，不进 git），首次启动解压到
+  `files/`，之后不再需要 adb 推；`signingConfigs.release` 从 `keystore.properties` 读材料，
+  文件缺失时仍能构建（产 unsigned 包），debug 不受影响。`mergeReleaseAssets` 加前置校验，
+  忘放词袋会直接报错而不是静默产出坏包。**未验证**（本机无法编译）。
 - [2026-11-05 IMU 噪声标定搬进 App：静置录一段，当场算 Allan 方差](2026-11-05-imu-allan-ondevice.md)
   —— 这是最后一个还依赖 PC 的标定项。新建 `ImuCalibActivity`（不碰相机），Kotlin 实现
   overlapping Allan 方差与幂律拟合，四个噪声密度写进 `profile.json` 并注入运行中的 SLAM。

@@ -28,5 +28,15 @@ app/src/main/cpp/thirdparty/OpenCV-android-sdk/
 # 系统垃圾
 .DS_Store
 
+# 签名材料
+*.jks
+*.keystore
+keystore.properties
+
+# release 专用词袋（139 MB）。由 tools/prepare-release-vocab.sh 从
+# ORB_SLAM3/Vocabulary/ 复制进来，只影响打包，不进版本库。
+/app/src/release/assets/ORBvoc.txt
+/app/src/release/assets/ORBvoc.txt.part
+
 /.vscode/
 /*.sh
