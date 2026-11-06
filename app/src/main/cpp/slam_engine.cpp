@@ -747,6 +747,26 @@ void setIntrinsics(float fx, float fy, float cx, float cy,
     fflush(stdout);
 }
 
+bool setImuNoise(float ng, float na, float ngw, float naw) {
+    Engine& e = engine();
+    ORB_SLAM3::System* sys = e.sys.load();
+    if (sys == nullptr) {
+        printf("[IMU] 噪声注入：System 还没构造好，忽略\n");
+        fflush(stdout);
+        return false;
+    }
+    if (e.running.load()) {
+        // 预积分在跑起来之后按帧读 Cov，中途改会让同一趟里前后协方差不一致。
+        printf("[IMU] 噪声注入在吃帧状态下被调用，忽略\n");
+        fflush(stdout);
+        return false;
+    }
+    sys->SetImuNoise(ng, na, ngw, naw);
+    printf("[IMU] 噪声注入 ng=%.3e na=%.3e ngw=%.3e naw=%.3e\n", ng, na, ngw, naw);
+    fflush(stdout);
+    return true;
+}
+
 void start() {
     Engine& e = engine();
     // 新一趟：让 worker 在第一帧把时间轴接在上一趟后面，避免触发跳变守卫。

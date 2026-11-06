@@ -42,6 +42,29 @@ data class CalibRow(
     val date: String = "",
 )
 
+/**
+ * 一次 Allan 方差标定得到的 IMU 噪声。
+ *
+ * 四个噪声密度是**连续量**（每 √Hz），单位和 `phone.yaml` 注释一致，进 native 前才乘除 √freq。
+ * [walkUpdated] 为 false 时两个 walk 字段存的是**当前生效值**（从 yaml 读出来的），不是本次测的——
+ * 游走项要 1 小时以上的数据才标得出来，短录制保留原值。
+ */
+data class ImuNoise(
+    val noiseGyro: Double,
+    val noiseAcc: Double,
+    val gyroWalk: Double,
+    val accWalk: Double,
+    val walkUpdated: Boolean = false,
+    val samples: Int = 0,
+    val durationS: Double = 0.0,
+    val rateHz: Double = 0.0,
+    val stillRatio: Double = 1.0,
+    val gapRatio: Double = 0.0,
+    /** ok | rough | bad，取四个维度里最差的一档。 */
+    val quality: String = "ok",
+    val recorded: String = "",
+)
+
 /** 一台设备 + 一个输出分辨率的内参表。行按 [CalibRow.d] 升序。 */
 data class CalibProfile(
     val model: String,
@@ -49,6 +72,8 @@ data class CalibProfile(
     val sensorOrientation: Int,
     val imuFrequency: Float,
     val rows: List<CalibRow>,
+    /** 旧文件没有这一段，读出来是 null。 */
+    val imuNoise: ImuNoise? = null,
 )
 
 /**
@@ -83,6 +108,8 @@ object CalibStore {
                 sensorOrientation = o.optInt("sensor_orientation", 0),
                 imuFrequency = o.optDouble("imu_frequency_hz", 0.0).toFloat(),
                 rows = rows,
+                // 旧文件没有这个键：optJSONObject 返回 null，不会抛。
+                imuNoise = o.optJSONObject("imu_noise")?.let(::noiseFromJson),
             )
         } catch (e: Exception) {
             Log.e(TAG, "读 profile 失败：${f.absolutePath}", e)
@@ -97,12 +124,14 @@ object CalibStore {
             val arr = JSONArray()
             p.rows.sortedBy { it.d }.forEach { arr.put(rowToJson(it)) }
             val o = JSONObject()
-                .put("version", 1)
+                .put("version", 2)
                 .put("model", p.model)
                 .put("camera_id", p.cameraId)
                 .put("sensor_orientation", p.sensorOrientation)
                 .put("imu_frequency_hz", p.imuFrequency.toDouble())
                 .put("rows", arr)
+            // 没标过就整键不写：让「没有」和「标过」在磁盘上可区分。
+            p.imuNoise?.let { o.put("imu_noise", noiseToJson(it)) }
             f.writeText(o.toString(2))
             Log.i(TAG, "写入 profile：${f.absolutePath}（${p.rows.size} 行）")
             true
@@ -137,6 +166,35 @@ object CalibStore {
         rms = o.optDouble("rms", 0.0).toFloat(),
         views = o.optInt("views", 0),
         date = o.optString("date", ""),
+    )
+
+    private fun noiseToJson(n: ImuNoise) = JSONObject()
+        .put("noise_gyro", n.noiseGyro)
+        .put("noise_acc", n.noiseAcc)
+        .put("gyro_walk", n.gyroWalk)
+        .put("acc_walk", n.accWalk)
+        .put("walk_updated", n.walkUpdated)
+        .put("samples", n.samples)
+        .put("duration_s", n.durationS)
+        .put("rate_hz", n.rateHz)
+        .put("still_ratio", n.stillRatio)
+        .put("gap_ratio", n.gapRatio)
+        .put("quality", n.quality)
+        .put("recorded", n.recorded)
+
+    private fun noiseFromJson(o: JSONObject) = ImuNoise(
+        noiseGyro = o.optDouble("noise_gyro", 0.0),
+        noiseAcc = o.optDouble("noise_acc", 0.0),
+        gyroWalk = o.optDouble("gyro_walk", 0.0),
+        accWalk = o.optDouble("acc_walk", 0.0),
+        walkUpdated = o.optBoolean("walk_updated", false),
+        samples = o.optInt("samples", 0),
+        durationS = o.optDouble("duration_s", 0.0),
+        rateHz = o.optDouble("rate_hz", 0.0),
+        stillRatio = o.optDouble("still_ratio", 1.0),
+        gapRatio = o.optDouble("gap_ratio", 0.0),
+        quality = o.optString("quality", "ok"),
+        recorded = o.optString("recorded", ""),
     )
 
     // ---------------- 插值 ----------------
@@ -296,7 +354,8 @@ object CalibStore {
         else -> "未标定"
     }
 
-    private fun stamp(): String =
+    /** 到分钟的时间戳，profile.json 的 date / recorded 字段都用它。 */
+    fun stamp(): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date())
 
     /** 没有屈光度信息时的占位档位（1 m）。 */

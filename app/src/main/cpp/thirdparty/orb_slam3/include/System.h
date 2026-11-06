@@ -142,6 +142,12 @@ public:
     void SetCameraIntrinsics(float fx, float fy, float cx, float cy,
                              float k1, float k2, float p1, float p2);
 
+    /**
+     * add：替换 IMU 噪声密度（连续量，每 √Hz，与 yaml 同单位）。
+     * 与 SetCameraIntrinsics 同一前置条件：只在没有帧在跑时调用。
+     */
+    void SetImuNoise(float ng, float na, float ngw, float naw);
+
     // add：ResetActiveMap 原地清空当前图，Map::mnId 不变，
     // 因此关键帧数降到 0 是「发生过重置」的唯一外部信号。
     unsigned long KeyFramesInMap() { return mpAtlas->KeyFramesInMap(); }

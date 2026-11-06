@@ -50,6 +50,20 @@
         app:iconSize="20dp"
         app:iconTint="?attr/colorOnPrimary" />
 
+    <!-- 排在档位按钮下面、用 tonal 样式：它和「新建档位」是两件事 ——
+         一个按屈光度存内参，一个和屈光度无关、全局只有一份。 -->
+    <Button
+        android:id="@+id/btnImuCalib"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="20dp"
+        android:text="IMU 噪声标定"
+        android:textSize="14sp"
+        app:cornerRadius="16dp" />
+
     <!--
       分区标题 + 排序控件同一行。点已选中的那颗 = 翻转方向，点另一颗 = 换排序键。
       方向只标在选中的那颗上，两颗都带箭头会让人以为它们各自有方向。

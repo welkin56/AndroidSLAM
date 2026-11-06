@@ -525,6 +525,11 @@ void System::SetCameraIntrinsics(float fx, float fy, float cx, float cy,
     mpTracker->SetCameraIntrinsics(fx, fy, cx, cy, k1, k2, p1, p2);
 }
 
+void System::SetImuNoise(float ng, float na, float ngw, float naw)
+{
+    mpTracker->SetImuNoise(ng, na, ngw, naw);
+}
+
 void System::Shutdown()
 {
     {

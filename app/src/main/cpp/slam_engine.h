@@ -45,6 +45,12 @@ void pushImu(long long tsNs, float wx, float wy, float wz,
 void setIntrinsics(float fx, float fy, float cx, float cy,
                    float k1, float k2, float p1, float p2);
 
+/**
+ * 注入 IMU 噪声密度（主线程调），与 setIntrinsics 同一前置条件：只在 start() 之前。
+ * 返回 false 表示 System 没构造好或正在吃帧，调用方决定要不要提示。
+ */
+bool setImuNoise(float ng, float na, float ngw, float naw);
+
 /** 开始吃帧，不销毁 System。 */
 void start();
 

@@ -2322,13 +2322,13 @@ class MainActivity : AppCompatActivity() {
         cameraId = info.first
         sensorOrientation = info.second
 
-        val imuFreq = CalibStore.load(this)?.imuFrequency?.takeIf { it > 0f }
-            ?: IMU_FREQ_FALLBACK
+        val prof = CalibStore.load(this)
+        val imuFreq = prof?.imuFrequency?.takeIf { it > 0f } ?: IMU_FREQ_FALLBACK
         try {
             val template = assets.open(SETTINGS_NAME).bufferedReader().use { it.readText() }
             val text = buildString {
                 append(SettingsTemplate.patch(
-                    template, SettingsTemplate.tbc(sensorOrientation), imuFreq))
+                    template, SettingsTemplate.tbc(sensorOrientation), imuFreq, prof?.imuNoise))
                 // 选择旧图时补充路径。System 构造时读取该键，载图只在那一刻生效；
                 // 值不带 .osa，上游会自行追加。
                 mapFile?.let { append("\nSystem.LoadAtlasFromFile: \"${it.removeSuffix(".osa")}\"\n") }

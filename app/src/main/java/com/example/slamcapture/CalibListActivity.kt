@@ -73,6 +73,10 @@ class CalibListActivity : AppCompatActivity() {
             Log.i(TAG, "进标定采集页")
             startActivity(Intent(this, CalibActivity::class.java))
         }
+        findViewById<Button>(R.id.btnImuCalib).setOnClickListener {
+            Log.i(TAG, "进 IMU 噪声标定页")
+            startActivity(Intent(this, ImuCalibActivity::class.java))
+        }
 
         render()
     }

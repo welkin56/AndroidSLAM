@@ -90,6 +90,11 @@ public:
     void SetCameraIntrinsics(float fx, float fy, float cx, float cy,
                              float k1, float k2, float p1, float p2);
 
+    // add：替换 IMU 噪声密度（连续量，每 √Hz），不经过 yaml。
+    // 与 SetCameraIntrinsics 同一前置条件：只在没有帧处理时调用。
+    // 改的是 mpImuCalib，下一帧 new Frame(..., *mpImuCalib) 才拿到新值；已有的帧不回改。
+    void SetImuNoise(float ng, float na, float ngw, float naw);
+
     // Use this function if you have deactivated local mapping and you only want to localize the camera.
     void InformOnlyTracking(const bool &flag);
 

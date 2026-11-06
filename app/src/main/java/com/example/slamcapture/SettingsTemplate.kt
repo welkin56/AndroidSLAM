@@ -36,10 +36,17 @@ object SettingsTemplate {
     }
 
     /**
-     * 替换模板里的 `IMU.T_b_c1` 数据块和 `IMU.Frequency`，其余原样保留（注释也在）。
-     * 找不到对应块时返回原文本 —— 宁可沿用模板，也不要生成一份坏的 yaml。
+     * 替换模板里的 `IMU.T_b_c1` 数据块、`IMU.Frequency`，以及（有标定值时）四个噪声键。
+     * 其余原样保留（注释也在）。找不到对应块时返回原文本 —— 宁可沿用模板，也不要生成一份坏的 yaml。
+     *
+     * [noise] 为 null 时四个噪声键一字不动：没标过就用模板值。
      */
-    fun patch(template: String, tbc: FloatArray, imuFrequency: Float): String {
+    fun patch(
+        template: String,
+        tbc: FloatArray,
+        imuFrequency: Float,
+        noise: ImuNoise? = null,
+    ): String {
         val out = template.lines().toMutableList()
 
         val head = out.indexOfFirst { it.startsWith("IMU.T_b_c1:") }
@@ -64,11 +71,59 @@ object SettingsTemplate {
             }
         }
 
-        for (i in out.indices) {
-            if (out[i].startsWith("IMU.Frequency:")) {
-                out[i] = "IMU.Frequency: " + String.format(Locale.US, "%.1f", imuFrequency)
-            }
-        }
+        replaceValue(out, "IMU.Frequency", String.format(Locale.US, "%.1f", imuFrequency))
+        noise?.let { writeNoise(out, it) }
         return out.joinToString("\n")
+    }
+
+    /** 只替换 `key:` 后面的数值，行尾的 `# 注释` 保持不动。找不到该键就什么都不做。 */
+    private fun replaceValue(lines: MutableList<String>, key: String, value: String) {
+        for (i in lines.indices) {
+            if (!lines[i].startsWith("$key:")) continue
+            val hashAt = lines[i].indexOf('#')
+            val tail = if (hashAt >= 0) "   " + lines[i].substring(hashAt) else ""
+            lines[i] = "$key: $value$tail"
+            return
+        }
+    }
+
+    /**
+     * 四个噪声键整行重写，注释跟着值一起换。
+     *
+     * 不保留模板里的旧注释：那上面写着上一次标定的日期和三轴均值，值换了注释不换，
+     * 读到的人会以为这行还是那次的结果。
+     */
+    private fun writeNoise(lines: MutableList<String>, n: ImuNoise) {
+        val day = n.recorded.take(10).ifEmpty { "未知日期" }
+        val from = "App Allan 标定 $day"
+        setNoiseLine(
+            lines, "IMU.NoiseGyro", n.noiseGyro, "rad/s/√Hz",
+            String.format(Locale.US, "%s（本次实测 %.3e）", from, n.noiseGyro),
+        )
+        setNoiseLine(
+            lines, "IMU.NoiseAcc", n.noiseAcc, "m/s²/√Hz",
+            String.format(Locale.US, "%s（本次实测 %.3e）", from, n.noiseAcc),
+        )
+        // 游走项只在本次真测出来时才换。短录制的曲线停在平顶段，
+        // 那时换算出的 K 取决于窗口位置，写进去等于编一个数。
+        if (n.walkUpdated) {
+            setNoiseLine(lines, "IMU.GyroWalk", n.gyroWalk, "rad/s²/√Hz", "$from（本次实测）")
+            setNoiseLine(lines, "IMU.AccWalk", n.accWalk, "m/s³/√Hz", "$from（本次实测）")
+        }
+    }
+
+    /** 整行替换；[value] 非有限或 ≤ 0 时跳过，避免写出 inf/0 让惯性初始化卡住。 */
+    private fun setNoiseLine(
+        lines: MutableList<String>,
+        key: String,
+        value: Double,
+        unit: String,
+        note: String,
+    ) {
+        if (!value.isFinite() || value <= 0.0) return
+        val idx = lines.indexOfFirst { it.startsWith("$key:") }
+        if (idx < 0) return
+        val text = String.format(Locale.US, "%s: %.3e", key, value)
+        lines[idx] = String.format(Locale.US, "%-28s# %-12s %s", text, unit, note).trimEnd()
     }
 }

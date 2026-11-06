@@ -64,6 +64,15 @@
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- IMU 噪声标定：不碰相机，只收 IMU。configChanges 是为了录制中转动屏幕
+             不会重建 Activity —— 数据只在内存里，重建就全丢了。 -->
+        <activity
+            android:name=".ImuCalibActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- 标定板要能发到别的设备/打印店，走 FileProvider 给一张 PNG。 -->
         <provider
             android:name="androidx.core.content.FileProvider"

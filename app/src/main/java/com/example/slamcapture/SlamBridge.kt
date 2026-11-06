@@ -48,6 +48,14 @@ object SlamBridge {
     external fun nativeSetIntrinsics(fx: Float, fy: Float, cx: Float, cy: Float,
                                      k1: Float, k2: Float, p1: Float, p2: Float)
 
+    /**
+     * 注入 IMU 噪声密度（连续量，每 √Hz，与 yaml 同单位）。
+     *
+     * 与 [nativeSetIntrinsics] 同一前置条件：只在没吃帧时生效。返回 false 表示当前没有
+     * 已构造的 SLAM 或正在跑，此时只靠下次冷启动读 settings.yaml 生效。
+     */
+    external fun nativeSetImuNoise(ng: Float, na: Float, ngw: Float, naw: Float): Boolean
+
     // ---------------- 棋盘格标定 ----------------
     //
     // 采集是分步引导的：每一步先 probe 看当前帧的板子四边形，上层判定姿势对上了再 commit。

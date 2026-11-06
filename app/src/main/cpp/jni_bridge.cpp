@@ -126,6 +126,18 @@ Java_com_example_slamcapture_SlamBridge_nativeSetIntrinsics(
     }
 }
 
+// 同上：只在没吃帧时生效，返回 false 表示没送进去。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_slamcapture_SlamBridge_nativeSetImuNoise(
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jfloat ng, jfloat na, jfloat ngw, jfloat naw) {
+    try {
+        return slam::setImuNoise(ng, na, ngw, naw) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
 // ---------------- 棋盘格标定 ----------------
 
 extern "C" JNIEXPORT jboolean JNICALL

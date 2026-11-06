@@ -4087,6 +4087,20 @@ void Tracking::SetCameraIntrinsics(float fx, float fy, float cx, float cy,
     Frame::mbInitialComputations = true;
 }
 
+void Tracking::SetImuNoise(float ng, float na, float ngw, float naw)
+{
+    if (!mpImuCalib) return;
+
+    // 与 newParameterLoader 同一套换算：yaml 填的是连续密度，Preintegrated 要的是每采样方差。
+    // 频率取 Tracking 自己的 mImuFreq，不在这里传 —— 否则和构造期那次换算会对不上。
+    const float sf = sqrt(mImuFreq);
+    const Sophus::SE3f Tbc = mpImuCalib->mTbc;  // Calib::Set 会用入参重算 Tcb，先取副本
+    mpImuCalib->Set(Tbc, ng * sf, na * sf, ngw / sf, naw / sf);
+
+    cout << "[IMU] 噪声已更新 Ng=" << ng << " Na=" << na
+         << " Ngw=" << ngw << " Naw=" << naw << " (sf=" << sf << ")" << endl;
+}
+
 void Tracking::InformOnlyTracking(const bool &flag)
 {
     mbOnlyTracking = flag;

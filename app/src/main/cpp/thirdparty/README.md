@@ -186,14 +186,18 @@ pKFi->mpImuPreintegrated->SetNewBias(...);                        // ← 然后�
 | `8a6d6bc` | `include/Map.h`、`src/Map.cc` | `std::atomic<float> mMetricScale` + `GetMetricScale()`；`ApplyScaledRotation()` 末尾 `*= s` | 钉点不知道整图被缩放过，`p_kf` 不重标 → 标记脱面、两点朝不同方向散开 |
 | `d731780` | `src/Tracking.cc` | 匿名命名空间加 `kWeakInliers` / `kWeakHoldS`；`NeedNewKeyFrame()` 加「弱帧推迟 / 丢失不立锚」两档；`CreateNewKeyFrame()` 末加 `[KF]` 日志 | 又变回「跟踪一变弱就补一张关键帧」，锚点落在最不可信的帧上 |
 | `661d3ed` | `src/KeyFrame.cc` | `SetBadFlag()` 的 `mbNotErase` 分支首次命中时打一行 `[KF] 保护命中 KF=N` | 只是少一行诊断，不影响行为；但 `mbToBeErased` 就没有外部观测手段了 |
+| 待提交 | `include/System.h`、`src/System.cc`<br>`include/Tracking.h`、`src/Tracking.cc` | `System::SetImuNoise()` → `Tracking::SetImuNoise()`：运行期用 `IMU::Calib::Set()` 重写 `mpImuCalib` 的四项噪声协方差。`sf = √mImuFreq` 取 Tracking 自己那份，不由调用方传 | App 内标定的噪声只在下次冷启动读 yaml 时生效；标定页当场算出的值和正在跑的那份会对不上。上行 `SetCameraIntrinsics` 是同一模式 |
 
-三条注意：
+四条注意：
 
 - `d731780` 和 `fa7157b` 都改了 `Tracking.cc`，**顺序有依赖** —— 前者插在 `NeedNewKeyFrame()` 里，
   后者在文件末尾加方法，重放时先 `fa7157b` 再 `d731780` 冲突最少。
 - `8a6d6bc` 的 `mMetricScale` **没有进 `Map::serialize`**。存图/载图后它回到 1，
   而钉点记的 `sAtPin` 可能是别的值 → 比值算成垃圾。现在的规避方式是
   `maybeRestoreMap` 里清空折线，**这个前提不能去掉**。
+- `SetImuNoise` 只对**之后的帧**生效：`mpImuCalib` 是裸指针，但 `Frame::mImuCalib` 是值拷贝
+  （`Frame.cc:62`），已有 Frame / KeyFrame 和已经建好的 `IMU::Preintegrated` 都不回溯。
+  上游另有 `Settings` 无 setter、只在 `System` 构造期读一次，所以「立即生效」只能靠这条路径。
 - 升级前先 `git log --oneline -- app/src/main/cpp/thirdparty` 对一遍，比这张表可靠。
 
 ## 许可证
