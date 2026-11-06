@@ -1,13 +1,15 @@
-# SLAMAPP — 工作约定
+# SLAMAPP — 开发约定
 
-自用 Android SLAM 测距 App。**这份是给我（Claude）看的操作约定**，不是教程。
-教程在 [docs/tutorial/ANDROID_SLAM_TUTORIAL.md](docs/tutorial/ANDROID_SLAM_TUTORIAL.md)。
+Android 单目惯性 SLAM 测距 App。这份文件记录这个项目的开发约定 —— **写给人看，也写给
+AI 助手看**。
+
+背景与架构见 [docs/tutorial/ANDROID_SLAM_TUTORIAL.md](docs/tutorial/ANDROID_SLAM_TUTORIAL.md)。
 
 ---
 
 ## 一、每次改动后必须写改动记录
 
-**在向用户报告「做完了」之前**，先在 `docs/changes/` 下写一份。
+**提交之前**，先在 `docs/changes/` 下写一份。
 
 - 命名 `YYYY-MM-DD-<english-kebab-slug>.md` —— 英文文件名、中文正文、**绝对日期**。
 - 同一天同一件事的后续**追加进已有文件**，不建 `-2` 版本。
@@ -26,10 +28,10 @@
 
 Android App：SLAM 建图 + 实时定位 + 在**实时画面上**测距。
 
-**硬约束（不要动摇）**
+**硬约束**
 
-- 自用、不对外分发 → GPL 义务不触发 → ORB-SLAM3 这类 GPL 框架可以放心用。
-
+- **已公开分发，GPLv3 义务触发。** ORB-SLAM3 与 DBoW2 都是 GPLv3，仓库根目录的
+  `LICENSE` 必须随分发提供；要改成闭源分发，得先拿到上游的商业授权。
 
 **已定的选型**
 
@@ -42,19 +44,16 @@ Android App：SLAM 建图 + 实时定位 + 在**实时画面上**测距。
 
 ---
 
-## 三、怎么和我协作
+## 三、协作方式
 
-用户在多轮来回里明确过的偏好，不是我的默认行为。
-
-- **直接改源文件。** 不要给 `sed` 命令、不要「你自己把那几行替换成」。
-- **环境类步骤反过来。** 装依赖 / 编译 / 跑标定 → 写成 `.md` 让用户执行，不代跑。
+- **直接改源文件。** 不给 `sed` 命令，也不写「你自己把那几行替换掉」。
+- **环境类步骤反过来。** 装依赖 / 编译 / 跑标定 → 写成 `.md` 让人执行，不代跑。
 - **不要把已实现的源码嵌进教程文档。** 教程讲怎么做，代码在源文件里。
 - **源码注释要短，而且只解释代码本身。**
-  - **不要把诊断过程写进注释。**「真机上撞过」「当初试过 X 不行」「症状是……」这类
+  - **不要把诊断过程写进注释。**
     **归 `docs/changes/` 和 `docs/bugs/`**。
-- **Python 一律用** `~/software/miniconda3/envs/slam/bin/python3`。**绝不 `pip install`**。
-
-- **不碰 git。** 提交、建分支、重置都留给用户；需要检查点就跟他说。
+- **Python 走仓库约定的 conda 环境**，不要往系统里 `pip install`。
+- **git 由人操作。** 提交、建分支、重置都不代劳；需要检查点就提出来。
 
 ---
 
@@ -65,7 +64,7 @@ Android App：SLAM 建图 + 实时定位 + 在**实时画面上**测距。
 ```
 SlamCapture/
 ├── CLAUDE.md
-├── app/                       Android 采集端（Kotlin + JNI）
+├── app/                       Android 端（Kotlin + JNI）
 │   └── src/main/cpp/thirdparty/orb_slam3/    ORB-SLAM3 的副本
 │                                             （移植改动见 thirdparty/README.md）
 ├── docs/
@@ -74,10 +73,10 @@ SlamCapture/
 │   └── bugs/                  踩过的坑，按名字查
 └── tools/
     ├── calibration/           标定与验证脚本 + charuco 板 + 标定结果
-    └── *.sh                   构建辅助（boost / 词袋推送）
+    └── *.sh                   构建辅助（boost / 词袋推送 / release 词袋准备）
 ```
 
-**仓库外**（不在工作区，一般不用管）：`../ORB_SLAM3/`（上游 clone，PC 跑对照用）、
+**仓库外**（作者的本地布局，clone 下来不会有）：`../ORB_SLAM3/`（上游 clone，PC 跑对照用）、
 `../opencv/`、`../Pangolin/`、`../dataset/`。
 
 > `thirdparty/` 下的 **OpenCV 官方 SDK** 和 **安卓版 Boost** 体积大（872 MB / 185 MB），
@@ -87,8 +86,9 @@ SlamCapture/
 
 ## 五、环境
 
-- WSL2 + WSLg（Ubuntu 24.04）。**sudo 每次都要先跟用户确认**，不要不打招呼就跑。
-- Android SDK `/home/welkin/Android/Sdk`，`ANDROID_HOME` / `ANDROID_SDK_ROOT` 已设。
+- WSL2（Ubuntu 24.04）。**执行 `sudo` 前先跟人确认**，不要不打招呼就跑。
+- Android SDK 在 `$ANDROID_HOME`（作者机器上是 `~/Android/Sdk`），`ANDROID_HOME` /
+  `ANDROID_SDK_ROOT` 需已设置。
 - JDK 17 (Temurin)。设备通过**无线 adb** 连接。
 
 **PC 上跑 ORB-SLAM3**（在 `../ORB_SLAM3/`，不在工作区）：
